@@ -219,3 +219,40 @@ pub struct UserSearchEntry {
     #[serde(default)]
     pub display_name: Option<String>,
 }
+
+// ---------------------------------------------------------------------------
+// Omni discovery (place search + recommendation feed)
+// ---------------------------------------------------------------------------
+
+/// Response of GET search-api/omni-search and POST discovery-api/
+/// omni-recommendation. Both share the `searchResults[].contents[]` shape;
+/// unknown fields are ignored and every field is optional/defensive.
+#[derive(Debug, Deserialize, Default)]
+pub struct OmniResponse {
+    #[serde(default, rename = "searchResults")]
+    pub search_results: Vec<OmniContentGroup>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct OmniContentGroup {
+    /// "Game", "Player", "Creator"… — only Game groups become place cards.
+    #[serde(default, rename = "contentGroupType")]
+    pub content_group_type: Option<String>,
+    #[serde(default)]
+    pub contents: Vec<OmniContent>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct OmniContent {
+    pub universe_id: Option<u64>,
+    pub root_place_id: Option<u64>,
+    pub name: Option<String>,
+    pub player_count: Option<u64>,
+    pub total_up_votes: Option<u64>,
+    pub total_down_votes: Option<u64>,
+    pub creator_name: Option<String>,
+    pub creator_type: Option<String>,
+    pub creator_id: Option<u64>,
+    pub is_sponsored: Option<bool>,
+}

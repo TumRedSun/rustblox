@@ -26,11 +26,11 @@ fn cache_path(url: &str) -> Option<PathBuf> {
         .map(|d| d.join(format!("{:016x}.rgba", fnv1a64(url.as_bytes()))))
 }
 
-/// Load a cached decoded avatar (48x48 RGBA8).
-pub fn load(url: &str) -> Option<Vec<u8>> {
+/// Load a cached decoded square image (`size` x `size` RGBA8).
+pub fn load(url: &str, size: u32) -> Option<Vec<u8>> {
     let p = cache_path(url)?;
     let data = std::fs::read(p).ok()?;
-    let expected = (crate::theme::AVATAR_SIZE * crate::theme::AVATAR_SIZE * 4) as usize;
+    let expected = (size * size * 4) as usize;
     if data.len() == expected {
         Some(data)
     } else {

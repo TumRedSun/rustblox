@@ -7,7 +7,7 @@ use crate::font::Fonts;
 use crate::login_ui::LoginView;
 use crate::menu_ui::{MenuTab, MenuView};
 use crate::model::{build_rows, UserProfile};
-use crate::net::{Command, UserEvent, WorkerEvent};
+use crate::net::{Command, ImageKind, UserEvent, WorkerEvent};
 use crate::roblox::auth::AuthOutcome;
 use crate::roblox::errors::ApiError;
 use crate::theme;
@@ -55,6 +55,8 @@ pub struct UiCtx<'a> {
     /// Set by a text field when a caret was visible (schedules blink redraw).
     pub caret_anim: bool,
     pub avatars: &'a mut HashMap<u64, Arc<Vec<u8>>>,
+    /// Decoded square game icons keyed by root place id.
+    pub icons: &'a mut HashMap<u64, Arc<Vec<u8>>>,
 }
 
 pub struct App {
@@ -77,6 +79,7 @@ pub struct App {
     pub needs_redraw: bool,
     pub next_anim: Option<Instant>,
     pub avatars: HashMap<u64, Arc<Vec<u8>>>,
+    pub place_icons: HashMap<u64, Arc<Vec<u8>>>,
     pub clipboard: Option<arboard::Clipboard>,
     pub start_instant: Instant,
     /// True while validating a saved session at startup.
@@ -104,6 +107,7 @@ impl App {
             needs_redraw: true,
             next_anim: None,
             avatars: HashMap::new(),
+            place_icons: HashMap::new(),
             clipboard: arboard::Clipboard::new().ok(),
             start_instant: Instant::now(),
             restoring: has_saved_session,
@@ -140,6 +144,7 @@ impl App {
                         now_ms,
                         caret_anim: false,
                         avatars: &mut self.avatars,
+                        icons: &mut self.place_icons,
                     };
                     crate::login_ui::draw(view, &mut ctx, &mut fb, self.restoring);
                 }
@@ -153,6 +158,7 @@ impl App {
                         now_ms,
                         caret_anim: false,
                         avatars: &mut self.avatars,
+                        icons: &mut self.place_icons,
                     };
                     crate::menu_ui::draw(view, &mut ctx, &mut fb);
                 }
@@ -169,7 +175,7 @@ impl App {
 
         let spinner = match &self.screen {
             Screen::Login(v) => v.busy,
-            Screen::Menu(v) => v.refreshing || v.add.searching,
+            Screen::Menu(v) => v.refreshing || v.add.searching || v.places_searching,
         };
         if spinner {
             wakes.push(now + Duration::from_millis(90));
@@ -292,11 +298,9 @@ impl App {
                 self.needs_redraw = true;
             }
             Screen::Menu(v) => {
-                if v.tab == MenuTab::AddFriends {
-                    self.run_user_search();
-                } else {
-                    self.focus = None;
-                    self.needs_redraw = true;
+                match v.tab {
+                    MenuTab::AddFriends => self.run_user_search(),
+                    MenuTab::Home => self.run_place_search(),
                 }
             }
         }
@@ -321,6 +325,21 @@ impl App {
         self.needs_redraw = true;
     }
 
+    /// Kick off a place search from the Home pane (empty query = the default
+    /// recommendation feed).
+    fn run_place_search(&mut self) {
+        let query = match &self.screen {
+            Screen::Menu(v) => v.search.value.trim().to_string(),
+            _ => return,
+        };
+        if let Screen::Menu(v) = &mut self.screen {
+            v.places_searching = true;
+            v.places_error = None;
+        }
+        self.send_command(Command::SearchPlaces { query });
+        self.needs_redraw = true;
+    }
+
     // -----------------------------------------------------------------
     // Screen transitions
     // -----------------------------------------------------------------
@@ -329,12 +348,13 @@ impl App {
         self.screen = Screen::Menu(MenuView::new(profile));
         self.focus = None;
         self.restoring = false;
-        // Kick off the first refresh immediately.
+        // Kick off the first refresh and the default places feed immediately.
         if let Screen::Menu(v) = &mut self.screen {
             v.refreshing = true;
             v.next_refresh = Some(Instant::now() + Duration::from_secs(REFRESH_SECS));
         }
         self.send_command(Command::StartRefresh);
+        self.send_command(Command::SearchPlaces { query: String::new() });
         self.request_redraw();
     }
 
@@ -465,12 +485,31 @@ impl App {
                         Ok(()) => {
                             v.add.sent.push(user_id);
                             v.add.failed.remove(&user_id);
+                            v.notice = Some(("Friend request sent".into(), Instant::now() + Duration::from_secs(4)));
                         }
                         Err(e) => {
                             v.add.failed.insert(user_id, e.to_string());
                         }
                     }
                     self.needs_redraw = true;
+                }
+            }
+            WorkerEvent::PlacesDone { query, result } => {
+                if let Screen::Menu(v) = &mut self.screen {
+                    // Ignore stale responses for an edited query.
+                    if v.search.value.trim() == query {
+                        v.places_searching = false;
+                        v.places_done_for = query;
+                        match result {
+                            Ok(cards) => {
+                                v.places = cards;
+                                v.places_error = None;
+                                v.places_scroll = 0.0;
+                            }
+                            Err(e) => v.places_error = Some(e.to_string()),
+                        }
+                        self.needs_redraw = true;
+                    }
                 }
             }
             WorkerEvent::LoggedOut => {
@@ -529,8 +568,8 @@ impl ApplicationHandler<UserEvent> for App {
                     if let Screen::Menu(v) = &mut self.screen {
                         let (scroll, k) = match v.tab {
                             MenuTab::Home => (
-                                &mut v.scroll,
-                                v.view_metrics.as_ref().map(|m| (m.content_h / m.h.max(1.0)).max(1.0)).unwrap_or(1.0),
+                                &mut v.places_scroll,
+                                v.places_metrics.as_ref().map(|m| (m.content_h / m.h.max(1.0)).max(1.0)).unwrap_or(1.0),
                             ),
                             MenuTab::AddFriends => (
                                 &mut v.add_scroll,
@@ -555,7 +594,7 @@ impl ApplicationHandler<UserEvent> for App {
                     if let Hit::Scrollbar = hit {
                         if let Screen::Menu(v) = &mut self.screen {
                             let start = match v.tab {
-                                MenuTab::Home => v.scroll,
+                                MenuTab::Home => v.places_scroll,
                                 MenuTab::AddFriends => v.add_scroll,
                             };
                             self.drag_scroll = Some((self.cursor.1, start));
@@ -579,7 +618,9 @@ impl ApplicationHandler<UserEvent> for App {
                             match released_hit {
                                 Hit::TabPassword | Hit::TabCookie | Hit::SignIn | Hit::Verify
                                 | Hit::Resend | Hit::Back | Hit::Logout | Hit::NavHome | Hit::NavAdd
-                                | Hit::AddSearchBtn | Hit::AddUser(_) => {
+                                | Hit::AddSearchBtn | Hit::AddUser(_)
+                                | Hit::SearchPlacesBtn | Hit::SidebarToggle
+                                | Hit::StripLeft | Hit::StripRight | Hit::JoinPlace(_) => {
                                     self.handle_button(released_hit);
                                 }
                                 Hit::Field(id) => {
@@ -598,9 +639,16 @@ impl ApplicationHandler<UserEvent> for App {
                         MouseScrollDelta::LineDelta(_, y) => y * 3.0 * theme::ROW_H * self.scale,
                         MouseScrollDelta::PixelDelta(p) => p.y as f32,
                     };
-                    match v.tab {
-                        MenuTab::Home => v.scroll = (v.scroll - amount).max(0.0),
-                        MenuTab::AddFriends => v.add_scroll = (v.add_scroll - amount).max(0.0),
+                    // Over the friends strip: scroll it horizontally.
+                    let over_strip = matches!(v.tab, MenuTab::Home)
+                        && v.strip_rect.map(|r| r.contains(self.cursor.0, self.cursor.1)).unwrap_or(false);
+                    if over_strip {
+                        v.strip_scroll = (v.strip_scroll - amount).max(0.0);
+                    } else {
+                        match v.tab {
+                            MenuTab::Home => v.places_scroll = (v.places_scroll - amount).max(0.0),
+                            MenuTab::AddFriends => v.add_scroll = (v.add_scroll - amount).max(0.0),
+                        }
                     }
                     self.request_redraw();
                 }
@@ -627,8 +675,15 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, _elwt: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Worker(ev) => self.on_worker_event(ev),
-            UserEvent::AvatarReady { user_id, rgba } => {
-                self.avatars.insert(user_id, rgba);
+            UserEvent::ImageReady { kind, rgba } => {
+                match kind {
+                    ImageKind::User(id) => {
+                        self.avatars.insert(id, rgba);
+                    }
+                    ImageKind::Place(id) => {
+                        self.place_icons.insert(id, rgba);
+                    }
+                }
                 self.request_redraw();
             }
         }
@@ -699,20 +754,29 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 impl App {
-    /// Scroll the active list by 1.5 rows in the direction of the arrow.
+    /// Scroll the active list/strip by a step in the direction of the hit.
     fn scroll_step(&mut self, hit: &Hit) {
         if let Screen::Menu(v) = &mut self.screen {
             let d = 1.5 * theme::ROW_H * self.scale;
             match (&v.tab, hit) {
-                (MenuTab::Home, Hit::ScrollUp) => v.scroll = (v.scroll - d).max(0.0),
+                (MenuTab::Home, Hit::ScrollUp) => v.places_scroll = (v.places_scroll - d).max(0.0),
                 (MenuTab::Home, Hit::ScrollDown) => {
-                    let max = v.view_metrics.as_ref().map(|m| (m.content_h - m.h).max(0.0)).unwrap_or(0.0);
-                    v.scroll = (v.scroll + d).min(max);
+                    let max = v.places_metrics.as_ref().map(|m| (m.content_h - m.h).max(0.0)).unwrap_or(0.0);
+                    v.places_scroll = (v.places_scroll + d).min(max);
                 }
                 (MenuTab::AddFriends, Hit::ScrollUp) => v.add_scroll = (v.add_scroll - d).max(0.0),
                 (MenuTab::AddFriends, Hit::ScrollDown) => {
                     let max = v.add_metrics.as_ref().map(|m| (m.content_h - m.h).max(0.0)).unwrap_or(0.0);
                     v.add_scroll = (v.add_scroll + d).min(max);
+                }
+                (_, Hit::StripLeft) => {
+                    let d = 3.0 * (theme::STRIP_CARD_W + 8.0) * self.scale;
+                    v.strip_scroll = (v.strip_scroll - d).max(0.0);
+                }
+                (_, Hit::StripRight) => {
+                    let d = 3.0 * (theme::STRIP_CARD_W + 8.0) * self.scale;
+                    let max = v.strip_metrics.as_ref().map(|m| (m.content_h - m.h).max(0.0)).unwrap_or(0.0);
+                    v.strip_scroll = (v.strip_scroll + d).min(max);
                 }
                 _ => {}
             }
@@ -768,6 +832,28 @@ impl App {
             }
             Hit::AddSearchBtn => {
                 self.run_user_search();
+            }
+            Hit::SearchPlacesBtn => {
+                self.run_place_search();
+            }
+            Hit::SidebarToggle => {
+                if let Screen::Menu(v) = &mut self.screen {
+                    v.collapsed = !v.collapsed;
+                }
+                self.needs_redraw = true;
+            }
+            Hit::StripLeft | Hit::StripRight => {
+                self.scroll_step(&hit);
+            }
+            Hit::JoinPlace(place_id) => {
+                let _ = place_id; // joining a server is not implemented yet
+                if let Screen::Menu(v) = &mut self.screen {
+                    v.notice = Some((
+                        "Joining places is not implemented yet \u{2014} coming soon".into(),
+                        Instant::now() + Duration::from_secs(4),
+                    ));
+                }
+                self.needs_redraw = true;
             }
             Hit::AddUser(user_id) => {
                 if let Screen::Menu(v) = &mut self.screen {

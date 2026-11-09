@@ -119,16 +119,35 @@ impl FriendRow {
             }
         }
     }
+}
 
-    pub fn matches_filter(&self, q: &str) -> bool {
-        if q.is_empty() {
-            return true;
-        }
-        let q = q.to_lowercase();
-        self.friend.name.to_lowercase().contains(&q)
-            || self.friend.display_name.to_lowercase().contains(&q)
-            || self.game_name.as_deref().unwrap_or("").to_lowercase().contains(&q)
-            || self.presence.last_location.to_lowercase().contains(&q)
+/// A game/place shown as a card in the Places grid (search result or the
+/// default recommendation feed).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlaceCard {
+    pub universe_id: u64,
+    /// Root place id — used to fetch the square game icon thumbnail.
+    pub root_place_id: u64,
+    pub name: String,
+    pub creator: String,
+    pub player_count: u64,
+    /// Like ratio in whole percents (0..=100), `None` when unknown.
+    pub likes_pct: Option<u8>,
+    pub sponsored: bool,
+}
+
+/// "1626" -> "1.6K", "1234567" -> "1.2M", "98" -> "98".
+pub fn format_count(n: u64) -> String {
+    if n >= 1_000_000 {
+        let m = n as f64 / 1_000_000.0;
+        format!("{:.1}M", m)
+    } else if n >= 10_000 {
+        format!("{:.0}K", n as f64 / 1_000.0)
+    } else if n >= 1_000 {
+        let k = n as f64 / 1_000.0;
+        format!("{:.1}K", k)
+    } else {
+        n.to_string()
     }
 }
 

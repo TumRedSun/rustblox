@@ -20,6 +20,8 @@ pub const FRIENDS_BASE: &str = "https://friends.roblox.com";
 pub const PRESENCE_BASE: &str = "https://presence.roblox.com";
 pub const THUMBS_BASE: &str = "https://thumbnails.roblox.com";
 pub const GAMES_BASE: &str = "https://games.roblox.com";
+/// Modern discovery/search APIs (omni-search, omni-recommendation).
+pub const APIS_BASE: &str = "https://apis.roblox.com";
 
 /// Raw response we keep alive long enough to extract headers + body.
 pub struct RawResponse {

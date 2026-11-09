@@ -159,8 +159,6 @@ fn rows_sorting_and_labels() {
     assert_eq!(rows[0].status_label(), "Playing Natural Disaster Survival");
     assert_eq!(rows[1].status_label(), "Online");
     assert_eq!(rows[2].status_label(), "Offline");
-    assert!(rows[2].matches_filter("car"));
-    assert!(!rows[0].matches_filter("zzz"));
 }
 
 #[test]

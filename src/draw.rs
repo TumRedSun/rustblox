@@ -237,34 +237,52 @@ impl<'a> FB<'a> {
     }
 
     /// Blit an RGBA8 source image (opaque or alpha-blended), optionally with
-    /// rounded corners. Source size must equal destination size (pre-scaled).
-    pub fn image(&mut self, x: i32, y: i32, src: &[u8], sw: i32, sh: i32, corner_radius: i32) {
+    /// rounded corners. The source is scaled (nearest neighbor) from
+    /// `sw` x `sh` into the `dw` x `dh` destination box, so the buffer and
+    /// the on-screen size may differ (UI scale, chip vs row avatars).
+    pub fn image(
+        &mut self,
+        x: i32,
+        y: i32,
+        src: &[u8],
+        sw: i32,
+        sh: i32,
+        dw: i32,
+        dh: i32,
+        corner_radius: i32,
+    ) {
+        if sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0 {
+            return;
+        }
         let c = self.clip;
-        for sy in 0..sh {
-            let dy = y + sy;
+        // Rounded-corner silhouette is evaluated in destination space.
+        let r = corner_radius.min(dw / 2).min(dh / 2);
+        for dy_i in 0..dh {
+            let dy = y + dy_i;
             if dy < c.y0 || dy >= c.y1 {
                 continue;
             }
-            for sx in 0..sw {
-                let dx = x + sx;
+            let sy = (dy_i * sh) / dh;
+            for dx_i in 0..dw {
+                let dx = x + dx_i;
                 if dx < c.x0 || dx >= c.x1 {
                     continue;
                 }
-                if corner_radius > 0 {
+                if r > 0 {
                     // Skip pixels outside the rounded silhouette (corners only).
-                    let r = corner_radius;
                     let (ncx, ncy) = (
-                        if sx < r { r - 1 } else if sx >= sw - r { sw - r } else { -999 },
-                        if sy < r { r - 1 } else if sy >= sh - r { sh - r } else { -999 },
+                        if dx_i < r { r - 1 } else if dx_i >= dw - r { dw - r } else { -999 },
+                        if dy_i < r { r - 1 } else if dy_i >= dh - r { dh - r } else { -999 },
                     );
                     if ncx != -999 && ncy != -999 {
-                        let ddx = (sx - ncx) as f32;
-                        let ddy = (sy - ncy) as f32;
+                        let ddx = (dx_i - ncx) as f32;
+                        let ddy = (dy_i - ncy) as f32;
                         if (ddx * ddx + ddy * ddy).sqrt() > r as f32 - 0.5 {
                             continue;
                         }
                     }
                 }
+                let sx = (dx_i * sw) / dw;
                 let off = ((sy * sw + sx) * 4) as usize;
                 if off + 4 <= src.len() {
                     let col = [src[off], src[off + 1], src[off + 2], src[off + 3]];

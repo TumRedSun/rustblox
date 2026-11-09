@@ -6,10 +6,10 @@ An open-source (**GPL-3.0**) third-party **Roblox client built in Rust**, using 
 
 **Milestone 1 scope (this release):**
 - Sign in to a Roblox account — password + 2-step verification, or a `.ROBLOSECURITY` session cookie
-- Main menu styled after roblox.com home: a left **sidebar** (logo, profile, navigation), a vertical **friends list** with live statuses — **online / offline / what game they are playing right now** — and a Roblox-style scrollbar (drag + up/down arrows + mouse wheel + keyboard)
+- Main menu styled after roblox.com home: a **collapsible left sidebar** (the rotated red logo tile doubles as the “R” of the wordmark; profile chip; Home / Add Friends navigation; icon-only mini mode), a **horizontal friends strip** with live statuses — **online / offline / what game they are playing right now** — and left/right scroll arrows (mouse wheel works too)
+- **Places** search by name (`search-api/omni-search`) with a card grid that fills most of the screen — icon, name, creator, like ratio, player count and a green **Join** button (joining itself is a Milestone 2 feature); while the search box is empty a personalized **recommendation feed** is shown (`discovery-api/omni-recommendation`)
 - **Add Friends** pane: search users by username (`users.roblox.com/v1/users/search`) and send friend requests in place
 - Automatic presence refresh every **10 seconds** (no manual refresh button)
-- A reserved **Places** strip at the bottom for future place cards
 - Session persistence
 - Nightly automated builds for Windows / Linux / macOS published to the rolling [nightly release](../../releases/tag/nightly)
 - Nothing more (on purpose — see [Roadmap](#roadmap))
@@ -65,8 +65,9 @@ The token is stored locally in your user config directory (`%APPDATA%/rustblox/s
 ## Networking details (how the official client does it)
 
 - **CSRF rotation** — every mutating request carries `X-CSRF-Token`; a `403 Token Validation Failed` response includes a fresh `x-csrf-token` header *and* fresh anonymous cookies. RustBlox stores both (browser-style cookie jar) and retries, exactly like the website.
-- **Batching** — friends: 1 request; presence: `POST /v1/presence/users` in chunks of ≤100 ids; game titles: 1 batched `GET /v1/games?universeIds=...`; avatars: 1 batched thumbnails request. A full refresh of 200 friends is ~5 HTTP requests.
+- **Batching** — friends: 1 request; presence: `POST /v1/presence/users` in chunks of ≤100 ids; game titles: 1 batched `GET /v1/games?universeIds=...`; avatars and place icons: 1 batched thumbnails request each. A full refresh of 200 friends is ~5 HTTP requests.
 - **User search** — `GET /v1/users/search?keyword=...&limit=25` (Add Friends pane); friend requests go through `POST /v1/friends/{userId}/request-friendship` with the usual CSRF dance; API error messages (e.g. "Friend request already pending") are surfaced on the row.
+- **Place discovery** — keyword search via `GET apis.roblox.com/search-api/omni-search`, default feed via `POST apis.roblox.com/discovery-api/omni-recommendation`; card icons via `GET /v1/places/gameicons` (batched).
 - **Presence types** — `0` Offline, `1` Online (website), `2` InGame (with `universeId` → game title lookup, `gameId` = server job id, kept for the future "join game" milestone), `3` Studio, `4` Invisible.
 - **Avatars** — decoded PNGs are cached on disk (keyed by thumbnail URL) and kept in GPU-uploadable RGBA8 form in memory; unchanged thumbnails are never re-downloaded.
 - **Session validation** — `GET /v1/users/authenticated`; a dead session drops you back to the login screen automatically.
@@ -78,7 +79,7 @@ src/
 ├── main.rs            # entry point
 ├── app.rs             # winit ApplicationHandler, screen state machine, input routing
 ├── login_ui.rs        # login screen (password / cookie tabs, 2FA dialog)
-├── menu_ui.rs         # main menu: sidebar (logo, nav, profile), friends list with arrow scrollbar, places strip, add-friends pane
+├── menu_ui.rs         # main menu: collapsible sidebar, horizontal friends strip, places search + card grid, add-friends pane
 ├── ui.rs              # widgets: text fields (IME!), buttons, hit-testing
 ├── draw.rs            # software rasterizer over the pixels framebuffer
 ├── font.rs            # ab_glyph text rendering
@@ -127,10 +128,10 @@ Open-source (**GPL-3.0**) сторонний **клиент Roblox на Rust**, 
 
 **Задание №1 (эта версия):**
 - Вход в аккаунт Roblox — пароль + двухэтапная верификация либо cookie-сессия `.ROBLOSECURITY`
-- Главное меню в стиле домашней страницы roblox.com: левый **сайдбар** (логотип, профиль, навигация), вертикальный **список друзей** со статусами — **в сети / не в сети / во что сейчас играет** — и Roblox-скроллбар со стрелками (перетаскивание + стрелки вверх/вниз + колесо мыши + клавиатура)
+- Главное меню в стиле домашней страницы roblox.com: **складной левый сайдбар** (повёрнутая красная плитка-логотип служит буквой «R» в названии; чип профиля; навигация Home / Add Friends; мини-режим только с иконками), **горизонтальная полоса друзей** со статусами — **в сети / не в сети / во что сейчас играет** — и стрелками прокрутки влево/вправо (колесо мыши тоже работает)
+- **Поиск Places** по названию (`search-api/omni-search`) с сеткой карточек на большую часть экрана — иконка, название, автор, рейтинг (лайки), число игроков и зелёная кнопка **Join** (само подключение — в Milestone 2); при пустом поиске показывается персональная лента рекомендаций (`discovery-api/omni-recommendation`)
 - Панель **«Добавить друзей»**: поиск пользователей по нику (`users.roblox.com/v1/users/search`) и отправка заявок в друзья прямо из приложения
 - Автообновление статусов каждые **10 секунд** (без ручной кнопки обновления)
-- Зарезервированная полоса **Places** внизу под будущие карточки плейсов
 - Сохранение сессии
 - Ночные автоматические сборки для Windows / Linux / macOS публикуются в скользящем [nightly-релизе](../../releases/tag/nightly)
 - И ничего больше (осознанно — см. [Roadmap](#roadmap))
@@ -161,13 +162,14 @@ cargo build --release
 ## Что внутри (кратко)
 
 - **Стек:** `winit` (окно) + `pixels`/wgpu (пиксельный фреймбуфер — с прицелом на будущий 3D-рендер плейсов на том же wgpu) + `ab_glyph` (текст) + `ureq`/rustls (сеть, без tokio и OpenSSL).
-- **Как у официального клиента:** ротация `X-CSRF-Token` (403 → свежий токен из ответа + куки → повтор), cookie-jar, батчинг (presence ≤100 id за запрос, игры/аватарки пачками), статусы 0/1/2/3/4, `gameId` сервера уже сохраняется для будущего входа в игру.
+- **Как у официального клиента:** ротация `X-CSRF-Token` (403 → свежий токен из ответа + куки → повтор), cookie-jar, батчинг (presence ≤100 id за запрос, игры/аватарки/иконки плейсов пачками), статусы 0/1/2/3/4, `gameId` сервера уже сохраняется для будущего входа в игру.
+- **Поиск плейсов:** `GET apis.roblox.com/search-api/omni-search` по ключевому слову, дефолтная лента — `POST apis.roblox.com/discovery-api/omni-recommendation` (с авторизацией, как на сайте); иконки карточек — `GET /v1/places/gameicons` пачками.
 - **Оптимизации:** LTO fat + codegen-units=1, отрисовка по требованию (без постоянного цикла), растеризация только видимых строк, дисковый кэш аватарок, ~5 HTTP-запросов на полный рефреш 200 друзей.
 
 ## Дорожная карта
 
-1. **M1 (текущая):** вход + меню друзей в стиле Roblox (сайдбар, поиск и заявки в друзья) со статусами ✔
-2. **M2:** подключение к реальным игровым серверам (официальный UDP-транспорт на базе RakNet) и рендеринг плейсов на wgpu — карточки плейсов займут зарезервированную полосу Places
+1. **M1 (текущая):** вход + меню в стиле Roblox (складной сайдбар, полоса друзей, поиск и карточки плейсов, заявки в друзья) со статусами ✔
+2. **M2:** подключение к реальным игровым серверам (официальный UDP-транспорт на базе RakNet) и рендеринг плейсов на wgpu — кнопка **Join** на карточках уже на месте
 3. **M3:** чат, уведомления, страницы Charts / Avatar (неактивные пункты сайдбара)
 4. **M4:** полный пайплайн рендеринга плейса
 

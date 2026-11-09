@@ -1,12 +1,15 @@
-//! Social data: friends, presence, game names, avatar thumbnails.
-//! All requests are batched (<=100 ids per call) to minimize round trips.
+//! Social data: friends, presence, game names, avatar thumbnails, place
+//! search/recommendations. All requests are batched (<=100 ids per call) to
+//! minimize round trips.
 
-use crate::model::{Friend, Presence, PresenceKind, UserEntry};
-use crate::roblox::client::{RobloxClient, FRIENDS_BASE, GAMES_BASE, PRESENCE_BASE, THUMBS_BASE, USERS_BASE};
+use crate::model::{Friend, PlaceCard, Presence, PresenceKind, UserEntry};
+use crate::roblox::client::{
+    RobloxClient, APIS_BASE, FRIENDS_BASE, GAMES_BASE, PRESENCE_BASE, THUMBS_BASE, USERS_BASE,
+};
 use crate::roblox::errors::ApiError;
 use crate::roblox::types::{
-    FriendsResponse, GamesResponse, LastOnlineResponse, PresenceResponse, ThumbsResponse, UserSearchResponse,
-    UsersBatchResponse,
+    FriendsResponse, GamesResponse, LastOnlineResponse, OmniResponse, PresenceResponse,
+    ThumbsResponse, UserSearchResponse, UsersBatchResponse,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -281,9 +284,9 @@ pub fn fetch_avatar_index(c: &mut RobloxClient, ids: &[u64]) -> Result<Vec<(u64,
     Ok(out)
 }
 
-/// Download an avatar image from the CDN and decode it to a square RGBA
-/// buffer of `size` x `size`.
-pub fn download_avatar(agent: &ureq::Agent, url: &str, size: u32) -> Result<Vec<u8>, ApiError> {
+/// Download an image from the CDN and decode it to a square RGBA buffer of
+/// `size` x `size` (avatars, place icons).
+pub fn download_image(agent: &ureq::Agent, url: &str, size: u32) -> Result<Vec<u8>, ApiError> {
     let sent = agent.get(url).set("Accept", "image/png,image/*").call();
     let resp = match sent {
         Ok(r) => r,
@@ -296,7 +299,152 @@ pub fn download_avatar(agent: &ureq::Agent, url: &str, size: u32) -> Result<Vec<
         .take(4 * 1024 * 1024)
         .read_to_end(&mut bytes)
         .map_err(|e| ApiError::Network(e.to_string()))?;
-    let img = image::load_from_memory(&bytes).map_err(|e| ApiError::Parse(format!("avatar: {}", e)))?;
+    let img = image::load_from_memory(&bytes).map_err(|e| ApiError::Parse(format!("image: {}", e)))?;
     let scaled = img.resize_exact(size, size, image::imageops::FilterType::Triangle);
     Ok(scaled.to_rgba8().into_raw())
+}
+
+/// GET /v1/places/gameicons?placeIds=... — [(place_id, image_url)] for
+/// completed square game icons (place cards).
+pub fn fetch_game_icons(c: &mut RobloxClient, place_ids: &[u64]) -> Vec<(u64, String)> {
+    let mut out = Vec::with_capacity(place_ids.len());
+    let unique: Vec<u64> = {
+        let mut v: Vec<u64> = place_ids.to_vec();
+        v.sort_unstable();
+        v.dedup();
+        v.retain(|id| *id != 0);
+        v
+    };
+    for chunk in chunks(&unique) {
+        let list: Vec<String> = chunk.iter().map(|i| i.to_string()).collect();
+        let url = format!(
+            "{}/v1/places/gameicons?placeIds={}&size=512x512&format=Png&isCircular=false",
+            THUMBS_BASE,
+            list.join(",")
+        );
+        if let Ok(raw) = c.send(&url, None) {
+            if (200..300).contains(&raw.status) {
+                if let Ok(tr) = raw.json::<ThumbsResponse>() {
+                    for t in tr.data {
+                        if t.state == "Completed" {
+                            if let Some(u) = t.image_url {
+                                out.push((t.target_id, u));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A plausible RFC-4122-shaped session id for the discovery APIs (no external
+/// rand crate: mixes the clock, a process-lifetime counter and the thread
+/// name hash through FNV-1a; the APIs treat it as an opaque token).
+pub fn pseudo_uuid() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64 ^ d.as_secs())
+        .unwrap_or(0);
+    let tid = format!("{:?}", std::thread::current().id());
+    let a = fnv1a64(&nanos.to_le_bytes());
+    let b = fnv1a64(&n.to_le_bytes()) ^ fnv1a64(tid.as_bytes());
+    let c = fnv1a64(&b.to_le_bytes()) ^ nanos.rotate_left(17);
+    let d = a ^ b.rotate_left(32) ^ c;
+    // Set the version (4) and variant bits so the shape looks canonical.
+    let b2 = (b & 0xFFFF_FFFF_FFFF_0FFF) | 0x0000_0000_0000_4000;
+    let c2 = (c & 0x3FFF_FFFF_FFFF_FFFF) | 0x8000_0000_0000_0000;
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        (a >> 32) as u32,
+        (a & 0xFFFF) as u16,
+        (b2 >> 48) as u16,
+        (c2 >> 48) as u16,
+        d & 0xFFFF_FFFF_FFFF
+    )
+}
+
+fn fnv1a64(data: &[u8]) -> u64 {
+    crate::avatar_cache::fnv1a64(data)
+}
+
+/// Parse an omni discovery payload (search or recommendation feed) into
+/// place cards. Sponsored entries and entries without a name/place id are
+/// skipped; duplicates by universe id are removed.
+fn parse_omni(body: &[u8], limit: usize) -> Result<Vec<PlaceCard>, ApiError> {
+    let omni: OmniResponse =
+        serde_json::from_slice(body).map_err(|e| ApiError::Parse(format!("places: {}", e)))?;
+    let mut out: Vec<PlaceCard> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    'groups: for group in omni.search_results {
+        for item in group.contents {
+            if out.len() >= limit {
+                break 'groups;
+            }
+            let name = item.name.unwrap_or_default();
+            if name.trim().is_empty() {
+                continue;
+            }
+            if item.is_sponsored.unwrap_or(false) {
+                continue;
+            }
+            let universe_id = item.universe_id.unwrap_or(0);
+            let root_place_id = item.root_place_id.unwrap_or(0);
+            if universe_id == 0 || root_place_id == 0 || !seen.insert(universe_id) {
+                continue;
+            }
+            let (up, down) = (
+                item.total_up_votes.unwrap_or(0),
+                item.total_down_votes.unwrap_or(0),
+            );
+            let likes_pct = if up + down > 0 {
+                Some(((up as f64 / (up + down) as f64) * 100.0).round() as u8)
+            } else {
+                None
+            };
+            out.push(PlaceCard {
+                universe_id,
+                root_place_id,
+                name,
+                creator: item.creator_name.unwrap_or_default(),
+                player_count: item.player_count.unwrap_or(0),
+                likes_pct,
+                sponsored: false,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// GET apis.roblox.com/search-api/omni-search?searchQuery=... — place search
+/// by name. Returns up to `limit` cards.
+pub fn search_games(c: &mut RobloxClient, keyword: &str, limit: usize) -> Result<Vec<PlaceCard>, ApiError> {
+    let url = format!(
+        "{}/search-api/omni-search?searchQuery={}&pageType=all&sessionId={}&pageToken=",
+        APIS_BASE,
+        percent_encode(keyword.trim()),
+        pseudo_uuid()
+    );
+    let raw = c.send(&url, None)?;
+    if !(200..300).contains(&raw.status) {
+        return Err(raw.error());
+    }
+    parse_omni(&raw.body, limit)
+}
+
+/// POST apis.roblox.com/discovery-api/omni-recommendation — the default
+/// "discover" feed shown while the place search box is empty (requires the
+/// authenticated session cookie, exactly like the website).
+pub fn recommended_games(c: &mut RobloxClient, limit: usize) -> Result<Vec<PlaceCard>, ApiError> {
+    let url = format!("{}/discovery-api/omni-recommendation", APIS_BASE);
+    let body = json!({ "sessionId": pseudo_uuid(), "pageType": "all" });
+    let raw = c.send(&url, Some(&body))?;
+    if !(200..300).contains(&raw.status) {
+        return Err(raw.error());
+    }
+    parse_omni(&raw.body, limit)
 }

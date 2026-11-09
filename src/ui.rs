@@ -35,15 +35,24 @@ pub enum Hit {
     NavHome,
     NavAdd,
     Logout,
-    /// Scrollbar parts of the friends list (Roblox-style arrows + track).
+    /// Collapse / expand the sidebar.
+    SidebarToggle,
+    /// Scrollbar parts of vertical lists (Roblox-style arrows + track).
     ScrollUp,
     ScrollDown,
     Scrollbar,
+    /// Left/right arrows of the horizontal friends strip.
+    StripLeft,
+    StripRight,
+    /// "Search" button of the places search bar (Home pane).
+    SearchPlacesBtn,
+    /// "Join" button on a place card (place id; joining is not implemented
+    /// yet — visual only for now).
+    JoinPlace(u64),
     /// "Search" button in the Add Friends pane.
     AddSearchBtn,
     /// "Add" button on a search-result row (user id).
     AddUser(u64),
-    Row(u64),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -375,6 +384,8 @@ pub enum BtnStyle {
     Primary,
     Secondary,
     Ghost,
+    /// Green action (Roblox-style "Join").
+    Success,
 }
 
 /// Draw a button; `hover`/`disabled` affect colors. Adds to the hit map.
@@ -412,6 +423,15 @@ pub fn draw_button(
             }
         }
         BtnStyle::Ghost => (theme::BG, if hovered { theme::TEXT } else { theme::TEXT_DIM }),
+        BtnStyle::Success => {
+            if disabled {
+                (theme::BTN_DISABLED, theme::TEXT_FAINT)
+            } else if hovered {
+                (theme::GREEN_HOVER, theme::BTN_TEXT)
+            } else {
+                (theme::GREEN, theme::BTN_TEXT)
+            }
+        }
     };
     fb.rect_rounded(r.x, r.y, r.w, r.h, (8.0 * s) as i32, bg);
     let tw = font::measure(ctx.fonts, label, 14.0 * s, true);

@@ -8,7 +8,7 @@
 //! third-party CDN hosts).
 
 use crate::config::Session;
-use crate::model::{Presence, PresenceKind, Snapshot, UserEntry};
+use crate::model::{PlaceCard, Presence, PresenceKind, Snapshot, UserEntry};
 use crate::roblox::auth::{self, AuthOutcome};
 use crate::roblox::client::RobloxClient;
 use crate::roblox::errors::ApiError;
@@ -27,6 +27,8 @@ pub enum Command {
     StartRefresh,
     SearchUsers { query: String },
     AddFriend { user_id: u64 },
+    /// Place search: an empty query requests the default recommendation feed.
+    SearchPlaces { query: String },
     Logout,
     Shutdown,
 }
@@ -38,21 +40,30 @@ pub enum WorkerEvent {
     RefreshDone(Result<Snapshot, ApiError>),
     SearchDone { query: String, result: Result<Vec<UserEntry>, ApiError> },
     FriendRequestDone { user_id: u64, result: Result<(), ApiError> },
+    PlacesDone { query: String, result: Result<Vec<PlaceCard>, ApiError> },
     LoggedOut,
+}
+
+/// Which slot a downloaded bitmap belongs to (users and places are kept in
+/// separate maps, their id spaces can overlap).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ImageKind {
+    User(u64),
+    Place(u64),
 }
 
 #[derive(Debug)]
 pub enum UserEvent {
     Worker(WorkerEvent),
-    AvatarReady { user_id: u64, rgba: Arc<Vec<u8>> },
+    ImageReady { kind: ImageKind, rgba: Arc<Vec<u8>> },
 }
 
 pub struct Worker {
     pub tx: Sender<Command>,
 }
 
-struct AvatarJob {
-    user_id: u64,
+struct ImageJob {
+    kind: ImageKind,
     url: String,
 }
 
@@ -60,14 +71,14 @@ pub fn spawn(proxy: EventLoopProxy<UserEvent>, session: Option<Session>) -> Work
     let (tx, rx) = channel::<Command>();
     let proxy = Arc::new(proxy);
 
-    // --- Avatar download pool ---------------------------------------------
-    let (job_tx, job_rx) = channel::<AvatarJob>();
+    // --- Image download pool (avatars + place icons) -----------------------
+    let (job_tx, job_rx) = channel::<ImageJob>();
     let job_rx = Arc::new(Mutex::new(job_rx));
     for _ in 0..4 {
         let job_rx = Arc::clone(&job_rx);
         let proxy = Arc::clone(&proxy);
         std::thread::Builder::new()
-            .name("rustblox-avatar".into())
+            .name("rustblox-images".into())
             .spawn(move || loop {
                 let job = {
                     let guard = match job_rx.lock() {
@@ -80,29 +91,35 @@ pub fn spawn(proxy: EventLoopProxy<UserEvent>, session: Option<Session>) -> Work
                     Ok(j) => j,
                     Err(_) => return,
                 };
-                if let Some(bytes) = crate::avatar_cache::load(&job.url) {
-                    let _ = proxy.send_event(UserEvent::AvatarReady {
-                        user_id: job.user_id,
+                let size = match job.kind {
+                    ImageKind::User(_) => crate::theme::AVATAR_SIZE,
+                    ImageKind::Place(_) => crate::theme::PLACE_ICON_PX,
+                };
+                if let Some(bytes) = crate::avatar_cache::load(&job.url, size) {
+                    let _ = proxy.send_event(UserEvent::ImageReady {
+                        kind: job.kind,
                         rgba: Arc::new(bytes),
                     });
                     continue;
                 }
                 let agent = crate::avatar_cache::cdn_agent();
-                if let Ok(rgba) = social::download_avatar(&agent, &job.url, crate::theme::AVATAR_SIZE) {
+                if let Ok(rgba) = social::download_image(&agent, &job.url, size) {
                     crate::avatar_cache::store(&job.url, &rgba);
-                    let _ = proxy.send_event(UserEvent::AvatarReady {
-                        user_id: job.user_id,
+                    let _ = proxy.send_event(UserEvent::ImageReady {
+                        kind: job.kind,
                         rgba: Arc::new(rgba),
                     });
                 }
             })
-            .expect("spawn avatar worker");
+            .expect("spawn image worker");
     }
 
     // --- Main worker --------------------------------------------------------
     let pushed: Arc<Mutex<HashMap<u64, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    let icons_pushed: Arc<Mutex<HashMap<u64, String>>> = Arc::new(Mutex::new(HashMap::new()));
     {
         let pushed = Arc::clone(&pushed);
+        let icons_pushed = Arc::clone(&icons_pushed);
         std::thread::Builder::new()
             .name("rustblox-worker".into())
             .spawn(move || {
@@ -159,6 +176,7 @@ pub fn spawn(proxy: EventLoopProxy<UserEvent>, session: Option<Session>) -> Work
                             auth::logout(&mut client);
                             me_id = None;
                             pushed.lock().unwrap().clear();
+                            icons_pushed.lock().unwrap().clear();
                             let _ = proxy.send_event(UserEvent::Worker(WorkerEvent::LoggedOut));
                         }
                         Command::StartRefresh => {
@@ -179,7 +197,8 @@ pub fn spawn(proxy: EventLoopProxy<UserEvent>, session: Option<Session>) -> Work
                                         let mut p = pushed.lock().unwrap();
                                         for (id, url) in index {
                                             if p.get(&id).map(|old| old != &url).unwrap_or(true) {
-                                                if job_tx.send(AvatarJob { user_id: id, url: url.clone() }).is_ok() {
+                                                let job = ImageJob { kind: ImageKind::User(id), url: url.clone() };
+                                                if job_tx.send(job).is_ok() {
                                                     p.insert(id, url);
                                                 }
                                             }
@@ -193,6 +212,28 @@ pub fn spawn(proxy: EventLoopProxy<UserEvent>, session: Option<Session>) -> Work
                         Command::AddFriend { user_id } => {
                             let result = social::send_friend_request(&mut client, user_id);
                             let _ = proxy.send_event(UserEvent::Worker(WorkerEvent::FriendRequestDone { user_id, result }));
+                        }
+                        Command::SearchPlaces { query } => {
+                            // Empty query -> default recommendation feed.
+                            let result = if query.trim().is_empty() {
+                                social::recommended_games(&mut client, 18)
+                            } else {
+                                social::search_games(&mut client, &query, 18)
+                            };
+                            if let Ok(cards) = &result {
+                                let place_ids: Vec<u64> = cards.iter().map(|p| p.root_place_id).collect();
+                                let icons = social::fetch_game_icons(&mut client, &place_ids);
+                                let mut p = icons_pushed.lock().unwrap();
+                                for (place_id, url) in icons {
+                                    if p.get(&place_id).map(|old| old != &url).unwrap_or(true) {
+                                        let job = ImageJob { kind: ImageKind::Place(place_id), url: url.clone() };
+                                        if job_tx.send(job).is_ok() {
+                                            p.insert(place_id, url);
+                                        }
+                                    }
+                                }
+                            }
+                            let _ = proxy.send_event(UserEvent::Worker(WorkerEvent::PlacesDone { query, result }));
                         }
                     }
                 }
@@ -208,7 +249,7 @@ pub fn spawn(proxy: EventLoopProxy<UserEvent>, session: Option<Session>) -> Work
 fn run_refresh(
     c: &mut RobloxClient,
     me_id: u64,
-    job_tx: Sender<AvatarJob>,
+    job_tx: Sender<ImageJob>,
     pushed: &Mutex<HashMap<u64, String>>,
 ) -> Result<Snapshot, ApiError> {
     let friends = social::fetch_friends(c, me_id)?;
@@ -235,7 +276,8 @@ fn run_refresh(
         let mut p = pushed.lock().unwrap();
         for (id, url) in index {
             if p.get(&id).map(|old| old != &url).unwrap_or(true) {
-                if job_tx.send(AvatarJob { user_id: id, url: url.clone() }).is_ok() {
+                let job = ImageJob { kind: ImageKind::User(id), url: url.clone() };
+                if job_tx.send(job).is_ok() {
                     p.insert(id, url);
                 }
             }
