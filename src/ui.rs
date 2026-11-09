@@ -263,11 +263,14 @@ impl TextField {
             font::draw(ctx.fonts, fb, x as f32, (ly + (12.0 * s) as i32) as f32, lb, 12.0 * s, theme::TEXT_DIM, false, 0.0);
         }
         let focused = ctx.focus == Some(id);
-        fb.rect_rounded(x, y, w, h, (8.0 * s) as i32, theme::INPUT_BG);
+        // Frameless input: filled rounded rect only. Focus is shown with a
+        // brighter fill plus an accent underline drawn inside the rect (no
+        // separate outline => it can never misalign).
+        fb.rect_rounded(x, y, w, h, (8.0 * s) as i32, if focused { theme::SURFACE_2 } else { theme::INPUT_BG });
         if focused {
-            fb.outline_rounded(x, y, w, h, (8.0 * s) as i32, theme::BORDER_FOCUS);
-        } else {
-            fb.outline_rounded(x, y, w, h, (8.0 * s) as i32, theme::BORDER);
+            let bar_h = (3.0 * s).max(1.0) as i32;
+            let inset = (10.0 * s) as i32;
+            fb.rect(x + inset, y + h - bar_h - 1, w - 2 * inset, bar_h, theme::ACCENT);
         }
 
         let pad_x = (12.0 * s) as i32;
@@ -399,9 +402,6 @@ pub fn draw_button(
         BtnStyle::Ghost => (theme::BG, if hovered { theme::TEXT } else { theme::TEXT_DIM }),
     };
     fb.rect_rounded(r.x, r.y, r.w, r.h, (8.0 * s) as i32, bg);
-    if matches!(style, BtnStyle::Secondary) {
-        fb.outline_rounded(r.x, r.y, r.w, r.h, (8.0 * s) as i32, theme::BORDER);
-    }
     let tw = font::measure(ctx.fonts, label, 14.0 * s, true);
     let _ = font::draw(
         ctx.fonts,

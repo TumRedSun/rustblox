@@ -57,11 +57,16 @@ pub fn draw(
         let id = font.glyph_id(ch);
         let glyph: Glyph = id.with_scale_and_position(scale, ab_glyph::point(x, y_baseline));
         if let Some(outlined) = font.outline_glyph(glyph) {
+            // ab_glyph >= 0.2.22 passes bounds-relative pixel coords (0,0 =
+            // px_bounds.min); translate them to absolute screen pixels.
+            let bmin = outlined.px_bounds().min;
+            let bx = bmin.x as i32;
+            let by = bmin.y as i32;
             outlined.draw(|gx, gy, alpha| {
                 if alpha > 0.004 {
                     let mut c = color;
                     c[3] = (color[3] as f32 * alpha).round().min(255.0) as u8;
-                    fb.set(gx as i32, gy as i32, c);
+                    fb.set(bx + gx as i32, by + gy as i32, c);
                 }
             });
         }

@@ -179,7 +179,8 @@ fn draw_two_step(v: &mut LoginView, ctx: &mut UiCtx, fb: &mut FB, x: i32, y: &mu
         ctx.fonts, fb, x as f32, *y as f32 + 12.0 * s,
         &format!("Enter the code from {}.", via), 13.0 * s, theme::TEXT_DIM, false, inner_w as f32,
     );
-    *y += (22.0 * s) as i32;
+    // Extra room so the field label below never collides with the subtitle.
+    *y += (34.0 * s) as i32;
 
     let field_h = (42.0 * s) as i32;
     v.code.draw(ctx, fb, x, *y, inner_w, field_h, FieldId::Code, Some("Verification code"));
@@ -223,13 +224,11 @@ fn draw_logo(ctx: &mut UiCtx, fb: &mut FB, w: i32, top: i32) {
 
 fn draw_tab(ctx: &mut UiCtx, fb: &mut FB, r: Rect, label: &str, active: bool, hit: Hit) {
     let s = ctx.scale;
-    let bg = if active { theme::SURFACE_2 } else { theme::BG };
-    fb.rect_rounded(r.x, r.y, r.w, r.h, (8.0 * s) as i32, bg);
+    // Frameless tabs: active = lighter fill + accent underline, inactive =
+    // plain dim text on the card background.
     if active {
-        // Accent underline.
-        fb.rect(r.x + (10.0 * s) as i32, r.y + r.h - (3.0 * s) as i32, r.w - (20.0 * s) as i32, (3.0 * s) as i32, theme::ACCENT);
-    } else {
-        fb.outline_rounded(r.x, r.y, r.w, r.h, (8.0 * s) as i32, theme::BORDER);
+        fb.rect_rounded(r.x, r.y, r.w, r.h, (8.0 * s) as i32, theme::SURFACE_2);
+        fb.rect(r.x + (10.0 * s) as i32, r.y + r.h - (3.0 * s).max(1.0) as i32, r.w - (20.0 * s) as i32, (3.0 * s).max(1.0) as i32, theme::ACCENT);
     }
     let tw = font::measure(ctx.fonts, label, 13.5 * s, true);
     font::draw(
