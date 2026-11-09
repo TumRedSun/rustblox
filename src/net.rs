@@ -29,6 +29,10 @@ pub enum Command {
     AddFriend { user_id: u64 },
     /// Place search: an empty query requests the default recommendation feed.
     SearchPlaces { query: String },
+    /// List incoming friend requests.
+    FetchFriendRequests,
+    /// Accept (true) or decline (false) an incoming friend request.
+    RespondFriendRequest { user_id: u64, accept: bool },
     Logout,
     Shutdown,
 }
@@ -41,6 +45,10 @@ pub enum WorkerEvent {
     SearchDone { query: String, result: Result<Vec<UserEntry>, ApiError> },
     FriendRequestDone { user_id: u64, result: Result<(), ApiError> },
     PlacesDone { query: String, result: Result<Vec<PlaceCard>, ApiError> },
+    FriendRequestsDone { result: Result<Vec<UserEntry>, ApiError> },
+    RequestResponded { user_id: u64, accept: bool, result: Result<(), ApiError> },
+    /// Recently played places (discovery "continue" row + local tracking).
+    RecentlyPlayedDone { result: Vec<PlaceCard> },
     LoggedOut,
 }
 
@@ -185,6 +193,14 @@ pub fn spawn(proxy: EventLoopProxy<UserEvent>, session: Option<Session>) -> Work
                             }
                             let snap = run_refresh(&mut client, me_id.unwrap(), job_tx.clone(), &pushed);
                             let _ = proxy.send_event(UserEvent::Worker(WorkerEvent::RefreshDone(snap)));
+                            // Piggyback the recently played feed on every
+                            // refresh (official "continue" row + local).
+                            let recent = collect_recently_played(
+                                &mut client,
+                                job_tx.clone(),
+                                &icons_pushed,
+                            );
+                            let _ = proxy.send_event(UserEvent::Worker(WorkerEvent::RecentlyPlayedDone { result: recent }));
                         }
                         Command::SearchUsers { query } => {
                             let result = social::search_users(&mut client, &query, 25);
@@ -221,19 +237,45 @@ pub fn spawn(proxy: EventLoopProxy<UserEvent>, session: Option<Session>) -> Work
                                 social::search_games(&mut client, &query, 18)
                             };
                             if let Ok(cards) = &result {
-                                let place_ids: Vec<u64> = cards.iter().map(|p| p.root_place_id).collect();
-                                let icons = social::fetch_game_icons(&mut client, &place_ids);
-                                let mut p = icons_pushed.lock().unwrap();
-                                for (place_id, url) in icons {
-                                    if p.get(&place_id).map(|old| old != &url).unwrap_or(true) {
-                                        let job = ImageJob { kind: ImageKind::Place(place_id), url: url.clone() };
-                                        if job_tx.send(job).is_ok() {
-                                            p.insert(place_id, url);
+                                push_place_icons(&mut client, cards, &job_tx, &icons_pushed);
+                            }
+                            let _ = proxy.send_event(UserEvent::Worker(WorkerEvent::PlacesDone { query, result }));
+                        }
+                        Command::FetchFriendRequests => {
+                            let result = match me_id {
+                                Some(id) => social::fetch_friend_requests(&mut client, id),
+                                None => Ok(Vec::new()),
+                            };
+                            if let Ok(users) = &result {
+                                let ids: Vec<u64> = users.iter().map(|u| u.id).collect();
+                                if let Ok(index) = social::fetch_avatar_index(&mut client, &ids) {
+                                    let mut p = pushed.lock().unwrap();
+                                    for (id, url) in index {
+                                        if p.get(&id).map(|old| old != &url).unwrap_or(true) {
+                                            let job = ImageJob { kind: ImageKind::User(id), url: url.clone() };
+                                            if job_tx.send(job).is_ok() {
+                                                p.insert(id, url);
+                                            }
                                         }
                                     }
                                 }
                             }
-                            let _ = proxy.send_event(UserEvent::Worker(WorkerEvent::PlacesDone { query, result }));
+                            let _ = proxy.send_event(UserEvent::Worker(WorkerEvent::FriendRequestsDone { result }));
+                        }
+                        Command::RespondFriendRequest { user_id, accept } => {
+                            let result = if accept {
+                                social::accept_friend_request(&mut client, user_id)
+                            } else {
+                                social::decline_friend_request(&mut client, user_id)
+                            };
+                            if result.is_ok() {
+                                // The friends list changed: force the next
+                                // refresh to pick it up immediately.
+                                if let Some(id) = me_id {
+                                    let _ = proxy.send_event(UserEvent::Worker(WorkerEvent::RefreshDone(run_refresh(&mut client, id, job_tx.clone(), &pushed))));
+                                }
+                            }
+                            let _ = proxy.send_event(UserEvent::Worker(WorkerEvent::RequestResponded { user_id, accept, result }));
                         }
                     }
                 }
@@ -242,6 +284,76 @@ pub fn spawn(proxy: EventLoopProxy<UserEvent>, session: Option<Session>) -> Work
     }
 
     Worker { tx }
+}
+
+/// Resolve + enqueue place icons for a card list (dedup across pushes).
+fn push_place_icons(
+    c: &mut RobloxClient,
+    cards: &[PlaceCard],
+    job_tx: &Sender<ImageJob>,
+    icons_pushed: &Mutex<HashMap<u64, String>>,
+) {
+    let place_ids: Vec<u64> = cards.iter().map(|p| p.root_place_id).collect();
+    let icons = social::fetch_game_icons(c, &place_ids);
+    let mut p = icons_pushed.lock().unwrap();
+    for (place_id, url) in icons {
+        if p.get(&place_id).map(|old| old != &url).unwrap_or(true) {
+            let job = ImageJob { kind: ImageKind::Place(place_id), url: url.clone() };
+            if job_tx.send(job).is_ok() {
+                p.insert(place_id, url);
+            }
+        }
+    }
+}
+
+/// Recently played = the official discovery "continue" row, extended with
+/// locally tracked places (recorded while the client is open). Best effort:
+/// never fails, returns whatever source worked.
+fn collect_recently_played(
+    c: &mut RobloxClient,
+    job_tx: Sender<ImageJob>,
+    icons_pushed: &Mutex<HashMap<u64, String>>,
+) -> Vec<PlaceCard> {
+    const LIMIT: usize = 12;
+    let mut out: Vec<PlaceCard> = Vec::new();
+    if let Ok(cards) = social::recently_played(c, LIMIT) {
+        out = cards;
+    }
+    // Local fallback / supplement from settings.json.
+    let local = crate::config::load_settings().recent_places;
+    if !local.is_empty() {
+        let universes: Vec<u64> = local.iter().map(|r| r.universe_id).filter(|u| *u != 0).collect();
+        let names = social::fetch_game_names(c, &universes);
+        for r in local {
+            if r.root_place_id == 0 || out.iter().any(|c| c.root_place_id == r.root_place_id) {
+                continue;
+            }
+            if out.len() >= LIMIT {
+                break;
+            }
+            let name = if r.name.is_empty() {
+                names.get(&r.universe_id).cloned().unwrap_or_default()
+            } else {
+                r.name
+            };
+            if name.is_empty() {
+                continue;
+            }
+            out.push(PlaceCard {
+                universe_id: r.universe_id,
+                root_place_id: r.root_place_id,
+                name,
+                creator: String::new(),
+                player_count: 0,
+                likes_pct: None,
+                sponsored: false,
+            });
+        }
+    }
+    if !out.is_empty() {
+        push_place_icons(c, &out, &job_tx, icons_pushed);
+    }
+    out
 }
 
 /// Full refresh pipeline: friends -> presence -> last-online -> game names,
@@ -255,11 +367,11 @@ fn run_refresh(
     let friends = social::fetch_friends(c, me_id)?;
     let ids: Vec<u64> = friends.iter().map(|f| f.id).collect();
 
-    let presences: HashMap<u64, Presence> = if ids.is_empty() {
-        HashMap::new()
-    } else {
-        social::fetch_presence(c, &ids)?
-    };
+    // Presence for friends AND ourselves: our own entry feeds the local
+    // "recently played" tracker (settings.json).
+    let mut lookup: Vec<u64> = ids.clone();
+    lookup.push(me_id);
+    let presences: HashMap<u64, Presence> = social::fetch_presence(c, &lookup)?;
     let last_online = social::fetch_last_online(c, &ids);
 
     let universes: Vec<u64> = presences
@@ -268,6 +380,19 @@ fn run_refresh(
         .filter_map(|p| p.universe_id)
         .collect();
     let games = social::fetch_game_names(c, &universes);
+
+    // Track the place we are playing right now for the recently played row.
+    if let Some(me) = presences.get(&me_id) {
+        if matches!(me.kind, PresenceKind::InGame | PresenceKind::Studio) {
+            if let (Some(root), uni) = (me.root_place_id, me.universe_id) {
+                let name = uni
+                    .and_then(|u| games.get(&u).cloned())
+                    .or_else(|| crate::model::clean_last_location(&me.last_location))
+                    .unwrap_or_default();
+                crate::config::note_recent_place(uni.unwrap_or(0), root, &name);
+            }
+        }
+    }
 
     // Avatars: resolve thumbnail URLs and enqueue downloads for anything not
     // pushed before (dedup across refreshes; disk cache absorbs the rest).

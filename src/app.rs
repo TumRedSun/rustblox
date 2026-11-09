@@ -5,7 +5,7 @@ use crate::config::{self, Session};
 use crate::draw::FB;
 use crate::font::Fonts;
 use crate::login_ui::LoginView;
-use crate::menu_ui::{MenuTab, MenuView};
+use crate::menu_ui::{FriendPane, MenuTab, MenuView, SettingsTab};
 use crate::model::{build_rows, UserProfile};
 use crate::net::{Command, ImageKind, UserEvent, WorkerEvent};
 use crate::roblox::auth::AuthOutcome;
@@ -84,10 +84,17 @@ pub struct App {
     pub start_instant: Instant,
     /// True while validating a saved session at startup.
     pub restoring: bool,
+    /// True while the login screen is open for "add another account" (the
+    /// running menu is parked in `suspended_menu`).
+    pub adding_account: bool,
+    pub suspended_menu: Option<MenuView>,
 }
 
 impl App {
     pub fn new(tx: Sender<Command>, has_saved_session: bool) -> App {
+        // Apply the persisted theme before the first frame.
+        let settings = config::load_settings();
+        theme::apply(theme::by_id(&settings.theme, settings.custom));
         App {
             window: None,
             pixels: None,
@@ -111,6 +118,8 @@ impl App {
             clipboard: arboard::Clipboard::new().ok(),
             start_instant: Instant::now(),
             restoring: has_saved_session,
+            adding_account: false,
+            suspended_menu: None,
         }
     }
 
@@ -131,7 +140,7 @@ impl App {
         {
             let frame = px.frame_mut();
             let mut fb = FB::new(frame, self.fbw, self.fbh);
-            fb.fill(theme::BG);
+            fb.fill(theme::cur().bg);
             let now_ms = self.start_instant.elapsed().as_millis() as u64;
             match &mut self.screen {
                 Screen::Login(view) => {
@@ -146,7 +155,7 @@ impl App {
                         avatars: &mut self.avatars,
                         icons: &mut self.place_icons,
                     };
-                    crate::login_ui::draw(view, &mut ctx, &mut fb, self.restoring);
+                    crate::login_ui::draw(view, &mut ctx, &mut fb, self.restoring, self.adding_account);
                 }
                 Screen::Menu(view) => {
                     let mut ctx = UiCtx {
@@ -175,7 +184,9 @@ impl App {
 
         let spinner = match &self.screen {
             Screen::Login(v) => v.busy,
-            Screen::Menu(v) => v.refreshing || v.add.searching || v.places_searching,
+            Screen::Menu(v) => {
+                v.refreshing || v.add.searching || v.places_searching || v.requests.loading
+            }
         };
         if spinner {
             wakes.push(now + Duration::from_millis(90));
@@ -205,9 +216,10 @@ impl App {
                     }
                 }
             }
-            Screen::Menu(v) => match v.tab {
-                MenuTab::Home => &[FieldId::Search],
-                MenuTab::AddFriends => &[FieldId::AddSearch],
+            Screen::Menu(v) => match (v.tab, v.friend_pane) {
+                (MenuTab::Home, _) => &[FieldId::Search],
+                (MenuTab::Friends, FriendPane::Search) => &[FieldId::AddSearch],
+                _ => &[],
             },
         };
         match self.focus {
@@ -230,9 +242,9 @@ impl App {
                 FieldId::Code => Some(&mut v.code),
                 FieldId::Search | FieldId::AddSearch => None,
             },
-            Screen::Menu(v) => match focus {
-                FieldId::Search => Some(&mut v.search),
-                FieldId::AddSearch => Some(&mut v.add.query),
+            Screen::Menu(v) => match (focus, v.tab, v.friend_pane) {
+                (FieldId::Search, MenuTab::Home, _) => Some(&mut v.search),
+                (FieldId::AddSearch, MenuTab::Friends, FriendPane::Search) => Some(&mut v.add.query),
                 _ => None,
             },
         }
@@ -297,12 +309,11 @@ impl App {
                 }
                 self.needs_redraw = true;
             }
-            Screen::Menu(v) => {
-                match v.tab {
-                    MenuTab::AddFriends => self.run_user_search(),
-                    MenuTab::Home => self.run_place_search(),
-                }
-            }
+            Screen::Menu(v) => match (v.tab, v.friend_pane) {
+                (MenuTab::Home, _) => self.run_place_search(),
+                (MenuTab::Friends, FriendPane::Search) => self.run_user_search(),
+                _ => {}
+            },
         }
     }
 
@@ -348,6 +359,8 @@ impl App {
         self.screen = Screen::Menu(MenuView::new(profile));
         self.focus = None;
         self.restoring = false;
+        self.adding_account = false;
+        self.suspended_menu = None;
         // Kick off the first refresh and the default places feed immediately.
         if let Screen::Menu(v) = &mut self.screen {
             v.refreshing = true;
@@ -382,6 +395,8 @@ impl App {
                     if let Err(e) = config::save_session(&sess) {
                         eprintln!("warn: could not persist session: {e}");
                     }
+                    // Remember the account for the quick switcher.
+                    config::upsert_account(&sess);
                     self.enter_menu(profile);
                 }
                 AuthOutcome::TwoStep { ticket, media_type } => {
@@ -412,6 +427,11 @@ impl App {
                         // Should not normally happen; handled via AuthOutcome.
                     }
                     v.status = Some((StatusKind::Error, msg));
+                } else if let Screen::Menu(v) = &mut self.screen {
+                    // A quick account switch failed; stay on the current one.
+                    let mut m = format!("Could not switch account: {}", msg);
+                    m.truncate(120);
+                    v.notice = Some((m, Instant::now() + Duration::from_secs(5)));
                 }
                 self.request_redraw();
             }
@@ -494,6 +514,45 @@ impl App {
                     self.needs_redraw = true;
                 }
             }
+            WorkerEvent::FriendRequestsDone { result } => {
+                if let Screen::Menu(v) = &mut self.screen {
+                    v.requests.loading = false;
+                    v.requests.loaded_once = true;
+                    match result {
+                        Ok(users) => {
+                            v.requests.items = users;
+                            v.requests.error = None;
+                            v.requests.failed.clear();
+                            v.requests_scroll = 0.0;
+                        }
+                        Err(e) => v.requests.error = Some(e.to_string()),
+                    }
+                    self.needs_redraw = true;
+                }
+            }
+            WorkerEvent::RequestResponded { user_id, accept, result } => {
+                if let Screen::Menu(v) = &mut self.screen {
+                    v.requests.acting.retain(|id| *id != user_id);
+                    match result {
+                        Ok(()) => {
+                            v.requests.items.retain(|u| u.id != user_id);
+                            v.requests.failed.remove(&user_id);
+                            let note = if accept { "Friend request accepted" } else { "Friend request declined" };
+                            v.notice = Some((note.into(), Instant::now() + Duration::from_secs(4)));
+                        }
+                        Err(e) => {
+                            v.requests.failed.insert(user_id, e.to_string());
+                        }
+                    }
+                    self.needs_redraw = true;
+                }
+            }
+            WorkerEvent::RecentlyPlayedDone { result } => {
+                if let Screen::Menu(v) = &mut self.screen {
+                    v.recent = result;
+                    self.needs_redraw = true;
+                }
+            }
             WorkerEvent::PlacesDone { query, result } => {
                 if let Screen::Menu(v) = &mut self.screen {
                     // Ignore stale responses for an edited query.
@@ -513,7 +572,15 @@ impl App {
                 }
             }
             WorkerEvent::LoggedOut => {
+                // Remove the signed-out account from the switcher.
+                if let Screen::Menu(v) = &self.screen {
+                    config::remove_account(v.profile.id);
+                } else if let Some(m) = &self.suspended_menu {
+                    config::remove_account(m.profile.id);
+                }
                 config::clear_session();
+                self.adding_account = false;
+                self.suspended_menu = None;
                 self.enter_login(None);
             }
         }
@@ -566,14 +633,22 @@ impl ApplicationHandler<UserEvent> for App {
                     self.mouse_down.as_ref().map(|h| matches!(h, Hit::Scrollbar)).unwrap_or(false),
                 ) {
                     if let Screen::Menu(v) = &mut self.screen {
-                        let (scroll, k) = match v.tab {
-                            MenuTab::Home => (
+                        let (scroll, k) = match (v.tab, v.friend_pane, v.settings.tab) {
+                            (MenuTab::Home, _, _) => (
                                 &mut v.places_scroll,
                                 v.places_metrics.as_ref().map(|m| (m.content_h / m.h.max(1.0)).max(1.0)).unwrap_or(1.0),
                             ),
-                            MenuTab::AddFriends => (
+                            (MenuTab::Friends, FriendPane::Requests, _) => (
+                                &mut v.requests_scroll,
+                                v.requests_metrics.as_ref().map(|m| (m.content_h / m.h.max(1.0)).max(1.0)).unwrap_or(1.0),
+                            ),
+                            (MenuTab::Friends, FriendPane::Search, _) => (
                                 &mut v.add_scroll,
                                 v.add_metrics.as_ref().map(|m| (m.content_h / m.h.max(1.0)).max(1.0)).unwrap_or(1.0),
+                            ),
+                            (MenuTab::Settings, _, SettingsTab::General) | (MenuTab::Settings, _, SettingsTab::Appearance) => (
+                                &mut v.settings_scroll,
+                                v.settings_metrics.as_ref().map(|m| (m.content_h / m.h.max(1.0)).max(1.0)).unwrap_or(1.0),
                             ),
                         };
                         *scroll = (start_scroll + (position.y as f32 - start_y) * k).max(0.0);
@@ -593,9 +668,11 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     if let Hit::Scrollbar = hit {
                         if let Screen::Menu(v) = &mut self.screen {
-                            let start = match v.tab {
-                                MenuTab::Home => v.places_scroll,
-                                MenuTab::AddFriends => v.add_scroll,
+                            let start = match (v.tab, v.friend_pane, v.settings.tab) {
+                                (MenuTab::Home, _, _) => v.places_scroll,
+                                (MenuTab::Friends, FriendPane::Requests, _) => v.requests_scroll,
+                                (MenuTab::Friends, FriendPane::Search, _) => v.add_scroll,
+                                (MenuTab::Settings, _, _) => v.settings_scroll,
                             };
                             self.drag_scroll = Some((self.cursor.1, start));
                         }
@@ -617,9 +694,14 @@ impl ApplicationHandler<UserEvent> for App {
                         if pressed_hit == released_hit {
                             match released_hit {
                                 Hit::TabPassword | Hit::TabCookie | Hit::SignIn | Hit::Verify
-                                | Hit::Resend | Hit::Back | Hit::Logout | Hit::NavHome | Hit::NavAdd
+                                | Hit::Resend | Hit::Back | Hit::Logout | Hit::NavFriends | Hit::NavSettings
                                 | Hit::AddSearchBtn | Hit::AddUser(_)
-                                | Hit::SearchPlacesBtn | Hit::SidebarToggle
+                                | Hit::SearchPlacesBtn | Hit::SidebarToggle | Hit::Logo
+                                | Hit::TabRequests | Hit::TabSearch | Hit::RequestAccept(_)
+                                | Hit::RequestDecline(_) | Hit::SwitchAccount(_) | Hit::AddAccount
+                                | Hit::ThemePreset(_) | Hit::ToggleRecommendations | Hit::SettingsTab(_)
+                                | Hit::RadiusUp | Hit::RadiusDown | Hit::ColorPrev(_)
+                                | Hit::ColorNext(_) | Hit::ResetAppearance | Hit::CancelAdd
                                 | Hit::StripLeft | Hit::StripRight | Hit::JoinPlace(_) => {
                                     self.handle_button(released_hit);
                                 }
@@ -645,9 +727,11 @@ impl ApplicationHandler<UserEvent> for App {
                     if over_strip {
                         v.strip_scroll = (v.strip_scroll - amount).max(0.0);
                     } else {
-                        match v.tab {
-                            MenuTab::Home => v.places_scroll = (v.places_scroll - amount).max(0.0),
-                            MenuTab::AddFriends => v.add_scroll = (v.add_scroll - amount).max(0.0),
+                        match (v.tab, v.friend_pane, v.settings.tab) {
+                            (MenuTab::Home, _, _) => v.places_scroll = (v.places_scroll - amount).max(0.0),
+                            (MenuTab::Friends, FriendPane::Requests, _) => v.requests_scroll = (v.requests_scroll - amount).max(0.0),
+                            (MenuTab::Friends, FriendPane::Search, _) => v.add_scroll = (v.add_scroll - amount).max(0.0),
+                            (MenuTab::Settings, _, _) => v.settings_scroll = (v.settings_scroll - amount).max(0.0),
                         }
                     }
                     self.request_redraw();
@@ -758,22 +842,32 @@ impl App {
     fn scroll_step(&mut self, hit: &Hit) {
         if let Screen::Menu(v) = &mut self.screen {
             let d = 1.5 * theme::ROW_H * self.scale;
-            match (&v.tab, hit) {
-                (MenuTab::Home, Hit::ScrollUp) => v.places_scroll = (v.places_scroll - d).max(0.0),
-                (MenuTab::Home, Hit::ScrollDown) => {
+            match (v.tab, v.friend_pane, v.settings.tab, hit) {
+                (MenuTab::Home, _, _, Hit::ScrollUp) => v.places_scroll = (v.places_scroll - d).max(0.0),
+                (MenuTab::Home, _, _, Hit::ScrollDown) => {
                     let max = v.places_metrics.as_ref().map(|m| (m.content_h - m.h).max(0.0)).unwrap_or(0.0);
                     v.places_scroll = (v.places_scroll + d).min(max);
                 }
-                (MenuTab::AddFriends, Hit::ScrollUp) => v.add_scroll = (v.add_scroll - d).max(0.0),
-                (MenuTab::AddFriends, Hit::ScrollDown) => {
+                (MenuTab::Friends, FriendPane::Requests, _, Hit::ScrollUp) => v.requests_scroll = (v.requests_scroll - d).max(0.0),
+                (MenuTab::Friends, FriendPane::Requests, _, Hit::ScrollDown) => {
+                    let max = v.requests_metrics.as_ref().map(|m| (m.content_h - m.h).max(0.0)).unwrap_or(0.0);
+                    v.requests_scroll = (v.requests_scroll + d).min(max);
+                }
+                (MenuTab::Friends, FriendPane::Search, _, Hit::ScrollUp) => v.add_scroll = (v.add_scroll - d).max(0.0),
+                (MenuTab::Friends, FriendPane::Search, _, Hit::ScrollDown) => {
                     let max = v.add_metrics.as_ref().map(|m| (m.content_h - m.h).max(0.0)).unwrap_or(0.0);
                     v.add_scroll = (v.add_scroll + d).min(max);
                 }
-                (_, Hit::StripLeft) => {
+                (MenuTab::Settings, _, _, Hit::ScrollUp) => v.settings_scroll = (v.settings_scroll - d).max(0.0),
+                (MenuTab::Settings, _, _, Hit::ScrollDown) => {
+                    let max = v.settings_metrics.as_ref().map(|m| (m.content_h - m.h).max(0.0)).unwrap_or(0.0);
+                    v.settings_scroll = (v.settings_scroll + d).min(max);
+                }
+                (_, _, _, Hit::StripLeft) => {
                     let d = 3.0 * (theme::STRIP_CARD_W + 8.0) * self.scale;
                     v.strip_scroll = (v.strip_scroll - d).max(0.0);
                 }
-                (_, Hit::StripRight) => {
+                (_, _, _, Hit::StripRight) => {
                     let d = 3.0 * (theme::STRIP_CARD_W + 8.0) * self.scale;
                     let max = v.strip_metrics.as_ref().map(|m| (m.content_h - m.h).max(0.0)).unwrap_or(0.0);
                     v.strip_scroll = (v.strip_scroll + d).min(max);
@@ -816,17 +910,189 @@ impl App {
                 }
                 self.needs_redraw = true;
             }
-            Hit::NavHome => {
+            Hit::NavFriends => {
                 if let Screen::Menu(v) = &mut self.screen {
-                    v.tab = MenuTab::Home;
+                    v.tab = MenuTab::Friends;
+                    self.focus = None;
+                    // Fresh list of incoming requests on every visit.
+                    v.requests.loading = true;
+                    v.requests.error = None;
+                }
+                self.send_command(Command::FetchFriendRequests);
+                self.needs_redraw = true;
+            }
+            Hit::NavSettings => {
+                if let Screen::Menu(v) = &mut self.screen {
+                    v.tab = MenuTab::Settings;
                     self.focus = None;
                 }
                 self.needs_redraw = true;
             }
-            Hit::NavAdd => {
+            Hit::Logo => {
+                // The wordmark is Home: refresh + jump to the top.
                 if let Screen::Menu(v) = &mut self.screen {
-                    v.tab = MenuTab::AddFriends;
+                    v.tab = MenuTab::Home;
+                    v.places_scroll = 0.0;
+                    v.strip_scroll = 0.0;
+                    if !v.refreshing {
+                        v.refreshing = true;
+                        v.next_refresh = Some(Instant::now() + Duration::from_secs(REFRESH_SECS));
+                        self.send_command(Command::StartRefresh);
+                    }
+                }
+                self.focus = None;
+                self.needs_redraw = true;
+            }
+            Hit::CancelAdd => {
+                if let Some(m) = self.suspended_menu.take() {
+                    self.screen = Screen::Menu(m);
+                }
+                self.adding_account = false;
+                self.focus = None;
+                self.needs_redraw = true;
+            }
+            Hit::TabRequests => {
+                if let Screen::Menu(v) = &mut self.screen {
+                    v.friend_pane = FriendPane::Requests;
+                    self.focus = None;
+                }
+                self.needs_redraw = true;
+            }
+            Hit::TabSearch => {
+                if let Screen::Menu(v) = &mut self.screen {
+                    v.friend_pane = FriendPane::Search;
                     self.focus = Some(FieldId::AddSearch);
+                }
+                self.needs_redraw = true;
+            }
+            Hit::RequestAccept(user_id) | Hit::RequestDecline(user_id) => {
+                let accept = matches!(hit, Hit::RequestAccept(_));
+                if let Screen::Menu(v) = &mut self.screen {
+                    if !v.requests.acting.contains(&user_id) {
+                        v.requests.acting.push(user_id);
+                        v.requests.failed.remove(&user_id);
+                        self.send_command(Command::RespondFriendRequest { user_id, accept });
+                    }
+                }
+                self.needs_redraw = true;
+            }
+            Hit::SwitchAccount(user_id) => {
+                let account = config::load_accounts().into_iter().find(|a| a.user_id == user_id);
+                if let Some(acc) = account {
+                    if let Screen::Menu(v) = &mut self.screen {
+                        v.notice = Some(("Switching account…".into(), Instant::now() + Duration::from_secs(4)));
+                    }
+                    self.send_command(Command::LoginCookie { token: acc.security_token });
+                }
+                self.needs_redraw = true;
+            }
+            Hit::AddAccount => {
+                if let Screen::Menu(v) = &mut self.screen {
+                    let menu = std::mem::replace(v, MenuView::new(v.profile.clone()));
+                    self.suspended_menu = Some(menu);
+                }
+                self.adding_account = true;
+                self.screen = Screen::Login(LoginView::new());
+                self.focus = None;
+                self.needs_redraw = true;
+            }
+            Hit::ThemePreset(idx) => {
+                if let Screen::Menu(v) = &mut self.screen {
+                    let has_custom = v.app_settings.custom.is_some();
+                    let ids = ["dark", "light", "gruvbox", "nord", "custom"];
+                    if let Some(id) = ids.get(idx as usize) {
+                        if *id == "custom" && !has_custom {
+                            return;
+                        }
+                        v.app_settings.theme = (*id).to_string();
+                        theme::apply(theme::by_id(id, v.app_settings.custom));
+                        config::save_settings(&v.app_settings);
+                    }
+                }
+                self.needs_redraw = true;
+            }
+            Hit::ToggleRecommendations => {
+                if let Screen::Menu(v) = &mut self.screen {
+                    v.app_settings.show_recommendations = !v.app_settings.show_recommendations;
+                    config::save_settings(&v.app_settings);
+                }
+                self.needs_redraw = true;
+            }
+            Hit::SettingsTab(i) => {
+                if let Screen::Menu(v) = &mut self.screen {
+                    v.settings.tab = if i == 1 { SettingsTab::Appearance } else { SettingsTab::General };
+                    v.settings_scroll = 0.0;
+                }
+                self.focus = None;
+                self.needs_redraw = true;
+            }
+            Hit::RadiusUp | Hit::RadiusDown => {
+                if let Screen::Menu(v) = &mut self.screen {
+                    if v.app_settings.custom.is_none() {
+                        v.app_settings.custom = Some(theme::cur());
+                        v.app_settings.theme = "custom".into();
+                    }
+                    let delta = if matches!(hit, Hit::RadiusUp) { 0.25 } else { -0.25 };
+                    if let Some(c) = v.app_settings.custom.as_mut() {
+                        c.radius_scale = (c.radius_scale + delta).clamp(0.0, 2.5);
+                        theme::apply(*c);
+                    }
+                    config::save_settings(&v.app_settings);
+                }
+                self.needs_redraw = true;
+            }
+            Hit::ColorPrev(i) | Hit::ColorNext(i) => {
+                let dir = if matches!(hit, Hit::ColorNext(_)) { 1 } else { -1 };
+                if let Screen::Menu(v) = &mut self.screen {
+                    if v.app_settings.custom.is_none() {
+                        v.app_settings.custom = Some(theme::cur());
+                        v.app_settings.theme = "custom".into();
+                    }
+                    if let Some(c) = v.app_settings.custom.as_mut() {
+                        let cur = crate::menu_ui::theme_field(*c, i);
+                        let next = crate::menu_ui::cycle_color(cur, dir);
+                        *c = crate::menu_ui::set_theme_slot(*c, i, next);
+                        theme::apply(*c);
+                    }
+                    config::save_settings(&v.app_settings);
+                }
+                self.needs_redraw = true;
+            }
+            Hit::ResetAppearance => {
+                if let Screen::Menu(v) = &mut self.screen {
+                    v.app_settings.custom = Some(theme::DARK);
+                    v.app_settings.theme = "custom".into();
+                    theme::apply(theme::DARK);
+                    config::save_settings(&v.app_settings);
+                }
+                self.needs_redraw = true;
+            }
+            Hit::ClearField(id) => {
+                if let Screen::Menu(v) = &mut self.screen {
+                    match id {
+                        FieldId::Search => {
+                            v.search.clear();
+                            // Restore the default feed (hides search output).
+                            self.run_place_search();
+                        }
+                        FieldId::AddSearch => {
+                            v.add.query.clear();
+                            v.add.results.clear();
+                            v.add.searched_once = false;
+                            v.add.error = None;
+                            v.add_scroll = 0.0;
+                        }
+                        _ => {}
+                    }
+                }
+                if let Screen::Login(v) = &mut self.screen {
+                    match id {
+                        FieldId::Username => v.username.clear(),
+                        FieldId::Password => v.password.clear(),
+                        FieldId::Cookie => v.cookie.clear(),
+                        FieldId::Code => v.code.clear(),
+                        _ => {}
+                    }
                 }
                 self.needs_redraw = true;
             }
@@ -889,7 +1155,13 @@ impl App {
         if ctrl && matches!(&event.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("f")) {
             if matches!(self.screen, Screen::Menu(_)) {
                 self.focus = Some(match &self.screen {
-                    Screen::Menu(v) if v.tab == MenuTab::AddFriends => FieldId::AddSearch,
+                    Screen::Menu(v) if v.tab == MenuTab::Friends && v.friend_pane == FriendPane::Search => FieldId::AddSearch,
+                    Screen::Menu(v) if v.tab == MenuTab::Friends => {
+                        if let Screen::Menu(v2) = &mut self.screen {
+                            v2.friend_pane = FriendPane::Search;
+                        }
+                        FieldId::AddSearch
+                    }
                     _ => FieldId::Search,
                 });
                 self.request_redraw();
@@ -919,8 +1191,12 @@ impl App {
                         }
                     }
                     Screen::Menu(v) => {
-                        if v.tab == MenuTab::AddFriends {
-                            // Esc goes back to the friends list.
+                        // Esc: back out one level (search pane -> requests ->
+                        // home), otherwise drop focus.
+                        if v.tab == MenuTab::Friends && v.friend_pane == FriendPane::Search {
+                            v.friend_pane = FriendPane::Requests;
+                            self.focus = None;
+                        } else if v.tab != MenuTab::Home {
                             v.tab = MenuTab::Home;
                             self.focus = None;
                         } else {

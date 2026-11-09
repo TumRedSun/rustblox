@@ -1,6 +1,6 @@
 [package]
 name = "rustblox"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 license = "GPL-3.0-only"
 description = "Open-source Roblox client built in Rust. Milestone 1: account login and friends menu with live presence."

@@ -42,11 +42,12 @@ impl PresenceKind {
     }
 
     pub fn dot_color(self) -> crate::theme::Rgba {
+        let t = crate::theme::cur();
         match self {
-            PresenceKind::Online => crate::theme::GREEN,
-            PresenceKind::InGame => crate::theme::BLUE,
-            PresenceKind::Studio => crate::theme::ORANGE,
-            PresenceKind::Offline | PresenceKind::Invisible => crate::theme::GRAY,
+            PresenceKind::Online => t.green,
+            PresenceKind::InGame => t.blue,
+            PresenceKind::Studio => t.orange,
+            PresenceKind::Offline | PresenceKind::Invisible => t.gray,
         }
     }
 }

@@ -122,12 +122,14 @@ impl<'a> FB<'a> {
     }
 
     /// Filled rounded rectangle (radius in px). Center uses the fast path,
-    /// only corner tiles do per-pixel work.
+    /// only corner tiles do per-pixel work. The radius is scaled by the
+    /// theme's global rounding multiplier (Settings → Appearance).
     pub fn rect_rounded(&mut self, x: i32, y: i32, w: i32, h: i32, radius: i32, color: Rgba) {
         if radius <= 0 {
             self.rect(x, y, w, h, color);
             return;
         }
+        let radius = (radius as f32 * crate::theme::cur().radius_scale).round() as i32;
         let r = radius.min(w / 2).min(h / 2);
         // Center band + middle columns.
         self.rect(x + r, y, w - 2 * r, h, color);
@@ -164,7 +166,7 @@ impl<'a> FB<'a> {
             return;
         }
         let (hw, hh) = (w as f32 / 2.0, h as f32 / 2.0);
-        let r = radius as f32;
+        let r = (radius as f32 * crate::theme::cur().radius_scale).max(0.0);
         let (sin, cos) = angle.sin_cos();
         // Bounding box big enough for the rotation (hypotenuse of half-size).
         let bound = (hw * hw + hh * hh).sqrt().ceil() as i32 + 2;
@@ -201,6 +203,7 @@ impl<'a> FB<'a> {
             self.outline(x, y, w, h, color);
             return;
         }
+        let radius = (radius as f32 * crate::theme::cur().radius_scale).round() as i32;
         let r = radius.min(w / 2).min(h / 2);
         self.rect(x + r, y, w - 2 * r, 1, color);
         self.rect(x + r, y + h - 1, w - 2 * r, 1, color);

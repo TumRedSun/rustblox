@@ -152,9 +152,9 @@ fn main() {
         view.password.value = "hunter2secret".into();
         let mut buf = blank_canvas(w, h);
         let mut fb = FB::new(&mut buf, w, h);
-        fb.fill(theme::BG);
+        fb.fill(theme::cur().bg);
         let mut ctx = p.ctx(Some(FieldId::Username));
-        rustblox::login_ui::draw(&mut view, &mut ctx, &mut fb, false);
+        rustblox::login_ui::draw(&mut view, &mut ctx, &mut fb, false, false);
         save(&buf, w, h, &format!("{dir}/preview_login_filled.png"));
     }
 
@@ -165,9 +165,9 @@ fn main() {
         view.tab = LoginTab::Cookie;
         let mut buf = blank_canvas(w, h);
         let mut fb = FB::new(&mut buf, w, h);
-        fb.fill(theme::BG);
+        fb.fill(theme::cur().bg);
         let mut ctx = p.ctx(Some(FieldId::Cookie));
-        rustblox::login_ui::draw(&mut view, &mut ctx, &mut fb, false);
+        rustblox::login_ui::draw(&mut view, &mut ctx, &mut fb, false, false);
         save(&buf, w, h, &format!("{dir}/preview_login_cookie.png"));
     }
 
@@ -183,9 +183,9 @@ fn main() {
         });
         let mut buf = blank_canvas(w, h);
         let mut fb = FB::new(&mut buf, w, h);
-        fb.fill(theme::BG);
+        fb.fill(theme::cur().bg);
         let mut ctx = p.ctx(Some(FieldId::Code));
-        rustblox::login_ui::draw(&mut view, &mut ctx, &mut fb, false);
+        rustblox::login_ui::draw(&mut view, &mut ctx, &mut fb, false, false);
         save(&buf, w, h, &format!("{dir}/preview_login_2fa.png"));
     }
 
@@ -202,7 +202,7 @@ fn main() {
         }
         let mut buf = blank_canvas(w, h);
         let mut fb = FB::new(&mut buf, w, h);
-        fb.fill(theme::BG);
+        fb.fill(theme::cur().bg);
         let mut ctx = p.ctx(Some(FieldId::Search));
         rustblox::menu_ui::draw(&mut view, &mut ctx, &mut fb);
         save(&buf, w, h, &format!("{dir}/preview_menu.png"));
@@ -216,7 +216,7 @@ fn main() {
         view.search.value = "obby".into();
         let mut buf = blank_canvas(w, h);
         let mut fb = FB::new(&mut buf, w, h);
-        fb.fill(theme::BG);
+        fb.fill(theme::cur().bg);
         let mut ctx = p.ctx(None);
         rustblox::menu_ui::draw(&mut view, &mut ctx, &mut fb);
         save(&buf, w, h, &format!("{dir}/preview_menu_mini.png"));
@@ -226,7 +226,8 @@ fn main() {
     {
         let mut p = Painter::new(&fonts);
         let mut view = blank_menu_view();
-        view.tab = rustblox::menu_ui::MenuTab::AddFriends;
+        view.tab = rustblox::menu_ui::MenuTab::Friends;
+        view.friend_pane = rustblox::menu_ui::FriendPane::Search;
         view.add.query.value = "builder".into();
         view.add.searched_once = true;
         view.add.results = vec![
@@ -238,7 +239,7 @@ fn main() {
         view.add.failed.insert(900, "Friend request already pending".into());
         let mut buf = blank_canvas(w, h);
         let mut fb = FB::new(&mut buf, w, h);
-        fb.fill(theme::BG);
+        fb.fill(theme::cur().bg);
         let mut ctx = p.ctx(Some(FieldId::AddSearch));
         rustblox::menu_ui::draw(&mut view, &mut ctx, &mut fb);
         save(&buf, w, h, &format!("{dir}/preview_menu_add.png"));
@@ -251,9 +252,70 @@ fn main() {
         view.places_scroll = 190.0;
         let mut buf = blank_canvas(w, h);
         let mut fb = FB::new(&mut buf, w, h);
-        fb.fill(theme::BG);
+        fb.fill(theme::cur().bg);
         let mut ctx = p.ctx(None);
         rustblox::menu_ui::draw(&mut view, &mut ctx, &mut fb);
         save(&buf, w, h, &format!("{dir}/preview_menu_scrolled.png"));
+    }
+
+    // 8. Menu: Friends tab — incoming friend requests pane.
+    {
+        let mut p = Painter::new(&fonts);
+        let mut view = blank_menu_view();
+        view.tab = rustblox::menu_ui::MenuTab::Friends;
+        view.friend_pane = rustblox::menu_ui::FriendPane::Requests;
+        view.requests.loaded_once = true;
+        view.requests.items = vec![
+            rustblox::model::UserEntry { id: 11, name: "requester_one".into(), display_name: "Requester One".into() },
+            rustblox::model::UserEntry { id: 12, name: "cool_player22".into(), display_name: "Cool Player".into() },
+        ];
+        for (id, a) in [fake_avatar(11u64), fake_avatar(12)] {
+            p.avatars.insert(id, a);
+        }
+        let mut buf = blank_canvas(w, h);
+        let mut fb = FB::new(&mut buf, w, h);
+        fb.fill(theme::cur().bg);
+        let mut ctx = p.ctx(None);
+        rustblox::menu_ui::draw(&mut view, &mut ctx, &mut fb);
+        save(&buf, w, h, &format!("{dir}/preview_friends_requests.png"));
+    }
+
+    // 9. Menu: Settings — General tab with accounts + themes.
+    {
+        let mut p = Painter::new(&fonts);
+        let mut view = blank_menu_view();
+        view.tab = rustblox::menu_ui::MenuTab::Settings;
+        view.accounts = vec![
+            rustblox::config::Session {
+                security_token: "x".into(), user_id: 42, username: "TumRedSun".into(), display_name: "TumRedSun".into(),
+            },
+            rustblox::config::Session {
+                security_token: "y".into(), user_id: 77, username: "alt_account".into(), display_name: "Alt Account".into(),
+            },
+        ];
+        for (id, a) in [fake_avatar(42u64), fake_avatar(77)] {
+            p.avatars.insert(id, a);
+        }
+        let mut buf = blank_canvas(w, h);
+        let mut fb = FB::new(&mut buf, w, h);
+        fb.fill(theme::cur().bg);
+        let mut ctx = p.ctx(None);
+        rustblox::menu_ui::draw(&mut view, &mut ctx, &mut fb);
+        save(&buf, w, h, &format!("{dir}/preview_settings.png"));
+    }
+
+    // 10. Menu: Settings — Appearance tab.
+    {
+        let mut p = Painter::new(&fonts);
+        let mut view = blank_menu_view();
+        view.tab = rustblox::menu_ui::MenuTab::Settings;
+        view.settings.tab = rustblox::menu_ui::SettingsTab::Appearance;
+        view.app_settings.custom = Some(rustblox::theme::DARK);
+        let mut buf = blank_canvas(w, h);
+        let mut fb = FB::new(&mut buf, w, h);
+        fb.fill(theme::cur().bg);
+        let mut ctx = p.ctx(None);
+        rustblox::menu_ui::draw(&mut view, &mut ctx, &mut fb);
+        save(&buf, w, h, &format!("{dir}/preview_appearance.png"));
     }
 }

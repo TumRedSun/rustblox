@@ -25,15 +25,21 @@ pub enum FieldId {
 pub enum Hit {
     None,
     Field(FieldId),
+    /// The little × inside a text field (clears it, hides results).
+    ClearField(FieldId),
     TabPassword,
     TabCookie,
     SignIn,
     Verify,
     Resend,
     Back,
+    /// The sidebar logo / wordmark: go Home, refresh, scroll to top.
+    Logo,
     /// Sidebar navigation.
-    NavHome,
-    NavAdd,
+    NavFriends,
+    NavSettings,
+    /// Login screen: abort "add another account" and return to the app.
+    CancelAdd,
     Logout,
     /// Collapse / expand the sidebar.
     SidebarToggle,
@@ -49,10 +55,34 @@ pub enum Hit {
     /// "Join" button on a place card (place id; joining is not implemented
     /// yet — visual only for now).
     JoinPlace(u64),
-    /// "Search" button in the Add Friends pane.
+    /// "Search" button in the Find-friends pane.
     AddSearchBtn,
     /// "Add" button on a search-result row (user id).
     AddUser(u64),
+    /// Friends pane tabs.
+    TabRequests,
+    TabSearch,
+    /// Accept / decline an incoming friend request (user id).
+    RequestAccept(u64),
+    RequestDecline(u64),
+    /// Quick-switch to another saved account (user id).
+    SwitchAccount(u64),
+    /// Settings: open the login screen to add another account.
+    AddAccount,
+    /// Settings: theme preset row (index into PRESETS + custom).
+    ThemePreset(u8),
+    /// Settings: recommendations on/off toggle.
+    ToggleRecommendations,
+    /// Appearance tab: settings sub-tabs (0 = general, 1 = appearance).
+    SettingsTab(u8),
+    /// Appearance tab: global corner radius +/-.
+    RadiusUp,
+    RadiusDown,
+    /// Appearance tab: cycle color slot i through the palette.
+    ColorPrev(usize),
+    ColorNext(usize),
+    /// Appearance tab: restore default (dark) colors.
+    ResetAppearance,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -278,25 +308,28 @@ impl TextField {
         label: Option<&str>,
     ) -> Rect {
         let s = ctx.scale;
+        let t = crate::theme::cur();
         // Label above the box.
         if let Some(lb) = label {
             let ly = y - (16.0 * s) as i32;
-            font::draw(ctx.fonts, fb, x as f32, (ly + (12.0 * s) as i32) as f32, lb, 12.0 * s, theme::TEXT_DIM, false, 0.0);
+            font::draw(ctx.fonts, fb, x as f32, (ly + (12.0 * s) as i32) as f32, lb, 12.0 * s, t.text_dim, false, 0.0);
         }
         let focused = ctx.focus == Some(id);
         // Frameless input: filled rounded rect only. Focus is shown with a
         // brighter fill plus an accent underline drawn inside the rect (no
         // separate outline => it can never misalign).
-        fb.rect_rounded(x, y, w, h, (8.0 * s) as i32, if focused { theme::SURFACE_2 } else { theme::INPUT_BG });
+        fb.rect_rounded(x, y, w, h, (8.0 * s) as i32, if focused { t.surface_2 } else { t.input_bg });
         if focused {
             let bar_h = (3.0 * s).max(1.0) as i32;
             let inset = (10.0 * s) as i32;
-            fb.rect(x + inset, y + h - bar_h - 1, w - 2 * inset, bar_h, theme::ACCENT);
+            fb.rect(x + inset, y + h - bar_h - 1, w - 2 * inset, bar_h, t.accent);
         }
 
         let pad_x = (12.0 * s) as i32;
+        // The clear (×) zone on the right, present while there is text.
+        let clear_w = if self.value.is_empty() { 0 } else { (26.0 * s) as i32 };
         let inner_x = x + pad_x;
-        let inner_w = w - 2 * pad_x;
+        let inner_w = w - 2 * pad_x - clear_w;
         let font_px = 14.0 * s;
         let baseline = y as f32 + h as f32 * 0.5 + font_px * 0.35;
 
@@ -325,7 +358,7 @@ impl TextField {
         fb.set_clip(text_clip);
 
         if self.value.is_empty() && !focused {
-            font::draw(ctx.fonts, fb, inner_x as f32, baseline, self.placeholder, font_px, theme::TEXT_FAINT, false, 0.0);
+            font::draw(ctx.fonts, fb, inner_x as f32, baseline, self.placeholder, font_px, t.text_faint, false, 0.0);
         } else {
             // Selection highlight.
             if let Some((a, b)) = self.sel {
@@ -337,7 +370,7 @@ impl TextField {
                     y + (4.0 * s) as i32,
                     ((ex - sx) as i32).max(2),
                     h - (8.0 * s) as i32,
-                    theme::SELECTION,
+                    t.selection,
                 );
             }
             font::draw(
@@ -347,7 +380,7 @@ impl TextField {
                 baseline,
                 &shown,
                 font_px,
-                theme::TEXT,
+                t.text,
                 false,
                 0.0,
             );
@@ -361,7 +394,7 @@ impl TextField {
                         y + (7.0 * s) as i32,
                         (2.0 * s).max(1.0) as i32,
                         h - (14.0 * s) as i32,
-                        theme::ACCENT,
+                        t.accent,
                     );
                 }
                 ctx.caret_anim = true;
@@ -371,6 +404,28 @@ impl TextField {
 
         let r = Rect { x, y, w, h };
         ctx.hits.add(r, Hit::Field(id));
+
+        // Clear (×) button on the right: erases everything typed. Registered
+        // after the field hit so it wins the hit test on top of it.
+        if clear_w > 0 {
+            let bw = (20.0 * s) as i32;
+            let bx = x + w - bw - (4.0 * s) as i32;
+            let by = y + (h - bw) / 2;
+            let crect = Rect { x: bx, y: by, w: bw, h: bw };
+            let (mx, my) = ctx.cursor;
+            let hov = crect.contains(mx, my);
+            let cc = if hov { t.text } else { t.text_faint };
+            let c = bw as f32;
+            let (x0, x1) = (bx as f32 + c * 0.30, bx as f32 + c * 0.70);
+            let (y0, y1) = (by as f32 + c * 0.30, by as f32 + c * 0.70);
+            let n = ((x1 - x0).ceil() as i32).max(1);
+            for i in 0..=n {
+                let fr = i as f32 / n as f32;
+                fb.set_f(x0 + fr * (x1 - x0), y0 + fr * (y1 - y0), cc);
+                fb.set_f(x0 + fr * (x1 - x0), y1 - fr * (y1 - y0), cc);
+            }
+            ctx.hits.add(crect, Hit::ClearField(id));
+        }
         r
     }
 }
@@ -398,6 +453,7 @@ pub fn draw_button(
     disabled: bool,
 ) -> Rect {
     let s = ctx.scale;
+    let t = theme::cur();
     let hovered = !disabled
         && ctx.cursor.0 >= r.x as f32
         && ctx.cursor.0 < (r.x + r.w) as f32
@@ -406,30 +462,30 @@ pub fn draw_button(
     let (bg, fg) = match style {
         BtnStyle::Primary => {
             if disabled {
-                (theme::BTN_DISABLED, theme::TEXT_FAINT)
+                (t.btn_disabled, t.text_faint)
             } else if hovered {
-                (theme::ACCENT_HOVER, theme::BTN_TEXT)
+                (t.accent_hover, t.btn_text)
             } else {
-                (theme::ACCENT, theme::BTN_TEXT)
+                (t.accent, t.btn_text)
             }
         }
         BtnStyle::Secondary => {
             if disabled {
-                (theme::BTN_DISABLED, theme::TEXT_FAINT)
+                (t.btn_disabled, t.text_faint)
             } else if hovered {
-                (theme::SURFACE_2, theme::TEXT)
+                (t.surface_2, t.text)
             } else {
-                (theme::SURFACE, theme::TEXT)
+                (t.surface, t.text)
             }
         }
-        BtnStyle::Ghost => (theme::BG, if hovered { theme::TEXT } else { theme::TEXT_DIM }),
+        BtnStyle::Ghost => (t.bg, if hovered { t.text } else { t.text_dim }),
         BtnStyle::Success => {
             if disabled {
-                (theme::BTN_DISABLED, theme::TEXT_FAINT)
+                (t.btn_disabled, t.text_faint)
             } else if hovered {
-                (theme::GREEN_HOVER, theme::BTN_TEXT)
+                (t.green_hover, t.btn_text)
             } else {
-                (theme::GREEN, theme::BTN_TEXT)
+                (t.green, t.btn_text)
             }
         }
     };

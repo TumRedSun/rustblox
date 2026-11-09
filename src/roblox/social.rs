@@ -8,8 +8,8 @@ use crate::roblox::client::{
 };
 use crate::roblox::errors::ApiError;
 use crate::roblox::types::{
-    FriendsResponse, GamesResponse, LastOnlineResponse, OmniResponse, PresenceResponse,
-    ThumbsResponse, UserSearchResponse, UsersBatchResponse,
+    FriendRequestsResponse, FriendsResponse, GamesResponse, LastOnlineResponse, OmniResponse,
+    PresenceResponse, ThumbsResponse, UserSearchResponse, UsersBatchResponse,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -64,6 +64,76 @@ pub fn search_users(c: &mut RobloxClient, keyword: &str, limit: u32) -> Result<V
 /// to the user as-is.
 pub fn send_friend_request(c: &mut RobloxClient, user_id: u64) -> Result<(), ApiError> {
     let url = format!("{}/v1/friends/{}/request-friendship", FRIENDS_BASE, user_id);
+    let raw = c.post_raw(&url, &json!({}))?;
+    if (200..300).contains(&raw.status) {
+        return Ok(());
+    }
+    Err(raw.error())
+}
+
+/// GET /v1/users/{userId}/friends/requests — incoming friend requests.
+/// Falls back to the older /v1/my/friends/requests path; entries carry either
+/// `userId` or `id`, names are resolved with the batch users endpoint.
+pub fn fetch_friend_requests(c: &mut RobloxClient, user_id: u64) -> Result<Vec<UserEntry>, ApiError> {
+    let urls = [
+        format!("{}/v1/users/{}/friends/requests?limit=50", FRIENDS_BASE, user_id),
+        format!("{}/v1/my/friends/requests?limit=50", FRIENDS_BASE),
+    ];
+    let mut ids: Vec<u64> = Vec::new();
+    let mut last_err: Option<ApiError> = None;
+    for url in urls {
+        match c.send(&url, None) {
+            Ok(raw) if (200..300).contains(&raw.status) => {
+                if let Ok(fr) = raw.json::<FriendRequestsResponse>() {
+                    ids = fr
+                        .data
+                        .iter()
+                        .filter_map(|e| e.user_id.or(e.id))
+                        .filter(|id| *id != 0)
+                        .collect();
+                    ids.dedup();
+                    if !ids.is_empty() {
+                        break;
+                    }
+                }
+            }
+            Ok(raw) => last_err = Some(raw.error()),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    if ids.is_empty() {
+        return match last_err {
+            Some(e) => Err(e),
+            None => Ok(Vec::new()),
+        };
+    }
+    let details = fetch_user_details(c, &ids);
+    Ok(ids
+        .iter()
+        .map(|id| {
+            let (name, display, _) = details.get(id).cloned().unwrap_or_default();
+            UserEntry {
+                id: *id,
+                name: if name.is_empty() { id.to_string() } else { name },
+                display_name: display,
+            }
+        })
+        .collect())
+}
+
+/// POST /v1/users/{userId}/accept-friend-request — accept an incoming request.
+pub fn accept_friend_request(c: &mut RobloxClient, user_id: u64) -> Result<(), ApiError> {
+    let url = format!("{}/v1/users/{}/accept-friend-request", FRIENDS_BASE, user_id);
+    let raw = c.post_raw(&url, &json!({}))?;
+    if (200..300).contains(&raw.status) {
+        return Ok(());
+    }
+    Err(raw.error())
+}
+
+/// POST /v1/users/{userId}/decline-friend-request — decline an incoming request.
+pub fn decline_friend_request(c: &mut RobloxClient, user_id: u64) -> Result<(), ApiError> {
+    let url = format!("{}/v1/users/{}/decline-friend-request", FRIENDS_BASE, user_id);
     let raw = c.post_raw(&url, &json!({}))?;
     if (200..300).contains(&raw.status) {
         return Ok(());
@@ -373,14 +443,21 @@ fn fnv1a64(data: &[u8]) -> u64 {
 }
 
 /// Parse an omni discovery payload (search or recommendation feed) into
-/// place cards. Sponsored entries and entries without a name/place id are
-/// skipped; duplicates by universe id are removed.
-fn parse_omni(body: &[u8], limit: usize) -> Result<Vec<PlaceCard>, ApiError> {
+/// place cards, keeping only groups matching `want`. Sponsored entries and
+/// entries without a name/place id are skipped; duplicates by universe id
+/// are removed.
+fn parse_omni_where(body: &[u8], want: &dyn Fn(&OmniGroupKind) -> bool, limit: usize) -> Result<Vec<PlaceCard>, ApiError> {
     let omni: OmniResponse =
         serde_json::from_slice(body).map_err(|e| ApiError::Parse(format!("places: {}", e)))?;
     let mut out: Vec<PlaceCard> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     'groups: for group in omni.search_results {
+        let kind = OmniGroupKind {
+            group_type: group.content_group_type.as_deref().unwrap_or(""),
+        };
+        if !want(&kind) {
+            continue;
+        }
         for item in group.contents {
             if out.len() >= limit {
                 break 'groups;
@@ -420,6 +497,25 @@ fn parse_omni(body: &[u8], limit: usize) -> Result<Vec<PlaceCard>, ApiError> {
     Ok(out)
 }
 
+/// Which content group a omni payload group belongs to.
+pub struct OmniGroupKind<'a> {
+    pub group_type: &'a str,
+}
+
+/// Any group (the default feed flattening).
+fn any_group(_: &OmniGroupKind) -> bool {
+    true
+}
+
+/// The "continue playing" group of the home discovery feed (recently played).
+fn continue_group(g: &OmniGroupKind) -> bool {
+    g.group_type.to_lowercase().contains("continue")
+}
+
+fn parse_omni(body: &[u8], limit: usize) -> Result<Vec<PlaceCard>, ApiError> {
+    parse_omni_where(body, &any_group, limit)
+}
+
 /// GET apis.roblox.com/search-api/omni-search?searchQuery=... — place search
 /// by name. Returns up to `limit` cards.
 pub fn search_games(c: &mut RobloxClient, keyword: &str, limit: usize) -> Result<Vec<PlaceCard>, ApiError> {
@@ -447,4 +543,18 @@ pub fn recommended_games(c: &mut RobloxClient, limit: usize) -> Result<Vec<Place
         return Err(raw.error());
     }
     parse_omni(&raw.body, limit)
+}
+
+/// POST apis.roblox.com/discovery-api/omni-recommendation with pageType
+/// "Home" — the website home feed; its "ContinuePlaying" group is the
+/// recently played row. Returns an empty Vec (not an error) when the payload
+/// has no such group.
+pub fn recently_played(c: &mut RobloxClient, limit: usize) -> Result<Vec<PlaceCard>, ApiError> {
+    let url = format!("{}/discovery-api/omni-recommendation", APIS_BASE);
+    let body = json!({ "sessionId": pseudo_uuid(), "pageType": "Home" });
+    let raw = c.send(&url, Some(&body))?;
+    if !(200..300).contains(&raw.status) {
+        return Err(raw.error());
+    }
+    parse_omni_where(&raw.body, &continue_group, limit)
 }

@@ -109,6 +109,26 @@ pub struct FriendEntry {
     pub is_banned: Option<bool>,
 }
 
+/// GET https://friends.roblox.com/v1/users/{userId}/friends/requests
+///
+/// Different generations of this endpoint use either `userId` or `id` for the
+/// requester; both are optional/defensive here and names are resolved with
+/// POST users.roblox.com/v1/users afterwards.
+#[derive(Debug, Deserialize, Default)]
+pub struct FriendRequestsResponse {
+    #[serde(default)]
+    pub data: Vec<FriendRequestEntry>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct FriendRequestEntry {
+    #[serde(default)]
+    pub user_id: Option<u64>,
+    #[serde(default)]
+    pub id: Option<u64>,
+}
+
 /// POST https://users.roblox.com/v1/users — batch user details (names).
 #[derive(Debug, Deserialize, Default)]
 pub struct UsersBatchResponse {
