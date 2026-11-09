@@ -1,0 +1,115 @@
+# Nightly builds: every night (and on demand) RustBlox is compiled for all
+# supported platforms; the release step publishes/updates a rolling
+# "nightly" GitHub Release whose assets are replaced (clobbered) on each run.
+#
+# Trigger manually: Actions -> Nightly builds -> Run workflow.
+
+name: Nightly builds
+
+on:
+  schedule:
+    # 02:00 UTC every day.
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests
+        run: cargo test --release
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            binary: rustblox
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: rustblox.exe
+          - os: macos-14
+            target: aarch64-apple-darwin
+            binary: rustblox
+          - os: macos-13
+            target: x86_64-apple-darwin
+            binary: rustblox
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          NAME="rustblox-${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/${NAME}.exe"
+          cp README.md LICENSE dist/
+          cd dist
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a -y "rustblox-nightly-${{ matrix.target }}.zip" "rustblox-${{ matrix.target }}.exe" README.md LICENSE
+          else
+            zip -q "rustblox-nightly-${{ matrix.target }}.zip" "rustblox-${{ matrix.target }}.exe" README.md LICENSE
+          fi
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustblox-nightly-${{ matrix.target }}
+          path: dist/rustblox-nightly-*.zip
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Publish / refresh the rolling "nightly" release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          DATE=$(date -u +%Y-%m-%d)
+          NOTES=$(cat <<EOF
+          Automated nightly build of \`main\` (${DATE}).
+
+          Assets (all unofficial, may be unstable — see the README for sign-in instructions):
+
+          | File | Platform |
+          |------|----------|
+          | \`rustblox-nightly-x86_64-unknown-linux-gnu.zip\` | Linux 64-bit |
+          | \`rustblox-nightly-x86_64-pc-windows-msvc.zip\` | Windows 64-bit |
+          | \`rustblox-nightly-aarch64-apple-darwin.zip\` | macOS Apple Silicon |
+          | \`rustblox-nightly-x86_64-apple-darwin.zip\` | macOS Intel |
+          EOF
+          )
+          if gh release view nightly > /dev/null 2>&1; then
+            gh release edit nightly --title "Nightly build (${DATE})" --notes "$NOTES" --prerelease
+          else
+            gh release create nightly --prerelease --title "Nightly build (${DATE})" --notes "$NOTES"
+          fi
+          gh release upload nightly artifacts/*.zip --clobber
+          echo "Nightly release refreshed for ${DATE}."
