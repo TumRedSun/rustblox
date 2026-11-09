@@ -20,9 +20,9 @@ env:
 
 jobs:
   test:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
@@ -34,21 +34,26 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-22.04
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             binary: rustblox
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             binary: rustblox.exe
-          - os: macos-14
+          # macos-14 was retired by GitHub on 2026-11-02 ("The configuration
+          # 'macos-14-arm64-us-default' is not supported"); macos-15 is the
+          # current ARM64 image.
+          - os: macos-15
             target: aarch64-apple-darwin
             binary: rustblox
-          - os: macos-13
+          # macos-13 was retired on 2025-12-04; macos-15-intel is the last
+          # x86_64 image GitHub offers (supported until August 2027).
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             binary: rustblox
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
