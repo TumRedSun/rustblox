@@ -97,6 +97,9 @@ jobs:
       - name: Publish / refresh the rolling "nightly" release
         env:
           GH_TOKEN: ${{ github.token }}
+          # No checkout happens in this job, so tell gh which repository to
+          # target instead of letting it probe the (missing) git remote.
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           DATE=$(date -u +%Y-%m-%d)
