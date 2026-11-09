@@ -702,6 +702,7 @@ impl App {
         }
 
         // Field editing keys.
+        let mods = self.mods;
         let mut edited = false;
         if let Some(f) = self.focused_field_mut() {
             match &event.logical_key {
@@ -729,11 +730,71 @@ impl App {
                     f.end();
                     edited = true;
                 }
+                Key::Named(NamedKey::Space) => {
+                    if char_input_allowed(mods) {
+                        f.insert(" ");
+                        edited = true;
+                    }
+                }
+                Key::Character(text) => {
+                    // Plain text entry (letters, digits, punctuation,
+                    // Cyrillic…). Shortcut combos are filtered by
+                    // char_input_allowed; Ctrl+V/A were already handled above.
+                    if char_input_allowed(mods) {
+                        f.insert(text);
+                        edited = true;
+                    }
+                }
                 _ => {}
             }
         }
         if edited {
             self.request_redraw();
         }
+    }
+}
+
+/// Whether a `Key::Character` press with these modifiers should insert text.
+///
+/// * No modifiers, or Shift only — insert.
+/// * Ctrl or Alt alone — a shortcut, do not insert (Ctrl+V/A are handled
+///   earlier in [`App::on_key`]).
+/// * Ctrl+Alt together — that is AltGr on Windows / European layouts, which
+///   produces printable characters (`\`, `@`, `#`, `€`…), so insert.
+/// * Super (Cmd/Win) — system shortcut, do not insert.
+pub fn char_input_allowed(mods: ModifiersState) -> bool {
+    let ctrl = mods.contains(ModifiersState::CONTROL);
+    let alt = mods.contains(ModifiersState::ALT);
+    let sup = mods.contains(ModifiersState::SUPER);
+    if sup {
+        return false;
+    }
+    // Exactly one of ctrl/alt => shortcut. Both (or neither) => text.
+    !(ctrl ^ alt)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::char_input_allowed;
+    use winit::keyboard::ModifiersState;
+
+    #[test]
+    fn plain_and_shifted_typing_allowed() {
+        assert!(char_input_allowed(ModifiersState::empty()));
+        assert!(char_input_allowed(ModifiersState::SHIFT));
+    }
+
+    #[test]
+    fn shortcut_modifiers_rejected() {
+        assert!(!char_input_allowed(ModifiersState::CONTROL));
+        assert!(!char_input_allowed(ModifiersState::ALT));
+        assert!(!char_input_allowed(ModifiersState::SUPER));
+        assert!(!char_input_allowed(ModifiersState::CONTROL | ModifiersState::SHIFT));
+    }
+
+    #[test]
+    fn altgr_counts_as_text() {
+        // AltGr is reported as Ctrl+Alt on Windows/EU layouts.
+        assert!(char_input_allowed(ModifiersState::CONTROL | ModifiersState::ALT));
     }
 }
