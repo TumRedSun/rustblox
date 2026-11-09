@@ -2,9 +2,9 @@
 //! All requests are batched (<=100 ids per call) to minimize round trips.
 
 use crate::model::{Friend, Presence, PresenceKind};
-use crate::roblox::client::{RobloxClient, FRIENDS_BASE, GAMES_BASE, PRESENCE_BASE, THUMBS_BASE};
+use crate::roblox::client::{RobloxClient, FRIENDS_BASE, GAMES_BASE, PRESENCE_BASE, THUMBS_BASE, USERS_BASE};
 use crate::roblox::errors::ApiError;
-use crate::roblox::types::{FriendsResponse, GamesResponse, LastOnlineResponse, PresenceResponse, ThumbsResponse};
+use crate::roblox::types::{FriendsResponse, GamesResponse, LastOnlineResponse, PresenceResponse, ThumbsResponse, UsersBatchResponse};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -25,7 +25,7 @@ pub fn fetch_friends(c: &mut RobloxClient, user_id: u64) -> Result<Vec<Friend>, 
     // context can also return an {"errors":[...]} envelope — parse defensibly.
     let fr: FriendsResponse = serde_json::from_slice(&raw.body)
         .map_err(|e| ApiError::Parse(format!("friends: {}", e)))?;
-    Ok(fr
+    let mut friends: Vec<Friend> = fr
         .data
         .into_iter()
         .map(|f| {
@@ -40,7 +40,64 @@ pub fn fetch_friends(c: &mut RobloxClient, user_id: u64) -> Result<Vec<Friend>, 
                 is_banned: f.is_banned.unwrap_or(false),
             }
         })
-        .collect())
+        .collect();
+
+    // Since Oct 2024 the friends endpoint no longer includes user names
+    // (the fields come back empty). Resolve them with the batch users
+    // endpoint; best effort — on failure the UI falls back to ids.
+    if friends.iter().any(|f| f.name.is_empty() || f.display_name.is_empty()) {
+        let ids: Vec<u64> = friends.iter().map(|f| f.id).collect();
+        let details = fetch_user_details(c, &ids);
+        for f in &mut friends {
+            if let Some((name, display, banned)) = details.get(&f.id) {
+                if f.name.is_empty() {
+                    f.name = name.clone();
+                }
+                if f.display_name.is_empty() {
+                    f.display_name = if display.is_empty() { name.clone() } else { display.clone() };
+                }
+                if *banned {
+                    f.is_banned = true;
+                }
+            }
+        }
+        // Last-resort label so a row is never just "@".
+        for f in &mut friends {
+            if f.display_name.is_empty() {
+                f.display_name = format!("User {}", f.id);
+            }
+            if f.name.is_empty() {
+                f.name = f.id.to_string();
+            }
+        }
+    }
+    Ok(friends)
+}
+
+/// POST /v1/users — batch user details (<=100 ids per call). Returns
+/// (username, display name, is_banned) keyed by user id.
+pub fn fetch_user_details(c: &mut RobloxClient, ids: &[u64]) -> HashMap<u64, (String, String, bool)> {
+    let mut out = HashMap::with_capacity(ids.len());
+    for chunk in chunks(ids) {
+        let raw = c.post_raw(
+            &format!("{}/v1/users", USERS_BASE),
+            &json!({ "userIds": chunk }),
+        );
+        let raw = match raw {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if !(200..300).contains(&raw.status) {
+            continue;
+        }
+        if let Ok(ur) = raw.json::<UsersBatchResponse>() {
+            for u in ur.data {
+                let display = u.display_name.filter(|d| !d.is_empty()).unwrap_or_default();
+                out.insert(u.id, (u.name, display, u.is_banned.unwrap_or(false)));
+            }
+        }
+    }
+    out
 }
 
 /// POST /v1/presence/users — batched presence lookup.
@@ -95,7 +152,19 @@ pub fn fetch_last_online(c: &mut RobloxClient, ids: &[u64]) -> HashMap<u64, i64>
     out
 }
 
+/// Names that are placeholders, not real titles.
+fn is_placeholder_game_name(name: &str) -> bool {
+    let n = name.trim();
+    n.is_empty()
+        || n.eq_ignore_ascii_case("[TITLE UNAVAILABLE]")
+        || n.eq_ignore_ascii_case("[Content Deleted]")
+        || n.eq_ignore_ascii_case("[content deleted]")
+}
+
 /// GET /v1/games?universeIds=... — game display names (skip placeholders).
+/// Universes the requester cannot view (private / age-restricted games) are
+/// silently missing from the response; the UI falls back to presence
+/// `lastLocation` for those.
 pub fn fetch_game_names(c: &mut RobloxClient, universe_ids: &[u64]) -> HashMap<u64, String> {
     let mut out = HashMap::new();
     let unique: Vec<u64> = {
@@ -115,7 +184,7 @@ pub fn fetch_game_names(c: &mut RobloxClient, universe_ids: &[u64]) -> HashMap<u
                 if let Ok(gr) = raw.json::<GamesResponse>() {
                     for g in gr.data {
                         if let Some(name) = g.name {
-                            if !name.is_empty() && !name.starts_with('[') {
+                            if !is_placeholder_game_name(&name) {
                                 out.insert(g.id, name);
                             }
                         }

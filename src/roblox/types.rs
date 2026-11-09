@@ -86,6 +86,11 @@ pub struct FullUser {
 }
 
 /// GET https://friends.roblox.com/v1/users/{userId}/friends
+///
+/// NOTE (Oct 2024 API change): Roblox removed `name`, `displayName`,
+/// `isBanned` etc. from this endpoint. The fields still appear but come back
+/// EMPTY; real names must be resolved with POST users.roblox.com/v1/users
+/// (see `social::fetch_user_details`).
 #[derive(Debug, Deserialize, Default)]
 pub struct FriendsResponse {
     #[serde(default)]
@@ -96,11 +101,33 @@ pub struct FriendsResponse {
 #[serde(rename_all = "camelCase")]
 pub struct FriendEntry {
     pub id: u64,
+    #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub display_name: Option<String>,
     #[serde(default)]
     pub is_banned: Option<bool>,
+}
+
+/// POST https://users.roblox.com/v1/users — batch user details (names).
+#[derive(Debug, Deserialize, Default)]
+pub struct UsersBatchResponse {
+    #[serde(default)]
+    pub data: Vec<UserBatchEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserBatchEntry {
+    pub id: u64,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub is_banned: Option<bool>,
+    #[serde(default)]
+    pub has_verified_badge: Option<bool>,
 }
 
 /// POST https://presence.roblox.com/v1/presence/users

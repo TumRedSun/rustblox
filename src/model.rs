@@ -84,10 +84,19 @@ impl FriendRow {
         match self.presence.kind {
             PresenceKind::InGame => match &self.game_name {
                 Some(g) => format!("Playing {}", g),
-                None => "In game".to_string(),
+                // The games endpoint omits universes it cannot show
+                // (private/age-restricted); presence `lastLocation` then
+                // carries the experience name — use it as a fallback.
+                None => match clean_last_location(&self.presence.last_location) {
+                    Some(g) => format!("Playing {}", g),
+                    None => "In game".to_string(),
+                },
             },
             PresenceKind::Online => "Online".to_string(),
-            PresenceKind::Studio => "In Studio".to_string(),
+            PresenceKind::Studio => match clean_last_location(&self.presence.last_location) {
+                Some(g) => format!("In Studio: {}", g),
+                None => "In Studio".to_string(),
+            },
             PresenceKind::Offline | PresenceKind::Invisible => {
                 match self.last_online {
                     Some(t) => format!("Offline \u{b7} last online {}", humanize_last_online(t)),
@@ -105,6 +114,32 @@ impl FriendRow {
         self.friend.name.to_lowercase().contains(&q)
             || self.friend.display_name.to_lowercase().contains(&q)
             || self.game_name.as_deref().unwrap_or("").to_lowercase().contains(&q)
+            || self.presence.last_location.to_lowercase().contains(&q)
+    }
+}
+
+/// Clean a presence `lastLocation` string into a possible place name.
+/// Returns `None` when it does not name a place ("Website", "Studio", empty).
+pub fn clean_last_location(loc: &str) -> Option<String> {
+    let mut s = loc.trim();
+    let lower = s.to_lowercase();
+    for p in ["playing: ", "playing ", "creating ", "building ", "developing ", "visiting "] {
+        if lower.starts_with(p) {
+            // Prefix is ASCII, so byte offset == char offset.
+            s = s[p.len()..].trim_start();
+            break;
+        }
+    }
+    let s = s.trim();
+    if s.is_empty()
+        || s.eq_ignore_ascii_case("website")
+        || s.eq_ignore_ascii_case("studio")
+        || s.eq_ignore_ascii_case("mobile website")
+        || s.eq_ignore_ascii_case("in game")
+    {
+        None
+    } else {
+        Some(s.to_string())
     }
 }
 

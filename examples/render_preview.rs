@@ -48,18 +48,19 @@ fn blank_canvas(w: i32, h: i32) -> Vec<u8> {
 }
 
 fn sample_rows() -> Vec<FriendRow> {
-    let mk = |id: u64, name: &str, dn: &str, kind: PresenceKind, game: Option<&str>, last: Option<i64>| FriendRow {
+    let mk = |id: u64, name: &str, dn: &str, kind: PresenceKind, game: Option<&str>, last: &str, lo: Option<i64>| FriendRow {
         friend: Friend { id, name: name.into(), display_name: dn.into(), is_banned: false },
-        presence: Presence { kind, ..Default::default() },
+        presence: Presence { kind, last_location: last.into(), ..Default::default() },
         game_name: game.map(|g| g.into()),
-        last_online: last,
+        last_online: lo,
     };
     vec![
-        mk(1, "builderman", "Builderman", PresenceKind::InGame, Some("Natural Disaster Survival"), None),
-        mk(2, "erik.cassel", "Erik", PresenceKind::Online, None, None),
-        mk(3, "shedletsky", "Shedletsky", PresenceKind::Studio, None, None),
-        mk(4, "noob2007", "Noob", PresenceKind::Offline, None, Some(1_700_000_000)),
-        mk(5, "guest1234", "Guest", PresenceKind::Invisible, None, None),
+        mk(1, "builderman", "Builderman", PresenceKind::InGame, Some("Natural Disaster Survival"), "Website", None),
+        // Universe hidden by the games API -> lastLocation fallback.
+        mk(2, "erik.cassel", "Erik", PresenceKind::InGame, None, "Playing: Blox Fruits", None),
+        mk(3, "shedletsky", "Shedletsky", PresenceKind::Studio, None, "Creating RustBlox HQ", None),
+        mk(4, "noob2007", "Noob", PresenceKind::Offline, None, "Website", Some(1_700_000_000)),
+        mk(5, "guest1234", "Guest", PresenceKind::Invisible, None, "", None),
     ]
 }
 

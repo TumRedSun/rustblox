@@ -2,7 +2,8 @@
 //! responses captured from the official endpoints.
 
 use rustblox::model::{
-    build_rows, humanize_last_online, parse_iso8601_utc, sort_rows, Presence, PresenceKind, Snapshot,
+    build_rows, clean_last_location, humanize_last_online, parse_iso8601_utc, sort_rows, Presence, PresenceKind,
+    Snapshot,
 };
 use rustblox::roblox::client::normalize_cookie_token;
 use rustblox::roblox::errors::ApiError;
@@ -23,6 +24,18 @@ const THUMBS_JSON: &str = r#"{"data":[
   {"targetId":261,"state":"Pending","imageUrl":null}
 ]}"#;
 
+/// The CURRENT shape of the friends endpoint (Oct 2024 API change): user
+/// fields were removed and come back as empty strings/nulls.
+const FRIENDS_JSON_NAMELESS: &str = r#"{"data":[
+  {"id":2,"name":"","displayName":"","created":"2020-01-01T00:00:00Z","isBanned":null,"description":""},
+  {"id":3,"name":"","displayName":"","created":"2020-01-01T00:00:00Z","isBanned":null,"description":""}
+],"nextPageCursor":null}"#;
+
+const USERS_BATCH_JSON: &str = r#"{"data":[
+  {"hasVerifiedBadge":true,"id":156,"name":"builderman","displayName":"builderman"},
+  {"hasVerifiedBadge":false,"id":2,"name":"bob","displayName":"Bobby","isBanned":false}
+]}"#;
+
 #[test]
 fn parses_presence_response() {
     let p: rustblox::roblox::types::PresenceResponse = serde_json::from_str(PRESENCE_JSON).unwrap();
@@ -40,6 +53,29 @@ fn parses_friends_response() {
     let f: rustblox::roblox::types::FriendsResponse = serde_json::from_str(FRIENDS_JSON).unwrap();
     assert_eq!(f.data.len(), 2);
     assert_eq!(f.data[0].display_name.as_deref(), Some("Bob"));
+}
+
+#[test]
+fn parses_friends_response_nameless() {
+    // Roblox removed name/displayName from the friends endpoint: the parse
+    // must still succeed with empty names (ids drive avatars/presence).
+    let f: rustblox::roblox::types::FriendsResponse = serde_json::from_str(FRIENDS_JSON_NAMELESS).unwrap();
+    assert_eq!(f.data.len(), 2);
+    assert_eq!(f.data[0].name, "");
+    assert_eq!(f.data[0].display_name, Some("".to_string()));
+    let _ = &f.data[0].id;
+}
+
+#[test]
+fn parses_users_batch_response() {
+    let u: rustblox::roblox::types::UsersBatchResponse = serde_json::from_str(USERS_BATCH_JSON).unwrap();
+    assert_eq!(u.data.len(), 2);
+    let first = u.data.iter().find(|e| e.id == 156).unwrap();
+    assert_eq!(first.name, "builderman");
+    assert_eq!(first.display_name.as_deref(), Some("builderman"));
+    let second = u.data.iter().find(|e| e.id == 2).unwrap();
+    assert_eq!(second.display_name.as_deref(), Some("Bobby"));
+    assert_eq!(second.is_banned, Some(false));
 }
 
 #[test]
@@ -125,6 +161,56 @@ fn rows_sorting_and_labels() {
     assert_eq!(rows[2].status_label(), "Offline");
     assert!(rows[2].matches_filter("car"));
     assert!(!rows[0].matches_filter("zzz"));
+}
+
+#[test]
+fn clean_last_location_variants() {
+    assert_eq!(clean_last_location("Website"), None);
+    assert_eq!(clean_last_location("Studio"), None);
+    assert_eq!(clean_last_location(""), None);
+    assert_eq!(clean_last_location("In Game"), None);
+    assert_eq!(clean_last_location("Playing: Blox Fruits").as_deref(), Some("Blox Fruits"));
+    assert_eq!(clean_last_location("Creating Natural Disaster Survival").as_deref(), Some("Natural Disaster Survival"));
+    assert_eq!(clean_last_location("  Desolate Island  ").as_deref(), Some("Desolate Island"));
+}
+
+#[test]
+fn ingame_label_falls_back_to_last_location() {
+    // Universe missing from the games response -> lastLocation fallback.
+    let row = rustblox::model::FriendRow {
+        friend: rustblox::model::Friend { id: 9, name: "x".into(), display_name: "X".into(), is_banned: false },
+        presence: Presence {
+            kind: PresenceKind::InGame,
+            universe_id: Some(77),
+            last_location: "Playing: License Plate Generator".into(),
+            ..Default::default()
+        },
+        game_name: None,
+        last_online: None,
+    };
+    assert_eq!(row.status_label(), "Playing License Plate Generator");
+
+    // Nothing usable -> plain "In game".
+    let row = rustblox::model::FriendRow {
+        presence: Presence { kind: PresenceKind::InGame, last_location: "Website".into(), ..Default::default() },
+        ..row
+    };
+    assert_eq!(row.status_label(), "In game");
+
+    // Game name from the games API wins over lastLocation.
+    let row = rustblox::model::FriendRow {
+        game_name: Some("Real Title".into()),
+        ..row
+    };
+    assert_eq!(row.status_label(), "Playing Real Title");
+
+    // Studio with a place name.
+    let row = rustblox::model::FriendRow {
+        presence: Presence { kind: PresenceKind::Studio, last_location: "Creating My Place".into(), ..Default::default() },
+        game_name: None,
+        ..row
+    };
+    assert_eq!(row.status_label(), "In Studio: My Place");
 }
 
 #[test]
