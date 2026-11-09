@@ -5,6 +5,10 @@
 
 use crate::theme::Rgba;
 
+fn vec_len(x: f32, y: f32) -> f32 {
+    (x * x + y * y).sqrt()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Clip {
     pub x0: i32,
@@ -146,6 +150,38 @@ impl<'a> FB<'a> {
                             self.set(xx, yy, px);
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// Filled rounded rectangle rotated around its center (SDF-based).
+    /// Used for the rotated logo tile; the area is small so the per-pixel
+    /// cost is negligible.
+    pub fn rect_rounded_rot(&mut self, cx: i32, cy: i32, w: i32, h: i32, radius: i32, angle: f32, color: Rgba) {
+        if angle.abs() < 0.001 {
+            self.rect_rounded(cx - w / 2, cy - h / 2, w, h, radius, color);
+            return;
+        }
+        let (hw, hh) = (w as f32 / 2.0, h as f32 / 2.0);
+        let r = radius as f32;
+        let (sin, cos) = angle.sin_cos();
+        // Bounding box big enough for the rotation (hypotenuse of half-size).
+        let bound = (hw * hw + hh * hh).sqrt().ceil() as i32 + 2;
+        let alpha_scale = color[3] as f32;
+        for dy in -bound..=bound {
+            for dx in -bound..=bound {
+                // Inverse-rotate the pixel offset into the tile's local space.
+                let (lx, ly) = (dx as f32 * cos + dy as f32 * sin, -dx as f32 * sin + dy as f32 * cos);
+                // Rounded-box signed distance.
+                let qx = lx.abs() - (hw - r);
+                let qy = ly.abs() - (hh - r);
+                let dist = vec_len(qx.max(0.0), qy.max(0.0)) + qx.max(qy).min(0.0) - r;
+                let aa = (0.5 - dist).clamp(0.0, 1.0);
+                if aa > 0.0 {
+                    let mut c = color;
+                    c[3] = (alpha_scale * aa) as u8;
+                    self.set(cx + dx, cy + dy, c);
                 }
             }
         }

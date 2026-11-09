@@ -8,7 +8,7 @@
 //! third-party CDN hosts).
 
 use crate::config::Session;
-use crate::model::{Presence, PresenceKind, Snapshot};
+use crate::model::{Presence, PresenceKind, Snapshot, UserEntry};
 use crate::roblox::auth::{self, AuthOutcome};
 use crate::roblox::client::RobloxClient;
 use crate::roblox::errors::ApiError;
@@ -25,6 +25,8 @@ pub enum Command {
     Resend2FA { login: String, ticket: String },
     LoginCookie { token: String },
     StartRefresh,
+    SearchUsers { query: String },
+    AddFriend { user_id: u64 },
     Logout,
     Shutdown,
 }
@@ -34,6 +36,8 @@ pub enum WorkerEvent {
     Login(Result<AuthOutcome, ApiError>),
     TwoStepSent { ticket: String, media_type: String },
     RefreshDone(Result<Snapshot, ApiError>),
+    SearchDone { query: String, result: Result<Vec<UserEntry>, ApiError> },
+    FriendRequestDone { user_id: u64, result: Result<(), ApiError> },
     LoggedOut,
 }
 
@@ -164,6 +168,32 @@ pub fn spawn(proxy: EventLoopProxy<UserEvent>, session: Option<Session>) -> Work
                             let snap = run_refresh(&mut client, me_id.unwrap(), job_tx.clone(), &pushed);
                             let _ = proxy.send_event(UserEvent::Worker(WorkerEvent::RefreshDone(snap)));
                         }
+                        Command::SearchUsers { query } => {
+                            let result = social::search_users(&mut client, &query, 25);
+                            match &result {
+                                Ok(users) if !users.is_empty() => {
+                                    // Resolve headshots for the results so the
+                                    // rows get avatars via the download pool.
+                                    let ids: Vec<u64> = users.iter().map(|u| u.id).collect();
+                                    if let Ok(index) = social::fetch_avatar_index(&mut client, &ids) {
+                                        let mut p = pushed.lock().unwrap();
+                                        for (id, url) in index {
+                                            if p.get(&id).map(|old| old != &url).unwrap_or(true) {
+                                                if job_tx.send(AvatarJob { user_id: id, url: url.clone() }).is_ok() {
+                                                    p.insert(id, url);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                            let _ = proxy.send_event(UserEvent::Worker(WorkerEvent::SearchDone { query, result }));
+                        }
+                        Command::AddFriend { user_id } => {
+                            let result = social::send_friend_request(&mut client, user_id);
+                            let _ = proxy.send_event(UserEvent::Worker(WorkerEvent::FriendRequestDone { user_id, result }));
+                        }
                     }
                 }
             })
@@ -200,7 +230,8 @@ fn run_refresh(
 
     // Avatars: resolve thumbnail URLs and enqueue downloads for anything not
     // pushed before (dedup across refreshes; disk cache absorbs the rest).
-    if let Ok(index) = social::fetch_avatar_index(c, &ids) {
+    // Includes our own id so the sidebar profile chip shows the real avatar.
+    if let Ok(index) = social::fetch_avatar_index(c, &[ids.as_slice(), &[me_id]].concat()) {
         let mut p = pushed.lock().unwrap();
         for (id, url) in index {
             if p.get(&id).map(|old| old != &url).unwrap_or(true) {

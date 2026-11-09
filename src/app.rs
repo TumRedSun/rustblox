@@ -5,7 +5,7 @@ use crate::config::{self, Session};
 use crate::draw::FB;
 use crate::font::Fonts;
 use crate::login_ui::LoginView;
-use crate::menu_ui::MenuView;
+use crate::menu_ui::{MenuTab, MenuView};
 use crate::model::{build_rows, UserProfile};
 use crate::net::{Command, UserEvent, WorkerEvent};
 use crate::roblox::auth::AuthOutcome;
@@ -24,8 +24,13 @@ use winit::window::{Window, WindowLevel};
 
 pub const WINDOW_W: f32 = 1100.0;
 pub const WINDOW_H: f32 = 740.0;
-pub const REFRESH_SECS: u64 = 15;
+/// Presence auto-refresh interval (no manual refresh button — automatic only).
+pub const REFRESH_SECS: u64 = 10;
 pub const BACKOFF_SECS: u64 = 30;
+/// Delay before the first auto-repeat tick of a held scroll arrow.
+pub const ARROW_REPEAT_DELAY_MS: u64 = 250;
+/// Auto-repeat interval of a held scroll arrow.
+pub const ARROW_REPEAT_MS: u64 = 110;
 
 pub enum Screen {
     Login(LoginView),
@@ -60,6 +65,8 @@ pub struct App {
     pub cursor: (f32, f32),
     pub mouse_down: Option<Hit>,
     pub drag_scroll: Option<(f32, f32)>, // (start cursor y, start scroll)
+    /// Held scroll arrow (Hit::ScrollUp/ScrollDown) with the next repeat tick.
+    pub arrow_hold: Option<(Hit, Instant)>,
     pub mods: ModifiersState,
     pub focus: Option<FieldId>,
     pub screen: Screen,
@@ -86,6 +93,7 @@ impl App {
             cursor: (-1.0, -1.0),
             mouse_down: None,
             drag_scroll: None,
+            arrow_hold: None,
             mods: ModifiersState::empty(),
             focus: None,
             screen: Screen::Login(LoginView::new()),
@@ -161,7 +169,7 @@ impl App {
 
         let spinner = match &self.screen {
             Screen::Login(v) => v.busy,
-            Screen::Menu(v) => v.refreshing,
+            Screen::Menu(v) => v.refreshing || v.add.searching,
         };
         if spinner {
             wakes.push(now + Duration::from_millis(90));
@@ -191,7 +199,10 @@ impl App {
                     }
                 }
             }
-            Screen::Menu(_) => &[FieldId::Search],
+            Screen::Menu(v) => match v.tab {
+                MenuTab::Home => &[FieldId::Search],
+                MenuTab::AddFriends => &[FieldId::AddSearch],
+            },
         };
         match self.focus {
             None => self.focus = order.first().copied(),
@@ -211,10 +222,11 @@ impl App {
                 FieldId::Password => Some(&mut v.password),
                 FieldId::Cookie => Some(&mut v.cookie),
                 FieldId::Code => Some(&mut v.code),
-                FieldId::Search => None,
+                FieldId::Search | FieldId::AddSearch => None,
             },
             Screen::Menu(v) => match focus {
                 FieldId::Search => Some(&mut v.search),
+                FieldId::AddSearch => Some(&mut v.add.query),
                 _ => None,
             },
         }
@@ -279,11 +291,34 @@ impl App {
                 }
                 self.needs_redraw = true;
             }
-            Screen::Menu(_) => {
-                self.focus = None;
-                self.needs_redraw = true;
+            Screen::Menu(v) => {
+                if v.tab == MenuTab::AddFriends {
+                    self.run_user_search();
+                } else {
+                    self.focus = None;
+                    self.needs_redraw = true;
+                }
             }
         }
+    }
+
+    /// Kick off a user search from the Add Friends pane.
+    fn run_user_search(&mut self) {
+        let query = match &self.screen {
+            Screen::Menu(v) => v.add.query.value.trim().to_string(),
+            _ => return,
+        };
+        if let Screen::Menu(v) = &mut self.screen {
+            if query.chars().count() < 2 {
+                v.add.error = Some("Enter at least 2 characters.".into());
+                self.needs_redraw = true;
+                return;
+            }
+            v.add.searching = true;
+            v.add.error = None;
+        }
+        self.send_command(Command::SearchUsers { query });
+        self.needs_redraw = true;
     }
 
     // -----------------------------------------------------------------
@@ -405,6 +440,39 @@ impl App {
                     self.needs_redraw = true;
                 }
             }
+            WorkerEvent::SearchDone { query, result } => {
+                if let Screen::Menu(v) = &mut self.screen {
+                    // Ignore stale responses for an edited query.
+                    if v.add.query.value.trim() == query {
+                        v.add.searching = false;
+                        v.add.searched_once = true;
+                        match result {
+                            Ok(users) => {
+                                v.add.results = users;
+                                v.add.error = None;
+                                v.add_scroll = 0.0;
+                            }
+                            Err(e) => v.add.error = Some(e.to_string()),
+                        }
+                        self.needs_redraw = true;
+                    }
+                }
+            }
+            WorkerEvent::FriendRequestDone { user_id, result } => {
+                if let Screen::Menu(v) = &mut self.screen {
+                    v.add.pending.retain(|id| *id != user_id);
+                    match result {
+                        Ok(()) => {
+                            v.add.sent.push(user_id);
+                            v.add.failed.remove(&user_id);
+                        }
+                        Err(e) => {
+                            v.add.failed.insert(user_id, e.to_string());
+                        }
+                    }
+                    self.needs_redraw = true;
+                }
+            }
             WorkerEvent::LoggedOut => {
                 config::clear_session();
                 self.enter_login(None);
@@ -453,14 +521,23 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x as f32, position.y as f32);
-                // Scrollbar drag.
-                if let (Some((start_y, start_scroll)), true) = (self.drag_scroll, self.mouse_down.as_ref().map(|h| matches!(h, Hit::Scrollbar)).unwrap_or(false)) {
+                // Scrollbar drag (whichever list is active).
+                if let (Some((start_y, start_scroll)), true) = (
+                    self.drag_scroll,
+                    self.mouse_down.as_ref().map(|h| matches!(h, Hit::Scrollbar)).unwrap_or(false),
+                ) {
                     if let Screen::Menu(v) = &mut self.screen {
-                        let k = match &v.view_metrics {
-                            Some(m) => (m.content_h / m.list_h.max(1.0)).max(1.0),
-                            None => 1.0,
+                        let (scroll, k) = match v.tab {
+                            MenuTab::Home => (
+                                &mut v.scroll,
+                                v.view_metrics.as_ref().map(|m| (m.content_h / m.h.max(1.0)).max(1.0)).unwrap_or(1.0),
+                            ),
+                            MenuTab::AddFriends => (
+                                &mut v.add_scroll,
+                                v.add_metrics.as_ref().map(|m| (m.content_h / m.h.max(1.0)).max(1.0)).unwrap_or(1.0),
+                            ),
                         };
-                        v.scroll = (start_scroll + (position.y as f32 - start_y) * k).max(0.0);
+                        *scroll = (start_scroll + (position.y as f32 - start_y) * k).max(0.0);
                     }
                 }
                 self.request_redraw();
@@ -477,8 +554,17 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     if let Hit::Scrollbar = hit {
                         if let Screen::Menu(v) = &mut self.screen {
-                            self.drag_scroll = Some((self.cursor.1, v.scroll));
+                            let start = match v.tab {
+                                MenuTab::Home => v.scroll,
+                                MenuTab::AddFriends => v.add_scroll,
+                            };
+                            self.drag_scroll = Some((self.cursor.1, start));
                         }
+                    }
+                    if matches!(hit, Hit::ScrollUp | Hit::ScrollDown) {
+                        // First step immediately, then auto-repeat while held.
+                        self.scroll_step(&hit);
+                        self.arrow_hold = Some((hit.clone(), Instant::now() + Duration::from_millis(ARROW_REPEAT_DELAY_MS)));
                     }
                     self.mouse_down = Some(hit);
                     self.needs_redraw = true;
@@ -486,12 +572,14 @@ impl ApplicationHandler<UserEvent> for App {
                 ElementState::Released => {
                     let pressed = self.mouse_down.take();
                     self.drag_scroll = None;
+                    self.arrow_hold = None;
                     if let Some(pressed_hit) = pressed {
                         let released_hit = self.hits.at(self.cursor.0, self.cursor.1);
                         if pressed_hit == released_hit {
                             match released_hit {
                                 Hit::TabPassword | Hit::TabCookie | Hit::SignIn | Hit::Verify
-                                | Hit::Resend | Hit::Back | Hit::Refresh | Hit::Logout => {
+                                | Hit::Resend | Hit::Back | Hit::Logout | Hit::NavHome | Hit::NavAdd
+                                | Hit::AddSearchBtn | Hit::AddUser(_) => {
                                     self.handle_button(released_hit);
                                 }
                                 Hit::Field(id) => {
@@ -510,7 +598,10 @@ impl ApplicationHandler<UserEvent> for App {
                         MouseScrollDelta::LineDelta(_, y) => y * 3.0 * theme::ROW_H * self.scale,
                         MouseScrollDelta::PixelDelta(p) => p.y as f32,
                     };
-                    v.scroll = (v.scroll - amount).max(0.0);
+                    match v.tab {
+                        MenuTab::Home => v.scroll = (v.scroll - amount).max(0.0),
+                        MenuTab::AddFriends => v.add_scroll = (v.add_scroll - amount).max(0.0),
+                    }
                     self.request_redraw();
                 }
             }
@@ -560,6 +651,19 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
 
+        // Auto repeat for a held scroll arrow.
+        let mut arrow_tick: Option<Hit> = None;
+        if let Some((hit, next_tick)) = &self.arrow_hold {
+            if now >= *next_tick {
+                arrow_tick = Some(hit.clone());
+            }
+        }
+        if let Some(hit) = arrow_tick {
+            self.scroll_step(&hit);
+            self.arrow_hold = Some((hit, now + Duration::from_millis(ARROW_REPEAT_MS)));
+            self.needs_redraw = true;
+        }
+
         if self.needs_redraw {
             self.needs_redraw = false;
             if let Some(w) = self.window.as_ref() {
@@ -595,6 +699,27 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 impl App {
+    /// Scroll the active list by 1.5 rows in the direction of the arrow.
+    fn scroll_step(&mut self, hit: &Hit) {
+        if let Screen::Menu(v) = &mut self.screen {
+            let d = 1.5 * theme::ROW_H * self.scale;
+            match (&v.tab, hit) {
+                (MenuTab::Home, Hit::ScrollUp) => v.scroll = (v.scroll - d).max(0.0),
+                (MenuTab::Home, Hit::ScrollDown) => {
+                    let max = v.view_metrics.as_ref().map(|m| (m.content_h - m.h).max(0.0)).unwrap_or(0.0);
+                    v.scroll = (v.scroll + d).min(max);
+                }
+                (MenuTab::AddFriends, Hit::ScrollUp) => v.add_scroll = (v.add_scroll - d).max(0.0),
+                (MenuTab::AddFriends, Hit::ScrollDown) => {
+                    let max = v.add_metrics.as_ref().map(|m| (m.content_h - m.h).max(0.0)).unwrap_or(0.0);
+                    v.add_scroll = (v.add_scroll + d).min(max);
+                }
+                _ => {}
+            }
+        }
+        self.needs_redraw = true;
+    }
+
     fn handle_button(&mut self, hit: Hit) {
         match hit {
             Hit::TabPassword | Hit::TabCookie => {
@@ -627,12 +752,29 @@ impl App {
                 }
                 self.needs_redraw = true;
             }
-            Hit::Refresh => {
-                let tx = self.tx.clone();
+            Hit::NavHome => {
                 if let Screen::Menu(v) = &mut self.screen {
-                    if !v.refreshing {
-                        v.refreshing = true;
-                        let _ = tx.send(Command::StartRefresh);
+                    v.tab = MenuTab::Home;
+                    self.focus = None;
+                }
+                self.needs_redraw = true;
+            }
+            Hit::NavAdd => {
+                if let Screen::Menu(v) = &mut self.screen {
+                    v.tab = MenuTab::AddFriends;
+                    self.focus = Some(FieldId::AddSearch);
+                }
+                self.needs_redraw = true;
+            }
+            Hit::AddSearchBtn => {
+                self.run_user_search();
+            }
+            Hit::AddUser(user_id) => {
+                if let Screen::Menu(v) = &mut self.screen {
+                    let already = v.add.pending.contains(&user_id) || v.add.sent.contains(&user_id);
+                    if !already {
+                        v.add.mark_pending(user_id);
+                        self.send_command(Command::AddFriend { user_id });
                     }
                 }
                 self.needs_redraw = true;
@@ -660,13 +802,12 @@ impl App {
         }
         if ctrl && matches!(&event.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("f")) {
             if matches!(self.screen, Screen::Menu(_)) {
-                self.focus = Some(FieldId::Search);
+                self.focus = Some(match &self.screen {
+                    Screen::Menu(v) if v.tab == MenuTab::AddFriends => FieldId::AddSearch,
+                    _ => FieldId::Search,
+                });
                 self.request_redraw();
             }
-            return;
-        }
-        if matches!(&event.logical_key, Key::Named(NamedKey::F5)) {
-            self.handle_button(Hit::Refresh);
             return;
         }
 
@@ -691,11 +832,25 @@ impl App {
                             self.focus = None;
                         }
                     }
-                    Screen::Menu(_) => {
-                        self.focus = None;
+                    Screen::Menu(v) => {
+                        if v.tab == MenuTab::AddFriends {
+                            // Esc goes back to the friends list.
+                            v.tab = MenuTab::Home;
+                            self.focus = None;
+                        } else {
+                            self.focus = None;
+                        }
                     }
                 }
                 self.request_redraw();
+                return;
+            }
+            Key::Named(NamedKey::ArrowUp | NamedKey::ArrowDown) => {
+                // Keyboard scrolling of the active list.
+                let dir = if matches!(&event.logical_key, Key::Named(NamedKey::ArrowUp)) { Hit::ScrollUp } else { Hit::ScrollDown };
+                if matches!(self.screen, Screen::Menu(_)) {
+                    self.scroll_step(&dir);
+                }
                 return;
             }
             _ => {}

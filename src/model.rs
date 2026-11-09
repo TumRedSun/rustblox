@@ -70,6 +70,20 @@ pub struct Friend {
     pub is_banned: bool,
 }
 
+/// A user found through the "Add friends" search (not necessarily a friend).
+#[derive(Clone, Debug, PartialEq)]
+pub struct UserEntry {
+    pub id: u64,
+    pub name: String,
+    pub display_name: String,
+}
+
+impl UserEntry {
+    pub fn display_or_name(&self) -> &str {
+        if self.display_name.is_empty() { &self.name } else { &self.display_name }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct FriendRow {
     pub friend: Friend,

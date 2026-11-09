@@ -226,3 +226,37 @@ fn cookie_token_normalization() {
     assert_eq!(normalize_cookie_token("  \"F9A2B8C4\"  "), "F9A2B8C4");
     assert_eq!(normalize_cookie_token("   "), "");
 }
+
+#[test]
+fn parses_user_search_response() {
+    // Shape of GET users.roblox.com/v1/users/search?keyword=builder
+    let json = r#"{"data":[
+        {"previousUsernames":["BuilderGuy"],"id":156,"name":"builderman","displayName":"Builderman"},
+        {"previousUsernames":[],"id":900,"name":"build2","displayName":""}
+    ]}"#;
+    let sr: rustblox::roblox::types::UserSearchResponse = serde_json::from_str(json).unwrap();
+    assert_eq!(sr.data.len(), 2);
+    assert_eq!(sr.data[0].id, 156);
+    assert_eq!(sr.data[0].name, "builderman");
+    assert_eq!(sr.data[0].display_name.as_deref(), Some("Builderman"));
+    assert_eq!(sr.data[1].display_name.as_deref(), Some(""));
+    // (search_users() maps empty display names to "" — see UserEntry fallback.)
+}
+
+#[test]
+fn percent_encoding() {
+    use rustblox::roblox::social::percent_encode;
+    assert_eq!(percent_encode("builder"), "builder");
+    assert_eq!(percent_encode("Cool Guy 99"), "Cool%20Guy%2099");
+    assert_eq!(percent_encode("ник"), "%D0%BD%D0%B8%D0%BA");
+    assert_eq!(percent_encode("a+b&c=d/e?~_.-"), "a%2Bb%26c%3Dd%2Fe%3F~_.-");
+}
+
+#[test]
+fn user_entry_display_fallback() {
+    use rustblox::model::UserEntry;
+    let e = UserEntry { id: 1, name: "bob".into(), display_name: String::new() };
+    assert_eq!(e.display_or_name(), "bob");
+    let e2 = UserEntry { id: 2, name: "bob2".into(), display_name: "Bobby".into() };
+    assert_eq!(e2.display_or_name(), "Bobby");
+}

@@ -6,8 +6,12 @@ An open-source (**GPL-3.0**) third-party **Roblox client built in Rust**, using 
 
 **Milestone 1 scope (this release):**
 - Sign in to a Roblox account — password + 2-step verification, or a `.ROBLOSECURITY` session cookie
-- Main menu with your friends list and live statuses: **online / offline / what game they are playing right now**
-- Session persistence with auto-refresh of presence every 15 seconds
+- Main menu styled after roblox.com home: a left **sidebar** (logo, profile, navigation), a vertical **friends list** with live statuses — **online / offline / what game they are playing right now** — and a Roblox-style scrollbar (drag + up/down arrows + mouse wheel + keyboard)
+- **Add Friends** pane: search users by username (`users.roblox.com/v1/users/search`) and send friend requests in place
+- Automatic presence refresh every **10 seconds** (no manual refresh button)
+- A reserved **Places** strip at the bottom for future place cards
+- Session persistence
+- Nightly automated builds for Windows / Linux / macOS published to the rolling [nightly release](../../releases/tag/nightly)
 - Nothing more (on purpose — see [Roadmap](#roadmap))
 
 > **Disclaimer.** This project is not affiliated with, endorsed by, or connected to Roblox Corporation in any way. Roblox's Terms of Use may prohibit third-party clients; using one can put your account at risk. This client was written for educational purposes — use it at your own risk and never share your `.ROBLOSECURITY` token with anyone.
@@ -37,6 +41,10 @@ cargo build --release
 
 Works on **Windows, Linux and macOS** out of the box (TLS via rustls, no system dependencies). Rendering uses wgpu (Vulkan / Metal / DX12 / GL fallback).
 
+### Nightly builds
+
+Every night (02:00 UTC) and on demand (*Actions → Nightly builds → Run workflow*) a GitHub Actions pipeline runs the test suite, builds release binaries for **Linux x64, Windows x64, macOS Apple Silicon and macOS Intel**, and publishes them as zip archives to the rolling [`nightly`](../../releases/tag/nightly) pre-release (assets are replaced on each run).
+
 ## Sign-in methods
 
 ### 1. Password (+ 2-step verification)
@@ -58,6 +66,7 @@ The token is stored locally in your user config directory (`%APPDATA%/rustblox/s
 
 - **CSRF rotation** — every mutating request carries `X-CSRF-Token`; a `403 Token Validation Failed` response includes a fresh `x-csrf-token` header *and* fresh anonymous cookies. RustBlox stores both (browser-style cookie jar) and retries, exactly like the website.
 - **Batching** — friends: 1 request; presence: `POST /v1/presence/users` in chunks of ≤100 ids; game titles: 1 batched `GET /v1/games?universeIds=...`; avatars: 1 batched thumbnails request. A full refresh of 200 friends is ~5 HTTP requests.
+- **User search** — `GET /v1/users/search?keyword=...&limit=25` (Add Friends pane); friend requests go through `POST /v1/friends/{userId}/request-friendship` with the usual CSRF dance; API error messages (e.g. "Friend request already pending") are surfaced on the row.
 - **Presence types** — `0` Offline, `1` Online (website), `2` InGame (with `universeId` → game title lookup, `gameId` = server job id, kept for the future "join game" milestone), `3` Studio, `4` Invisible.
 - **Avatars** — decoded PNGs are cached on disk (keyed by thumbnail URL) and kept in GPU-uploadable RGBA8 form in memory; unchanged thumbnails are never re-downloaded.
 - **Session validation** — `GET /v1/users/authenticated`; a dead session drops you back to the login screen automatically.
@@ -69,7 +78,7 @@ src/
 ├── main.rs            # entry point
 ├── app.rs             # winit ApplicationHandler, screen state machine, input routing
 ├── login_ui.rs        # login screen (password / cookie tabs, 2FA dialog)
-├── menu_ui.rs         # main menu (friends list, statuses, search, scrollbar)
+├── menu_ui.rs         # main menu: sidebar (logo, nav, profile), friends list with arrow scrollbar, places strip, add-friends pane
 ├── ui.rs              # widgets: text fields (IME!), buttons, hit-testing
 ├── draw.rs            # software rasterizer over the pixels framebuffer
 ├── font.rs            # ab_glyph text rendering
@@ -99,9 +108,9 @@ The UI thread never blocks: all network work runs on a worker thread (plus a 4-t
 
 ## Roadmap
 
-- **M1 — this release:** login + friends menu with presence ✔
-- **M2:** joining real game servers (the official RakNet-based UDP transport, `gameId` is already captured by the presence API) and rendering places with wgpu on the same window/surface stack
-- **M3:** friend requests, chat, notifications
+- **M1 — this release:** login + Roblox-style friends menu (sidebar, add-friends search) with presence ✔
+- **M2:** joining real game servers (the official RakNet-based UDP transport, `gameId` is already captured by the presence API) and rendering places with wgpu on the same window/surface stack — the reserved *Places* strip will host the place cards
+- **M3:** chat, notifications, Charts / Avatar pages (the disabled sidebar entries)
 - **M4:** full place rendering pipeline (instances, replication, input)
 
 ## License
@@ -118,8 +127,12 @@ Open-source (**GPL-3.0**) сторонний **клиент Roblox на Rust**, 
 
 **Задание №1 (эта версия):**
 - Вход в аккаунт Roblox — пароль + двухэтапная верификация либо cookie-сессия `.ROBLOSECURITY`
-- Главное меню со списком друзей и их статусами: **в сети / не в сети / во что сейчас играет**
-- Сохранение сессии и автообновление статусов каждые 15 секунд
+- Главное меню в стиле домашней страницы roblox.com: левый **сайдбар** (логотип, профиль, навигация), вертикальный **список друзей** со статусами — **в сети / не в сети / во что сейчас играет** — и Roblox-скроллбар со стрелками (перетаскивание + стрелки вверх/вниз + колесо мыши + клавиатура)
+- Панель **«Добавить друзей»**: поиск пользователей по нику (`users.roblox.com/v1/users/search`) и отправка заявок в друзья прямо из приложения
+- Автообновление статусов каждые **10 секунд** (без ручной кнопки обновления)
+- Зарезервированная полоса **Places** внизу под будущие карточки плейсов
+- Сохранение сессии
+- Ночные автоматические сборки для Windows / Linux / macOS публикуются в скользящем [nightly-релизе](../../releases/tag/nightly)
 - И ничего больше (осознанно — см. [Roadmap](#roadmap))
 
 > **Важно.** Проект не связан с Roblox Corporation. Условия использования Roblox могут запрещать сторонние клиенты — используйте на свой риск. Никогда не передавайте свой `.ROBLOSECURITY` никому (включая этот клиент — он хранит токен только локально).
@@ -135,6 +148,10 @@ cargo build --release
 
 Работает на **Windows, Linux и macOS** без системных зависимостей (TLS — rustls).
 
+### Ночные сборки
+
+Каждую ночь (02:00 UTC) и по кнопке (*Actions → Nightly builds → Run workflow*) GitHub Actions прогоняет тесты, собирает release-бинарники для **Linux x64, Windows x64, macOS Apple Silicon и macOS Intel** и публикует их zip-архивами в скользящий пререлиз [`nightly`](../../releases/tag/nightly) (ассеты перезаписываются при каждой сборке).
+
 ## Как войти
 
 **Пароль (+2FA):** тот же флоу, что у официального сайта (`auth.roblox.com/v2/login` → при 2FA ввод кода → verify). Если Roblox показывает капчу FunCaptcha (часто бывает с «необычных» IP), клиент предложит использовать cookie-метод.
@@ -149,9 +166,9 @@ cargo build --release
 
 ## Дорожная карта
 
-1. **M1 (текущая):** вход + меню друзей со статусами ✔
-2. **M2:** подключение к реальным игровым серверам (официальный UDP-транспорт на базе RakNet) и рендеринг плейсов на wgpu
-3. **M3:** заявки в друзья, чат, уведомления
+1. **M1 (текущая):** вход + меню друзей в стиле Roblox (сайдбар, поиск и заявки в друзья) со статусами ✔
+2. **M2:** подключение к реальным игровым серверам (официальный UDP-транспорт на базе RakNet) и рендеринг плейсов на wgpu — карточки плейсов займут зарезервированную полосу Places
+3. **M3:** чат, уведомления, страницы Charts / Avatar (неактивные пункты сайдбара)
 4. **M4:** полный пайплайн рендеринга плейса
 
 ## Лицензия

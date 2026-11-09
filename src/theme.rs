@@ -26,8 +26,12 @@ pub const RED: Rgba = [0xE2, 0x23, 0x1A, 0xFF]; // errors / logo
 pub const WHITE: Rgba = [0xFF, 0xFF, 0xFF, 0xFF];
 
 // Layout metrics (logical pixels, multiplied by scale factor at draw time).
+pub const SIDEBAR_W: f32 = 224.0;
 pub const TOPBAR_H: f32 = 58.0;
 pub const SEARCHBAR_H: f32 = 46.0;
 pub const STATUSBAR_H: f32 = 26.0;
 pub const ROW_H: f32 = 68.0;
+pub const PLACES_H: f32 = 168.0;
+/// Width of the arrow scrollbar next to the friends list.
+pub const SCROLL_W: f32 = 16.0;
 pub const AVATAR_SIZE: u32 = 48;

@@ -61,7 +61,25 @@ fn sample_rows() -> Vec<FriendRow> {
         mk(3, "shedletsky", "Shedletsky", PresenceKind::Studio, None, "Creating RustBlox HQ", None),
         mk(4, "noob2007", "Noob", PresenceKind::Offline, None, "Website", Some(1_700_000_000)),
         mk(5, "guest1234", "Guest", PresenceKind::Invisible, None, "", None),
+        mk(6, "telamon", "Telamon", PresenceKind::InGame, Some("Doomspire Brickbattle"), "Website", None),
+        mk(7, "stickmasterluke", "Stickmasterluke", PresenceKind::Online, None, "Website", None),
+        mk(8, "Asimo3089", "asimo3089", PresenceKind::Online, None, "Website", None),
+        mk(9, "badcc", "badcc", PresenceKind::Offline, None, "Website", Some(1_702_000_000)),
+        mk(10, "beeism", "Beeism", PresenceKind::InGame, Some("Adopt Me!"), "Website", None),
     ]
+}
+
+fn blank_menu_view() -> rustblox::menu_ui::MenuView {
+    let mut view = rustblox::menu_ui::MenuView::new(UserProfile {
+        id: 42,
+        name: "TumRedSun".into(),
+        display_name: "TumRedSun".into(),
+    });
+    view.rows = sample_rows();
+    view.refreshing = false;
+    view.last_update = Some(std::time::Instant::now());
+    view.next_refresh = Some(std::time::Instant::now() + std::time::Duration::from_secs(7));
+    view
 }
 
 fn main() {
@@ -116,23 +134,52 @@ fn main() {
         save(&buf, w, h, &format!("{dir}/preview_login_2fa.png"));
     }
 
-    // 4. Menu with sample friends.
+    // 4. Menu: Home tab with the Roblox-style sidebar, friends list,
+    //    arrow scrollbar and the reserved places strip.
     {
         let mut p = Painter::new(&fonts);
-        let mut view = rustblox::menu_ui::MenuView::new(UserProfile {
-            id: 42,
-            name: "TumRedSun".into(),
-            display_name: "TumRedSun".into(),
-        });
-        view.rows = sample_rows();
-        view.refreshing = false;
-        view.last_update = Some(std::time::Instant::now());
-        view.next_refresh = Some(std::time::Instant::now() + std::time::Duration::from_secs(12));
+        let mut view = blank_menu_view();
         let mut buf = blank_canvas(w, h);
         let mut fb = FB::new(&mut buf, w, h);
         fb.fill(theme::BG);
         let mut ctx = p.ctx(None);
         rustblox::menu_ui::draw(&mut view, &mut ctx, &mut fb);
         save(&buf, w, h, &format!("{dir}/preview_menu.png"));
+    }
+
+    // 5. Menu: Add Friends pane with search results.
+    {
+        let mut p = Painter::new(&fonts);
+        let mut view = blank_menu_view();
+        view.tab = rustblox::menu_ui::MenuTab::AddFriends;
+        view.add.query.value = "builder".into();
+        view.add.searched_once = true;
+        view.add.results = vec![
+            rustblox::model::UserEntry { id: 1, name: "builderman".into(), display_name: "Builderman".into() },
+            rustblox::model::UserEntry { id: 156, name: "builderguy".into(), display_name: "Builderguy".into() },
+            rustblox::model::UserEntry { id: 900, name: "blockbuilder99".into(), display_name: "BlockBuilder".into() },
+        ];
+        view.add.sent.push(156);
+        view.add.failed.insert(900, "Friend request already pending".into());
+        let mut buf = blank_canvas(w, h);
+        let mut fb = FB::new(&mut buf, w, h);
+        fb.fill(theme::BG);
+        let mut ctx = p.ctx(Some(FieldId::AddSearch));
+        rustblox::menu_ui::draw(&mut view, &mut ctx, &mut fb);
+        save(&buf, w, h, &format!("{dir}/preview_menu_add.png"));
+    }
+
+    // 6. Menu: Home scrolled down (arrows + thumb state).
+    {
+        let mut p = Painter::new(&fonts);
+        let mut view = blank_menu_view();
+        view.scroll = 3.0 * theme::ROW_H;
+        view.search.value = "o".into();
+        let mut buf = blank_canvas(w, h);
+        let mut fb = FB::new(&mut buf, w, h);
+        fb.fill(theme::BG);
+        let mut ctx = p.ctx(None);
+        rustblox::menu_ui::draw(&mut view, &mut ctx, &mut fb);
+        save(&buf, w, h, &format!("{dir}/preview_menu_scrolled.png"));
     }
 }

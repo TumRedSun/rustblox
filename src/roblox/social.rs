@@ -1,14 +1,72 @@
 //! Social data: friends, presence, game names, avatar thumbnails.
 //! All requests are batched (<=100 ids per call) to minimize round trips.
 
-use crate::model::{Friend, Presence, PresenceKind};
+use crate::model::{Friend, Presence, PresenceKind, UserEntry};
 use crate::roblox::client::{RobloxClient, FRIENDS_BASE, GAMES_BASE, PRESENCE_BASE, THUMBS_BASE, USERS_BASE};
 use crate::roblox::errors::ApiError;
-use crate::roblox::types::{FriendsResponse, GamesResponse, LastOnlineResponse, PresenceResponse, ThumbsResponse, UsersBatchResponse};
+use crate::roblox::types::{
+    FriendsResponse, GamesResponse, LastOnlineResponse, PresenceResponse, ThumbsResponse, UserSearchResponse,
+    UsersBatchResponse,
+};
 use serde_json::json;
 use std::collections::HashMap;
 
 const CHUNK: usize = 100;
+
+/// Percent-encode a query-string component (RFC 3986 unreserved characters
+/// stay readable, everything else is %XX-escaped byte-wise).
+pub fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => out.push(b as char),
+            other => out.push_str(&format!("%{:02X}", other)),
+        }
+    }
+    out
+}
+
+/// GET /v1/users/search?keyword=...&limit=25 — find users by name.
+/// The endpoint requires at least 2 characters in the keyword.
+pub fn search_users(c: &mut RobloxClient, keyword: &str, limit: u32) -> Result<Vec<UserEntry>, ApiError> {
+    let url = format!(
+        "{}/v1/users/search?keyword={}&limit={}",
+        USERS_BASE,
+        percent_encode(keyword.trim()),
+        limit.clamp(1, 25)
+    );
+    let raw = c.send(&url, None)?;
+    if !(200..300).contains(&raw.status) {
+        return Err(raw.error());
+    }
+    let sr: UserSearchResponse = serde_json::from_slice(&raw.body)
+        .map_err(|e| ApiError::Parse(format!("user search: {}", e)))?;
+    let mut out: Vec<UserEntry> = sr
+        .data
+        .into_iter()
+        .filter(|u| u.id != 0)
+        .map(|u| UserEntry {
+            id: u.id,
+            name: u.name,
+            display_name: u.display_name.filter(|d| !d.is_empty()).unwrap_or_default(),
+        })
+        .collect();
+    out.dedup_by(|a, b| a.id == b.id);
+    Ok(out)
+}
+
+/// POST /v1/friends/{userId}/request-friendship — send a friend request.
+/// 200 = request sent (or already pending); 4xx carries a human message
+/// ("Already friends", "Friend request already pending", …) which is shown
+/// to the user as-is.
+pub fn send_friend_request(c: &mut RobloxClient, user_id: u64) -> Result<(), ApiError> {
+    let url = format!("{}/v1/friends/{}/request-friendship", FRIENDS_BASE, user_id);
+    let raw = c.post_raw(&url, &json!({}))?;
+    if (200..300).contains(&raw.status) {
+        return Ok(());
+    }
+    Err(raw.error())
+}
 
 fn chunks(ids: &[u64]) -> impl Iterator<Item = &[u64]> {
     ids.chunks(CHUNK)

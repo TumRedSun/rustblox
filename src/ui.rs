@@ -15,7 +15,10 @@ pub enum FieldId {
     Password,
     Cookie,
     Code,
+    /// Filter field of the friends list (Home tab).
     Search,
+    /// Search field of the Add Friends pane.
+    AddSearch,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -28,9 +31,18 @@ pub enum Hit {
     Verify,
     Resend,
     Back,
-    Refresh,
+    /// Sidebar navigation.
+    NavHome,
+    NavAdd,
     Logout,
+    /// Scrollbar parts of the friends list (Roblox-style arrows + track).
+    ScrollUp,
+    ScrollDown,
     Scrollbar,
+    /// "Search" button in the Add Friends pane.
+    AddSearchBtn,
+    /// "Add" button on a search-result row (user id).
+    AddUser(u64),
     Row(u64),
 }
 

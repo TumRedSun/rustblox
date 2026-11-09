@@ -201,3 +201,21 @@ pub struct GameEntry {
     #[serde(default)]
     pub name: Option<String>,
 }
+
+/// GET https://users.roblox.com/v1/users/search?keyword=...&limit=25
+#[derive(Debug, Deserialize, Default)]
+pub struct UserSearchResponse {
+    #[serde(default)]
+    pub data: Vec<UserSearchEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserSearchEntry {
+    #[serde(default)]
+    pub id: u64,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+}
