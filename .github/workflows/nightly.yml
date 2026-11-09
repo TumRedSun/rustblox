@@ -63,13 +63,15 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           NAME="rustblox-${{ matrix.target }}"
-          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/${NAME}.exe"
+          EXT=""
+          if [ "$RUNNER_OS" = "Windows" ]; then EXT=".exe"; fi
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/${NAME}${EXT}"
           cp README.md LICENSE dist/
           cd dist
           if [ "$RUNNER_OS" = "Windows" ]; then
-            7z a -y "rustblox-nightly-${{ matrix.target }}.zip" "rustblox-${{ matrix.target }}.exe" README.md LICENSE
+            7z a -y "rustblox-nightly-${{ matrix.target }}.zip" "${NAME}${EXT}" README.md LICENSE
           else
-            zip -q "rustblox-nightly-${{ matrix.target }}.zip" "rustblox-${{ matrix.target }}.exe" README.md LICENSE
+            zip -q "rustblox-nightly-${{ matrix.target }}.zip" "${NAME}${EXT}" README.md LICENSE
           fi
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
