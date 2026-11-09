@@ -258,3 +258,20 @@ fn user_entry_display_fallback() {
     let e2 = UserEntry { id: 2, name: "bob2".into(), display_name: "Bobby".into() };
     assert_eq!(e2.display_or_name(), "Bobby");
 }
+
+#[test]
+fn parses_friend_request_ids_all_shapes() {
+    use rustblox::roblox::social::parse_friend_request_ids;
+    // Current documented shape: {"data":[...]} with `id` keys.
+    let a = br#"{"data":[{"id":11,"name":"a"},{"id":12,"name":"b"}]}"#;
+    assert_eq!(parse_friend_request_ids(a), vec![11, 12]);
+    // Older shape: bare array with `userId` keys.
+    let b = br#"[{"userId":21},{"userId":22}]"#;
+    assert_eq!(parse_friend_request_ids(b), vec![21, 22]);
+    // Mixed keys and a zero id are tolerated.
+    let c = br#"{"data":[{"userId":31},{"id":0},{"id":32}]}"#;
+    assert_eq!(parse_friend_request_ids(c), vec![31, 32]);
+    // Empty list and garbage both yield an empty result (not an error).
+    assert!(parse_friend_request_ids(br#"{"data":[]}"#).is_empty());
+    assert!(parse_friend_request_ids(b"not json").is_empty());
+}

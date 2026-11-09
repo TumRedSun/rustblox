@@ -334,7 +334,9 @@ fn draw_sidebar(v: &mut MenuView, ctx: &mut UiCtx, fb: &mut FB, w: i32, h: i32) 
     }
     y += avatar_sz + (12.0 * s) as i32;
 
-    // Navigation (no Home button: the logo does that).
+    // Navigation (no Home button: the logo does that). In mini mode the
+    // Settings item is dropped here — the bottom gear button covers it, so
+    // there is exactly one Settings entry point per sidebar layout.
     let item_h = (34.0 * s) as i32;
     let item_pad = if mini { (6.0 * s) as i32 } else { pad };
     let item_w = w - 2 * item_pad;
@@ -343,10 +345,12 @@ fn draw_sidebar(v: &mut MenuView, ctx: &mut UiCtx, fb: &mut FB, w: i32, h: i32) 
         v.tab == MenuTab::Friends, true, Hit::NavFriends, None, mini,
     );
     y += item_h + (5.0 * s) as i32;
-    nav_item(
-        ctx, fb, item_pad, y, item_w, item_h, "Settings", icon_gear,
-        v.tab == MenuTab::Settings, true, Hit::NavSettings, None, mini,
-    );
+    if !mini {
+        nav_item(
+            ctx, fb, item_pad, y, item_w, item_h, "Settings", icon_gear,
+            v.tab == MenuTab::Settings, true, Hit::NavSettings, None, mini,
+        );
+    }
     y += item_h + (9.0 * s) as i32;
 
     if !mini {
@@ -473,25 +477,22 @@ fn icon_person_add(fb: &mut FB, x: i32, y: i32, sz: i32, color: theme::Rgba) {
 }
 
 fn icon_gear(fb: &mut FB, x: i32, y: i32, sz: i32, color: theme::Rgba) {
+    // Proper gear: ring body + 8 teeth on the rim + open hub. Built from a
+    // ring (no background-colored punching), so it renders correctly on any
+    // surface including hover highlights.
     let cx = x + sz / 2;
     let cy = y + sz / 2;
-    let r = sz / 2 - 1;
-    // Ring.
-    fb.circle(cx, cy, r, color);
-    fb.circle(cx, cy, (r - 2).max(1), crate::theme::cur().surface);
-    // Teeth (N, E, S, W + diagonals).
-    for &(dx, dy) in &[(0, -1), (0, 1), (-1, 0), (1, 0)] {
-        let tx = cx + dx * (r - 1);
-        let ty = cy + dy * (r - 1);
-        fb.rect(tx - 1, ty - 1, 3, 3, color);
+    let ro = (sz / 2 - 1).max(3);
+    let ri = (ro * 45 / 100).max(1);
+    let tooth = ((sz / 8) as i32).max(2);
+    for k in 0..8 {
+        let a = k as f32 * std::f32::consts::FRAC_PI_4;
+        let (sn, cs) = a.sin_cos();
+        let tx = cx + (cs * ro as f32).round() as i32;
+        let ty = cy + (sn * ro as f32).round() as i32;
+        fb.rect(tx - tooth / 2, ty - tooth / 2, tooth, tooth, color);
     }
-    for &(dx, dy) in &[(-1, -1), (1, -1), (-1, 1), (1, 1)] {
-        let tx = cx + dx * (r - 1);
-        let ty = cy + dy * (r - 1);
-        fb.rect(tx, ty, 2, 2, color);
-    }
-    // Center hole punched with the sidebar surface.
-    fb.circle(cx, cy, (r / 3).max(1), crate::theme::cur().surface);
+    fb.ring(cx, cy, ro, ri, color);
 }
 
 fn icon_person(fb: &mut FB, x: i32, y: i32, sz: i32, color: theme::Rgba) {

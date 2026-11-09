@@ -8,7 +8,7 @@ use crate::roblox::client::{
 };
 use crate::roblox::errors::ApiError;
 use crate::roblox::types::{
-    FriendRequestsResponse, FriendsResponse, GamesResponse, LastOnlineResponse, OmniResponse,
+    FriendsResponse, GamesResponse, LastOnlineResponse, OmniResponse,
     PresenceResponse, ThumbsResponse, UserSearchResponse, UsersBatchResponse,
 };
 use serde_json::json;
@@ -71,41 +71,22 @@ pub fn send_friend_request(c: &mut RobloxClient, user_id: u64) -> Result<(), Api
     Err(raw.error())
 }
 
-/// GET /v1/users/{userId}/friends/requests — incoming friend requests.
-/// Falls back to the older /v1/my/friends/requests path; entries carry either
-/// `userId` or `id`, names are resolved with the batch users endpoint.
-pub fn fetch_friend_requests(c: &mut RobloxClient, user_id: u64) -> Result<Vec<UserEntry>, ApiError> {
-    let urls = [
-        format!("{}/v1/users/{}/friends/requests?limit=50", FRIENDS_BASE, user_id),
-        format!("{}/v1/my/friends/requests?limit=50", FRIENDS_BASE),
-    ];
-    let mut ids: Vec<u64> = Vec::new();
-    let mut last_err: Option<ApiError> = None;
-    for url in urls {
-        match c.send(&url, None) {
-            Ok(raw) if (200..300).contains(&raw.status) => {
-                if let Ok(fr) = raw.json::<FriendRequestsResponse>() {
-                    ids = fr
-                        .data
-                        .iter()
-                        .filter_map(|e| e.user_id.or(e.id))
-                        .filter(|id| *id != 0)
-                        .collect();
-                    ids.dedup();
-                    if !ids.is_empty() {
-                        break;
-                    }
-                }
-            }
-            Ok(raw) => last_err = Some(raw.error()),
-            Err(e) => last_err = Some(e),
-        }
+/// GET /v1/my/friends/requests — incoming friend requests of the logged-in
+/// user. (The old /v1/users/{userId}/friends/requests route was removed by
+/// Roblox and answers 404, so the "my" path is the only one left.) The
+/// payload has shipped in more than one shape over the years — a bare array
+/// or a {"data": [...]} wrapper, entries keyed by `userId` or `id` — so the
+/// ids are dug out defensively; names are resolved with the batch users
+/// endpoint afterwards.
+pub fn fetch_friend_requests(c: &mut RobloxClient) -> Result<Vec<UserEntry>, ApiError> {
+    let url = format!("{}/v1/my/friends/requests?limit=50", FRIENDS_BASE);
+    let raw = c.send(&url, None)?;
+    if !(200..300).contains(&raw.status) {
+        return Err(raw.error());
     }
+    let ids = parse_friend_request_ids(&raw.body);
     if ids.is_empty() {
-        return match last_err {
-            Some(e) => Err(e),
-            None => Ok(Vec::new()),
-        };
+        return Ok(Vec::new());
     }
     let details = fetch_user_details(c, &ids);
     Ok(ids
@@ -119,6 +100,35 @@ pub fn fetch_friend_requests(c: &mut RobloxClient, user_id: u64) -> Result<Vec<U
             }
         })
         .collect())
+}
+
+/// Extract requester ids from a friend-requests payload. Tolerates: a bare
+/// JSON array, an object with the list under "data", and entries keyed by
+/// either `userId` or `id`. Public for tests.
+pub fn parse_friend_request_ids(body: &[u8]) -> Vec<u64> {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    let list = match &v {
+        serde_json::Value::Array(a) => Some(a.clone()),
+        serde_json::Value::Object(o) => o.get("data").and_then(|d| d.as_array()).cloned(),
+        _ => None,
+    };
+    let mut ids: Vec<u64> = Vec::new();
+    if let Some(items) = list {
+        for it in items {
+            let id = it
+                .get("userId")
+                .or_else(|| it.get("id"))
+                .and_then(|x| x.as_u64())
+                .filter(|id| *id != 0);
+            if let Some(id) = id {
+                ids.push(id);
+            }
+        }
+    }
+    ids.dedup();
+    ids
 }
 
 /// POST /v1/users/{userId}/accept-friend-request — accept an incoming request.

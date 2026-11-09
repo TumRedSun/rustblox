@@ -239,6 +239,33 @@ impl<'a> FB<'a> {
         }
     }
 
+    /// Filled ring (annulus) around (`cx`, `cy`): outer radius `ro`, inner
+    /// radius `ri` (`ri >= ro` or negative `ri` degrades to a full disc).
+    /// Unlike a filled circle punched with the background color this works
+    /// on any surface, so icons stay correct on hover highlights.
+    pub fn ring(&mut self, cx: i32, cy: i32, ro: i32, ri: i32, color: Rgba) {
+        if ro <= 0 {
+            return;
+        }
+        let ri = ri.max(0).min(ro - 1);
+        for dy in -ro..=ro {
+            let o2 = ro * ro - dy * dy;
+            let ox = (o2 as f32).sqrt().round() as i32;
+            let i2 = ri * ri - dy * dy;
+            if i2 <= 0 {
+                // Row does not reach the inner circle: solid span.
+                self.rect(cx - ox, cy + dy, ox * 2 + 1, 1, color);
+            } else {
+                let ix = (i2 as f32).sqrt().round() as i32;
+                let w = ox - ix;
+                if w > 0 {
+                    self.rect(cx - ox, cy + dy, w, 1, color);
+                    self.rect(cx + ix + 1, cy + dy, w, 1, color);
+                }
+            }
+        }
+    }
+
     /// Blit an RGBA8 source image (opaque or alpha-blended), optionally with
     /// rounded corners. The source is scaled (nearest neighbor) from
     /// `sw` x `sh` into the `dw` x `dh` destination box, so the buffer and

@@ -702,6 +702,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 | Hit::ThemePreset(_) | Hit::ToggleRecommendations | Hit::SettingsTab(_)
                                 | Hit::RadiusUp | Hit::RadiusDown | Hit::ColorPrev(_)
                                 | Hit::ColorNext(_) | Hit::ResetAppearance | Hit::CancelAdd
+                                | Hit::ClearField(_)
                                 | Hit::StripLeft | Hit::StripRight | Hit::JoinPlace(_) => {
                                     self.handle_button(released_hit);
                                 }

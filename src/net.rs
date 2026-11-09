@@ -242,10 +242,10 @@ pub fn spawn(proxy: EventLoopProxy<UserEvent>, session: Option<Session>) -> Work
                             let _ = proxy.send_event(UserEvent::Worker(WorkerEvent::PlacesDone { query, result }));
                         }
                         Command::FetchFriendRequests => {
-                            let result = match me_id {
-                                Some(id) => social::fetch_friend_requests(&mut client, id),
-                                None => Ok(Vec::new()),
-                            };
+                            // The endpoint targets the logged-in user ("my"),
+                            // so no user id is needed; unauthenticated calls
+                            // fail with 401 and surface as an error message.
+                            let result = social::fetch_friend_requests(&mut client);
                             if let Ok(users) = &result {
                                 let ids: Vec<u64> = users.iter().map(|u| u.id).collect();
                                 if let Ok(index) = social::fetch_avatar_index(&mut client, &ids) {
