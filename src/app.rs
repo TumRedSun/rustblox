@@ -154,6 +154,12 @@ impl App {
         {
             let frame = px.frame_mut();
             let mut fb = FB::new(frame, self.fbw, self.fbh);
+            // Immediate-mode hit testing: the map holds ONLY what the current
+            // frame drew. Without this clear, hits from previously visited
+            // screens/menus stay clickable at their old coordinates (e.g.
+            // theme presets firing from the Home tab, or sidebar items
+            // reacting while the sidebar is collapsed).
+            self.hits.clear();
             fb.fill(theme::cur().bg);
             let now_ms = self.start_instant.elapsed().as_millis() as u64;
             match &mut self.screen {
@@ -792,6 +798,10 @@ impl ApplicationHandler<UserEvent> for App {
         self.pixels = Some(pixels::Pixels::new(self.fbw as u32, self.fbh as u32, surface)
             .expect("create pixel surface"));
         self.window = Some(window);
+        // Mobile: (re)apply fullscreen/immersive window state every time the
+        // native window comes up (hide system bars, cutout mode). No-op on
+        // desktop — no hooks are registered there.
+        crate::platform::window_ready();
         self.request_redraw();
     }
 

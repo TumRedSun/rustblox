@@ -16,7 +16,7 @@
         android:label="RustBlox"
         android:icon="@mipmap/ic_launcher"
         android:hasCode="false"
-        android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
+        android:theme="@style/RustBloxTheme">
 
         <activity
             android:name="android.app.NativeActivity"

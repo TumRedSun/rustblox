@@ -19,6 +19,9 @@ pub(crate) static APP: std::sync::OnceLock<android_activity::AndroidApp> =
 #[cfg(target_os = "android")]
 mod android_clip;
 
+#[cfg(target_os = "android")]
+mod android_ui;
+
 #[cfg(target_os = "ios")]
 mod ios_clip;
 
@@ -33,6 +36,9 @@ pub fn run_ios() {
         // natively — no extra sync needed.
         ime_push: None,
         ime_pull: None,
+        // Fullscreen is handled declaratively via Info.plist
+        // (UIStatusBarHidden + UIViewControllerBasedStatusBarAppearance).
+        window_ready: None,
     });
     rustblox::run_desktop();
 }
@@ -52,7 +58,14 @@ fn android_main(app: android_activity::AndroidApp) {
         // the client today (see docs/MOBILE.md).
         ime_push: None,
         ime_pull: None,
+        // Fired from App::resumed on every window (re)creation: hides the
+        // status/navigation bars (sticky immersive) and enables drawing
+        // under the camera cutout.
+        window_ready: Some(android_ui::enter_immersive_mode),
     });
+    // Best-effort early apply (the window exists before the surface does);
+    // the resumed hook re-applies it on every lifecycle change.
+    android_ui::enter_immersive_mode();
 
     let session = rustblox::config::load_session();
     let event_loop = winit::event_loop::EventLoop::<rustblox::net::UserEvent>::with_user_event()

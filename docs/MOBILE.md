@@ -27,6 +27,8 @@ the `nightly` release on `main`.
 | Soft keyboard show/hide | ✅ on field tap / tap-away | ✅ (winit UIKeyInput) |
 | Text input | 🚧 hardware-style keys only (backspace, space, digits; BT keyboards fully work) | ✅ native IME events |
 | Save/restore session | ✅ `.ROBLOSECURITY` config file | ✅ |
+| Immersive fullscreen | ✅ status + navigation bars hidden (sticky), window draws under the camera cutout — re-applied on every resume via JNI (`android_ui.rs`) | ✅ status bar hidden via Info.plist; content spans the full screen |
+| Launcher icon | ✅ red “R” in the rotated tile | ✅ same artwork |
 
 ## How it works
 
@@ -45,7 +47,13 @@ desktop build:
   loop runs, so no Objective-C bootstrap is needed.
 
 Shared plumbing lives in `rustblox::platform`: the harness registers function
-pointers (clipboard get/set) that the client calls instead of arboard.
+pointers (clipboard get/set, IME push/pull, `window_ready`) that the client
+calls instead of touching platform APIs directly. The `window_ready` hook
+fires from `App::resumed` on every window (re)creation — on Android it runs
+the JNI immersive setup (`mobile/src/android_ui.rs`: hide status/navigation
+bars sticky-immersive, `setDecorFitsSystemWindows(false)`,
+`layoutInDisplayCutoutMode=shortEdges` in `values-v28`), so no part of the
+client UI ends up under the phone's camera cutout or gesture buttons.
 
 Touch input is handled in `App::handle_touch`: the first finger drives a
 synthetic pointer through the same hit-testing pipeline as the mouse

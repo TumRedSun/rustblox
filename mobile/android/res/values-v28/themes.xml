@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- API 28+: let the client draw under the camera cutout (shortEdges).
+     The client itself re-applies immersive flags + insets hiding via JNI on
+     every resume (mobile/src/android_ui.rs); this theme attribute covers the
+     window-layout side declaratively. -->
+<resources>
+    <style name="RustBloxTheme" parent="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+    </style>
+</resources>

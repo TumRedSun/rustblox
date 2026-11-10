@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- RustBlox app theme: fullscreen, no action/title bar. The cutout policy
+     lives in values-v28 (the attribute does not exist below API 28). -->
+<resources>
+    <style name="RustBloxTheme" parent="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen" />
+</resources>

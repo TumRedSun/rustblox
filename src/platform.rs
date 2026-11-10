@@ -20,6 +20,11 @@ pub struct PlatformHooks {
     /// Reads back the IME text state (committed/composing text) — `Some`
     /// text means the platform has text to sync into the focused field.
     pub ime_pull: Option<fn() -> Option<String>>,
+    /// Called whenever the native window was (re)created and is about to be
+    /// shown (`App::resumed`). Mobile harnesses use it to (re)apply
+    /// fullscreen/immersive window state — hide the status/navigation bars
+    /// and let the surface draw under the display cutout. None = no-op.
+    pub window_ready: Option<fn()>,
 }
 
 static HOOKS: OnceLock<RwLock<PlatformHooks>> = OnceLock::new();
@@ -62,4 +67,11 @@ pub fn ime_push(text: &str) {
 pub fn ime_pull() -> Option<String> {
     let f = hooks().ime_pull?;
     f()
+}
+
+/// The native window was (re)created (no-op on desktop).
+pub fn window_ready() {
+    if let Some(f) = hooks().window_ready {
+        f();
+    }
 }
