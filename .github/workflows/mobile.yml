@@ -206,5 +206,12 @@ jobs:
           # are unreliable here, so patch the API directly.
           MOBILE_RID=$(gh api "repos/${GH_REPO}/releases/tags/mobile" --jq .id)
           gh api -X PATCH "repos/${GH_REPO}/releases/${MOBILE_RID}" -f make_latest=false > /dev/null
+          # Creating any release makes it the newest one, and GitHub then
+          # points the Latest badge at it — so re-pin the desktop nightly
+          # release as Latest at the very end (no-op if it doesn't exist yet).
+          NIGHTLY_RID=$(gh api "repos/${GH_REPO}/releases/tags/nightly" --jq .id 2>/dev/null) || true
+          if [ -n "${NIGHTLY_RID}" ]; then
+            gh api -X PATCH "repos/${GH_REPO}/releases/${NIGHTLY_RID}" -f make_latest=true > /dev/null
+          fi
           gh release upload mobile artifacts/* --clobber
           echo "Mobile release refreshed for ${DATE}."
