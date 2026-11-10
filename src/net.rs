@@ -283,6 +283,7 @@ pub fn spawn(proxy: EventLoopProxy<UserEvent>, session: Option<Session>) -> Work
                             let _ = proxy.send_event(UserEvent::Worker(WorkerEvent::RequestResponded { user_id, accept, result }));
                         }
                         Command::JoinPlace { place_id } => {
+                            crate::logs::push("app", &format!("join requested: place {}", place_id));
                             let _ = proxy.send_event(UserEvent::Worker(WorkerEvent::Game(GameEvent::Progress("Запрашиваем сервер…".into()))));
                             match crate::roblox::join::join_game(&mut client, place_id) {
                                 Ok(resp) => {

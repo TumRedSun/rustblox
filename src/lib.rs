@@ -10,6 +10,7 @@ pub mod font;
 pub mod game;
 pub mod gfx;
 pub mod login_ui;
+pub mod logs;
 pub mod menu_ui;
 pub mod model;
 pub mod net;

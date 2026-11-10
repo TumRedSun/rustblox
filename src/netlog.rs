@@ -31,19 +31,26 @@ pub fn enabled(kind: &str) -> bool {
 
 #[macro_export]
 macro_rules! netlog {
-    (net, $($arg:tt)*) => {
+    // Wrapped in a block so the macro is a single expression: match arms in
+    // raknet.rs use it in value position.
+    (net, $($arg:tt)*) => {{
+        $crate::logs::push("net", &format!($($arg)*));
         if $crate::netlog_enabled("net") { eprintln!("[rustblox/net] {}", format_args!($($arg)*)); }
-    };
-    (info, $($arg:tt)*) => {
+    }};
+    (info, $($arg:tt)*) => {{
+        $crate::logs::push("net", &format!($($arg)*));
         if $crate::netlog_enabled("net") { eprintln!("[rustblox/net] {}", format_args!($($arg)*)); }
-    };
-    (debug, $($arg:tt)*) => {
+    }};
+    (debug, $($arg:tt)*) => {{
+        $crate::logs::push("net", &format!($($arg)*));
         if $crate::netlog_enabled("net") { eprintln!("[rustblox/net] {}", format_args!($($arg)*)); }
-    };
-    (game, $($arg:tt)*) => {
+    }};
+    (game, $($arg:tt)*) => {{
+        $crate::logs::push("game", &format!($($arg)*));
         if $crate::netlog_enabled("game") { eprintln!("[rustblox/game] {}", format_args!($($arg)*)); }
-    };
-    (gfx, $($arg:tt)*) => {
+    }};
+    (gfx, $($arg:tt)*) => {{
+        $crate::logs::push("gfx", &format!($($arg)*));
         if $crate::netlog_enabled("gfx") { eprintln!("[rustblox/gfx] {}", format_args!($($arg)*)); }
-    };
+    }};
 }
