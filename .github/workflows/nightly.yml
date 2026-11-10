@@ -143,6 +143,10 @@ jobs:
           # and /releases/latest resolves to it right from the repo page.
           gh release create nightly --target "${GITHUB_SHA}" --latest \
             --title "Nightly build (${DATE})" --notes "$NOTES"
+          # Pin the Latest badge explicitly (gh bool flags are unreliable
+          # here, and later mobile runs must never steal it).
+          NIGHTLY_RID=$(gh api "repos/${GH_REPO}/releases/tags/nightly" --jq .id)
+          gh api -X PATCH "repos/${GH_REPO}/releases/${NIGHTLY_RID}" -f make_latest=true > /dev/null
           gh release upload nightly artifacts/*.zip --clobber
           echo "Nightly release refreshed for ${DATE}."
       - name: Trigger the nightly mobile build
