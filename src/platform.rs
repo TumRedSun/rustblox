@@ -25,6 +25,12 @@ pub struct PlatformHooks {
     /// fullscreen/immersive window state — hide the status/navigation bars
     /// and let the surface draw under the display cutout. None = no-op.
     pub window_ready: Option<fn()>,
+    /// Returns the app-private data directory (Android:
+    /// NativeActivity's `internalDataPath`, e.g.
+    /// `/data/data/<pkg>/files`). Used for persisting the session,
+    /// accounts and settings — `dirs::config_dir()` is unusable on Android
+    /// (no `$HOME`). None on desktop → the caller falls back to `dirs`.
+    pub app_data_dir: Option<fn() -> Option<std::path::PathBuf>>,
 }
 
 static HOOKS: OnceLock<RwLock<PlatformHooks>> = OnceLock::new();
@@ -74,4 +80,11 @@ pub fn window_ready() {
     if let Some(f) = hooks().window_ready {
         f();
     }
+}
+
+/// The platform's private data directory (None on desktop — callers fall
+/// back to `dirs::config_dir()`).
+pub fn app_data_dir() -> Option<std::path::PathBuf> {
+    let f = hooks().app_data_dir?;
+    f()
 }

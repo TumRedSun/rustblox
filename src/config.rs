@@ -17,10 +17,19 @@ pub struct Session {
 }
 
 pub fn app_dir() -> Option<PathBuf> {
+    // Mobile platforms provide their app-private data dir through the
+    // platform hook (Android has no $HOME, so `dirs` returns nothing
+    // useful there). Desktop falls through to the regular config dir.
+    if let Some(dir) = crate::platform::app_data_dir() {
+        return Some(dir.join("rustblox"));
+    }
     dirs::config_dir().map(|d| d.join("rustblox"))
 }
 
 pub fn avatar_cache_dir() -> Option<PathBuf> {
+    if let Some(dir) = crate::platform::app_data_dir() {
+        return Some(dir.join("rustblox").join("avatars"));
+    }
     dirs::cache_dir().map(|d| d.join("rustblox").join("avatars"))
 }
 

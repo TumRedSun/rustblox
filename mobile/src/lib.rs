@@ -62,6 +62,8 @@ fn android_main(app: android_activity::AndroidApp) {
         // status/navigation bars (sticky immersive) and enables drawing
         // under the camera cutout.
         window_ready: Some(android_ui::enter_immersive_mode),
+        // App-private storage dir — sessions/settings survive restarts.
+        app_data_dir: Some(android_ui::app_data_dir),
     });
     // Best-effort early apply (the window exists before the surface does);
     // the resumed hook re-applies it on every lifecycle change.

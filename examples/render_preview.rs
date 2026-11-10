@@ -31,7 +31,6 @@ impl<'a> Painter<'a> {
             focus,
             scale: 1.0,
             now_ms: 0,
-            caret_anim: false,
             avatars: &mut self.avatars,
             icons: &mut self.icons,
         }

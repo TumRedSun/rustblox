@@ -52,8 +52,6 @@ pub struct UiCtx<'a> {
     pub focus: Option<FieldId>,
     pub scale: f32,
     pub now_ms: u64,
-    /// Set by a text field when a caret was visible (schedules blink redraw).
-    pub caret_anim: bool,
     pub avatars: &'a mut HashMap<u64, Arc<Vec<u8>>>,
     /// Decoded square game icons keyed by root place id.
     pub icons: &'a mut HashMap<u64, Arc<Vec<u8>>>,
@@ -71,6 +69,11 @@ pub struct App {
     pub pointer_touch: Option<u64>,
     /// Touch drag over empty content: scroll the active pane 1:1 with the finger.
     pub content_drag: Option<(f32, f32)>, // (start cursor y, start scroll)
+    /// Touch drag that started on the horizontal friends strip:
+    /// `(start_x, start_y, start_strip_scroll, axis)` — the axis is decided
+    /// once the finger moves: horizontal swipes scroll the strip, vertical
+    /// swipes fall through to the page (`content_drag`).
+    pub strip_drag: Option<(f32, f32, f32, Option<bool>)>,
     /// Held scroll arrow (Hit::ScrollUp/ScrollDown) with the next repeat tick.
     pub arrow_hold: Option<(Hit, Instant)>,
     pub mods: ModifiersState,
@@ -114,6 +117,7 @@ impl App {
             drag_scroll: None,
             pointer_touch: None,
             content_drag: None,
+            strip_drag: None,
             arrow_hold: None,
             mods: ModifiersState::empty(),
             focus: None,
@@ -171,7 +175,6 @@ impl App {
                         focus: self.focus,
                         scale: self.scale,
                         now_ms,
-                        caret_anim: false,
                         avatars: &mut self.avatars,
                         icons: &mut self.place_icons,
                     };
@@ -185,7 +188,6 @@ impl App {
                         focus: self.focus,
                         scale: self.scale,
                         now_ms,
-                        caret_anim: false,
                         avatars: &mut self.avatars,
                         icons: &mut self.place_icons,
                     };
@@ -197,7 +199,7 @@ impl App {
         self.pixels = Some(px);
     }
 
-    /// Earliest future redraw needed for animations (spinner, caret, countdown).
+    /// Earliest future redraw needed for animations (spinner, countdown).
     fn schedule_anim(&mut self) -> Option<Instant> {
         let now = Instant::now();
         let mut wakes: Vec<Instant> = Vec::with_capacity(3);
@@ -210,9 +212,6 @@ impl App {
         };
         if spinner {
             wakes.push(now + Duration::from_millis(90));
-        }
-        if self.focus.is_some() {
-            wakes.push(now + Duration::from_millis(530));
         }
         if matches!(self.screen, Screen::Menu(_)) {
             wakes.push(now + Duration::from_millis(1000));
@@ -357,6 +356,43 @@ impl App {
                 *scroll = (start_scroll - (y - start_y)).max(0.0);
             }
         }
+        // Touch drag on the friends strip: resolve the gesture axis once,
+        // then either swipe the strip horizontally or hand the gesture over
+        // to the vertical page scroll above.
+        if let Some((sx, sy, s0, axis)) = self.strip_drag {
+            if let Screen::Menu(v) = &mut self.screen {
+                if matches!(v.tab, MenuTab::Home) {
+                    let dx = x - sx;
+                    let dy = y - sy;
+                    let resolved = match axis {
+                        Some(a) => Some(a),
+                        None => {
+                            let th = 8.0 * self.scale;
+                            if dx.abs() > th || dy.abs() > th {
+                                Some(dx.abs() >= dy.abs())
+                            } else {
+                                None
+                            }
+                        }
+                    };
+                    self.strip_drag = Some((sx, sy, s0, resolved));
+                    match resolved {
+                        Some(true) => {
+                            v.strip_scroll = (s0 - dx).max(0.0);
+                            // Horizontal swipe wins: stop the page scroll.
+                            self.content_drag = None;
+                        }
+                        Some(false) => {
+                            // Vertical swipe: the page scroll takes over.
+                            self.strip_drag = None;
+                        }
+                        None => {}
+                    }
+                } else {
+                    self.strip_drag = None;
+                }
+            }
+        }
         self.request_redraw();
     }
 
@@ -413,6 +449,23 @@ impl App {
                 self.content_drag = Some((self.cursor.1, start));
             }
         }
+        // Touch: a drag starting on the friends strip may become either a
+        // horizontal strip swipe or a vertical page scroll (axis resolved on
+        // first movement in `pointer_moved`). Taps on the strip arrows stay
+        // plain button clicks.
+        if self.pointer_touch.is_some() && self.strip_drag.is_none() {
+            if let Screen::Menu(v) = &mut self.screen {
+                if matches!(v.tab, MenuTab::Home) {
+                    if let Some(r) = v.strip_rect {
+                        if r.contains(self.cursor.0, self.cursor.1)
+                            && !matches!(hit, Hit::StripLeft | Hit::StripRight)
+                        {
+                            self.strip_drag = Some((self.cursor.0, self.cursor.1, v.strip_scroll, None));
+                        }
+                    }
+                }
+            }
+        }
         self.mouse_down = Some(hit);
         self.needs_redraw = true;
     }
@@ -420,6 +473,7 @@ impl App {
     /// Shared pointer-release logic for mouse (`Released`) and touch (`Ended`).
     fn pointer_released(&mut self) {
         self.content_drag = None;
+        self.strip_drag = None;
         let pressed = self.mouse_down.take();
         self.drag_scroll = None;
         self.arrow_hold = None;
@@ -789,6 +843,12 @@ impl ApplicationHandler<UserEvent> for App {
             .with_inner_size(winit::dpi::LogicalSize::new(WINDOW_W, WINDOW_H))
             .with_min_inner_size(winit::dpi::LogicalSize::new(880.0, 600.0))
             .with_window_level(WindowLevel::Normal);
+        // Desktop: launch straight into borderless fullscreen (Alt+F11 or the
+        // window manager still escapes it). Mobile ignores these attributes —
+        // winit binds the window to the native activity surface there, where
+        // the immersive-mode hook already hides the system bars.
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let attrs = attrs.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
         let window = Arc::new(elwt.create_window(attrs).expect("create window"));
         let size = window.inner_size();
         self.scale = window.scale_factor() as f32;

@@ -169,3 +169,11 @@ fn clear(env: &mut JNIEnv) {
         let _ = env.exception_clear();
     }
 }
+
+/// App-private data directory (NativeActivity `internalDataPath`, typically
+/// `/data/data/<package>/files`). Registered as the `app_data_dir` platform
+/// hook so sessions, saved accounts and settings persist across restarts —
+/// `dirs::config_dir()` is useless here because Android sets no `$HOME`.
+pub fn app_data_dir() -> Option<std::path::PathBuf> {
+    crate::APP.get().and_then(|app| app.internal_data_path())
+}
