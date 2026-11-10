@@ -37,8 +37,19 @@ jobs:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             binary: rustblox
+          # ARM64 Linux: GitHub offers free hosted ARM64 runners for public
+          # repositories (ubuntu-24.04-arm).
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary: rustblox
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            binary: rustblox.exe
+          # ARM64 Windows: free hosted runner for public repositories
+          # (windows-11-arm); rustup ships native aarch64-pc-windows-msvc
+          # host tools.
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
             binary: rustblox.exe
           # macos-14 was retired by GitHub on 2026-11-02 ("The configuration
           # 'macos-14-arm64-us-default' is not supported"); macos-15 is the
@@ -111,7 +122,9 @@ jobs:
           | File | Platform |
           |------|----------|
           | \`rustblox-nightly-x86_64-unknown-linux-gnu.zip\` | Linux 64-bit |
+          | \`rustblox-nightly-aarch64-unknown-linux-gnu.zip\` | Linux ARM64 |
           | \`rustblox-nightly-x86_64-pc-windows-msvc.zip\` | Windows 64-bit |
+          | \`rustblox-nightly-aarch64-pc-windows-msvc.zip\` | Windows ARM64 |
           | \`rustblox-nightly-aarch64-apple-darwin.zip\` | macOS Apple Silicon |
           | \`rustblox-nightly-x86_64-apple-darwin.zip\` | macOS Intel |
           EOF

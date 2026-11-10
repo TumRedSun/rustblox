@@ -43,7 +43,7 @@ Works on **Windows, Linux and macOS** out of the box (TLS via rustls, no system 
 
 ### Nightly builds
 
-Every night (02:00 UTC) and on demand (*Actions → Nightly builds → Run workflow*) a GitHub Actions pipeline runs the test suite, builds release binaries for **Linux x64, Windows x64, macOS Apple Silicon and macOS Intel**, and publishes them as zip archives to the rolling [`nightly`](../../releases/tag/nightly) pre-release (assets are replaced on each run).
+Every night (02:00 UTC) and on demand (*Actions → Nightly builds → Run workflow*) a GitHub Actions pipeline runs the test suite, builds release binaries for **Linux x64 & ARM64, Windows x64 & ARM64, macOS Apple Silicon and macOS Intel**, and publishes them as zip archives to the rolling [`nightly`](../../releases/tag/nightly) pre-release (assets are replaced on each run).
 
 ## Sign-in methods
 
@@ -151,7 +151,7 @@ cargo build --release
 
 ### Ночные сборки
 
-Каждую ночь (02:00 UTC) и по кнопке (*Actions → Nightly builds → Run workflow*) GitHub Actions прогоняет тесты, собирает release-бинарники для **Linux x64, Windows x64, macOS Apple Silicon и macOS Intel** и публикует их zip-архивами в скользящий пререлиз [`nightly`](../../releases/tag/nightly) (ассеты перезаписываются при каждой сборке).
+Каждую ночь (02:00 UTC) и по кнопке (*Actions → Nightly builds → Run workflow*) GitHub Actions прогоняет тесты, собирает release-бинарники для **Linux x64 & ARM64, Windows x64 & ARM64, macOS Apple Silicon и macOS Intel** и публикует их zip-архивами в скользящий пререлиз [`nightly`](../../releases/tag/nightly) (ассеты перезаписываются при каждой сборке).
 
 ## Как войти
 
