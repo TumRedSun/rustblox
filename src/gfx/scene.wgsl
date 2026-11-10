@@ -23,20 +23,25 @@ struct FrameUniforms {
 @group(1) @binding(0) var shadow_map: texture_depth_2d;
 @group(1) @binding(1) var shadow_samp: sampler_comparison;
 
-// Per-part instance: 3x3 rotation (column-major), position, full size,
-// color, roughness + emissive.
-struct PartInstance {
-    @location(0) rot: mat3x3<f32>,
+// Vertex inputs for the scene/shadow passes: builtins plus per-part
+// instance data. A mat3x3 cannot be a vertex attribute directly, so the
+// rotation arrives as three column vectors at locations 0..2 (this matches
+// the Rust-side gfx::SceneInstance layout). Location 3 is intentionally
+// unused by both sides.
+struct SceneIn {
+    @builtin(vertex_index) vi: u32,
+    @location(0) rc0: vec3<f32>,        // rotation column 0
+    @location(1) rc1: vec3<f32>,        // rotation column 1
+    @location(2) rc2: vec3<f32>,        // rotation column 2
     @location(4) pos: vec4<f32>,        // xyz, w unused
     @location(5) size: vec4<f32>,       // full extents, w unused
     @location(6) color: vec4<f32>,      // rgba (a = opacity)
     @location(7) params: vec4<f32>,     // x = roughness, y = emissive, z/w unused
 };
 
-struct CubeIn {
-    @builtin(vertex_index) vi: u32,
-    @builtin(instance_index) ii: u32,
-};
+fn instance_rot(in: SceneIn) -> mat3x3<f32> {
+    return mat3x3<f32>(in.rc0, in.rc1, in.rc2);
+}
 
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
@@ -46,20 +51,22 @@ struct VsOut {
     @location(3) params: vec2<f32>,
 };
 
-// 24-vertex cube: 6 faces x 4 corners. face = vi / 4, corner = vi % 4.
+// 36-vertex cube: 6 faces x 6 vertices (two triangles per face, no index
+// buffer). face = vi / 6, k = vi % 6.
 // Faces: 0:+X, 1:-X, 2:+Y, 3:-Y, 4:+Z, 5:-Z.
 fn cube_pos_normal(vi: u32) -> vec3<f32> {
-    let face = vi / 4u;
-    let k = vi % 4u;
+    let face = vi / 6u;
+    let k = vi % 6u;
     let a = face / 2u;            // axis 0..2
     let sgn = select(-1.0, 1.0, face % 2u == 0u);
     let ua = (a + 1u) % 3u;       // tangent axis
     let va = (a + 2u) % 3u;       // bitangent axis
+    // Corner pattern for the two triangles of each face:
+    // (-1,-1) (1,-1) (1,1) | (1,1) (-1,1) (-1,-1)
     var cu = -1.0;
     var cv = -1.0;
-    if (k == 1u) { cu = 1.0; }
-    if (k == 2u) { cu = 1.0; cv = 1.0; }
-    if (k == 3u) { cv = 1.0; }
+    if (k == 1u || k == 2u || k == 3u) { cu = 1.0; }
+    if (k == 2u || k == 3u || k == 4u) { cv = 1.0; }
     var p = vec3<f32>(0.0);
     p[a] = sgn;
     p[ua] = cu;
@@ -68,13 +75,14 @@ fn cube_pos_normal(vi: u32) -> vec3<f32> {
 }
 
 @vertex
-fn vs_scene(in: CubeIn) -> VsOut {
+fn vs_scene(in: SceneIn) -> VsOut {
     var out: VsOut;
+    let rot = instance_rot(in);
     let corner = cube_pos_normal(in.vi);
     let local = corner * in.size.xyz * 0.5;
-    let world = in.pos.xyz + in.rot * local;
+    let world = in.pos.xyz + rot * local;
     out.world = world;
-    out.normal = normalize(in.rot * cube_normal(in.vi));
+    out.normal = normalize(rot * cube_normal(in.vi));
     out.clip = frame.view_proj * vec4<f32>(world, 1.0);
     out.color = in.color;
     out.params = in.params.xy;
@@ -82,7 +90,7 @@ fn vs_scene(in: CubeIn) -> VsOut {
 }
 
 fn cube_normal(vi: u32) -> vec3<f32> {
-    let face = vi / 4u;
+    let face = vi / 6u;
     var n = vec3<f32>(0.0, 0.0, 1.0);
     if (face == 0u) { n = vec3<f32>(1.0, 0.0, 0.0); }
     else if (face == 1u) { n = vec3<f32>(-1.0, 0.0, 0.0); }
@@ -108,9 +116,9 @@ fn shadow_factor(world: vec3<f32>, n: vec3<f32>) -> f32 {
     let sp = frame.light_view_proj * vec4<f32>(world + n * 0.05, 1.0);
     let proj = sp.xyz / sp.w;
     let uv = vec2<f32>(proj.x * 0.5 + 0.5, 0.5 - proj.y * 0.5);
-    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || proj.z > 1.0) {
-        return 1.0;
-    }
+    // No early return: textureSampleCompare needs uniform control flow, and
+    // a non-uniform return would diverge the quad. Mask the result instead.
+    let inside = (uv.x >= 0.0) & (uv.x <= 1.0) & (uv.y >= 0.0) & (uv.y <= 1.0) & (proj.z <= 1.0);
     var sum = 0.0;
     for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
         for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
@@ -118,7 +126,7 @@ fn shadow_factor(world: vec3<f32>, n: vec3<f32>) -> f32 {
             sum = sum + textureSampleCompare(shadow_map, shadow_samp, uv + o, proj.z - 0.0015);
         }
     }
-    return sum / 9.0;
+    return select(1.0, sum / 9.0, inside);
 }
 
 @fragment
@@ -168,11 +176,12 @@ struct ShadowOut {
 };
 
 @vertex
-fn vs_shadow(in: CubeIn) -> ShadowOut {
+fn vs_shadow(in: SceneIn) -> ShadowOut {
     var out: ShadowOut;
+    let rot = instance_rot(in);
     let corner = cube_pos_normal(in.vi);
     let local = corner * in.size.xyz * 0.5;
-    let world = in.pos.xyz + in.rot * local;
+    let world = in.pos.xyz + rot * local;
     out.clip = frame.light_view_proj * vec4<f32>(world, 1.0);
     return out;
 }

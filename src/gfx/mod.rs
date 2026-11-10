@@ -81,6 +81,60 @@ fn rgba_to_f32(c: Rgba) -> [f32; 4] {
     [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0, c[3] as f32 / 255.0]
 }
 
+/// Upload a tightly-packed R8/RGBA8 image to a texture, padding every row
+/// to wgpu's 256-byte copy-row alignment. `data` holds `width * height *
+/// bytes_per_px` bytes, row-major, with no padding of its own.
+fn write_texture_padded(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    origin: wgpu::Origin3d,
+    data: &[u8],
+    width: u32,
+    height: u32,
+    bytes_per_px: u32,
+) {
+    let src_bpr = (width * bytes_per_px) as usize;
+    let dst_bpr = ((src_bpr + 255) / 256) * 256; // COPY_BYTES_PER_ROW_ALIGNMENT
+    let info = wgpu::TexelCopyTextureInfo {
+        texture,
+        mip_level: 0,
+        origin,
+        aspect: wgpu::TextureAspect::All,
+    };
+    let extent = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
+    if data.len() < src_bpr * height as usize {
+        return; // not enough pixels; refuse to upload garbage
+    }
+    if src_bpr == dst_bpr {
+        queue.write_texture(
+            info,
+            data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(src_bpr as u32),
+                rows_per_image: Some(height),
+            },
+            extent,
+        );
+        return;
+    }
+    let mut padded = vec![0u8; dst_bpr * height as usize];
+    for row in 0..height as usize {
+        let s = row * src_bpr;
+        padded[row * dst_bpr..row * dst_bpr + src_bpr].copy_from_slice(&data[s..s + src_bpr]);
+    }
+    queue.write_texture(
+        info,
+        &padded,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(dst_bpr as u32),
+            rows_per_image: Some(height),
+        },
+        extent,
+    );
+}
+
 fn clip_to_scissor(c: Clip, w: u32, h: u32) -> (u32, u32, u32, u32) {
     let x0 = c.x0.clamp(0, w as i32) as u32;
     let y0 = c.y0.clamp(0, h as i32) as u32;
@@ -603,22 +657,16 @@ impl Gfx {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(sw * 4),
-                rows_per_image: Some(sh),
-            },
-            wgpu::Extent3d { width: sw, height: sh, depth_or_array_layers: 1 },
-        );
         let view = texture.create_view(&Default::default());
+        write_texture_padded(
+            &self.queue,
+            &texture,
+            wgpu::Origin3d::ZERO,
+            data,
+            sw,
+            sh,
+            4,
+        );
         let layout = self.ui_pipeline.get_bind_group_layout(0);
         let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ui-image-bg"),
@@ -689,20 +737,14 @@ impl Gfx {
         if m.x + m.w > page as u16 || m.y + m.h > page as u16 {
             return;
         }
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.atlas_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x: m.x as u32, y: m.y as u32, z: 0 },
-                aspect: wgpu::TextureAspect::All,
-            },
+        write_texture_padded(
+            &self.queue,
+            &self.atlas_texture,
+            wgpu::Origin3d { x: m.x as u32, y: m.y as u32, z: 0 },
             &m.data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(w),
-                rows_per_image: Some(h),
-            },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            w,
+            h,
+            1,
         );
     }
 
@@ -1100,4 +1142,34 @@ fn glyph_uv(slot: &GlyphSlot, page: u32) -> [f32; 4] {
         slot.w as f32 / p,
         slot.h as f32 / p,
     ]
+}
+
+// ---------------------------------------------------------------------------
+// Shader validation: wgpu only parses/validates WGSL at runtime on the GPU
+// path, which no CI machine can exercise. Parse + validate every embedded
+// shader with naga (the same front-end wgpu uses) so shader mistakes break
+// `cargo test` instead of the client on launch.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod shader_tests {
+    #[test]
+    fn gfx_shaders_parse_and_validate() {
+        let sources: [(&str, &str); 2] = [
+            ("ui.wgsl", include_str!("ui.wgsl")),
+            ("scene.wgsl", include_str!("scene.wgsl")),
+        ];
+        for (name, src) in sources {
+            let module = naga::front::wgsl::parse_str(src)
+                .unwrap_or_else(|e| panic!("{name}: WGSL parse error: {e}"));
+            let mut validator = naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            );
+            validator
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{name}: WGSL validation error: {e}"));
+            // Entry points must exist.
+            assert!(!module.entry_points.is_empty(), "{name}: no entry points");
+        }
+    }
 }
