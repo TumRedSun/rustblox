@@ -1,0 +1,23 @@
+[package]
+name = "rustblox-mobile"
+version = "0.1.2"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "Mobile (Android/iOS) harness for RustBlox: builds the client as a cdylib/staticlib for the platform runtimes."
+repository = "https://github.com/TumRedSun/rustblox"
+
+# Android: librustblox_mobile.so, loaded by the runtime, exports `android_main`.
+[lib]
+name = "rustblox_mobile"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+rustblox = { path = ".." }
+winit = "0.30.13"
+
+# Android: native-activity glue. winit 0.30 pulls android-activity 0.6
+# itself; the extra `features` line enables the native-activity backend on
+# the shared winit dependency.
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity = { version = "0.6", features = ["native-activity"] }
+winit = { version = "0.30.13", features = ["android-native-activity"] }

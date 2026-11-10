@@ -8,6 +8,13 @@ repository = "https://github.com/TumRedSun/rustblox"
 keywords = ["roblox", "client", "rust", "gpl"]
 categories = ["games", "network-programming"]
 
+# Workspace: the mobile/ member carries the Android/iOS harness (cdylib +
+# staticlib). Default members keep plain `cargo build` / `cargo test`
+# desktop-only, exactly like before the mobile branch.
+[workspace]
+members = ["mobile"]
+default-members = ["."]
+
 [dependencies]
 winit = "0.30.13"
 pixels = "0.17"
@@ -17,6 +24,9 @@ serde_json = "1.0"
 ureq = { version = "2.10", default-features = false, features = ["tls", "gzip"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 dirs = "5.0"
+
+# Desktop clipboard (arboard has no Android/iOS backend).
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 arboard = "3.7"
 
 [profile.release]

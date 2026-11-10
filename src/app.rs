@@ -80,7 +80,12 @@ pub struct App {
     pub next_anim: Option<Instant>,
     pub avatars: HashMap<u64, Arc<Vec<u8>>>,
     pub place_icons: HashMap<u64, Arc<Vec<u8>>>,
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     pub clipboard: Option<arboard::Clipboard>,
+    /// Mobile targets have no arboard backend; paste is a no-op until the
+    /// platform IME integration lands (see docs/MOBILE.md).
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    pub clipboard: Option<()>,
     pub start_instant: Instant,
     /// True while validating a saved session at startup.
     pub restoring: bool,
@@ -115,7 +120,10 @@ impl App {
             next_anim: None,
             avatars: HashMap::new(),
             place_icons: HashMap::new(),
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             clipboard: arboard::Clipboard::new().ok(),
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            clipboard: None,
             start_instant: Instant::now(),
             restoring: has_saved_session,
             adding_account: false,
@@ -250,6 +258,7 @@ impl App {
         }
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn paste_clipboard(&mut self) {
         if let Some(text) = self
             .clipboard
@@ -263,6 +272,10 @@ impl App {
             }
         }
     }
+
+    /// Paste stub for mobile: no system clipboard backend yet.
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    fn paste_clipboard(&mut self) {}
 
     fn primary_action(&mut self) {
         let tx = self.tx.clone();
@@ -588,6 +601,15 @@ impl App {
 }
 
 impl ApplicationHandler<UserEvent> for App {
+    fn suspended(&mut self, _elwt: &ActiveEventLoop) {
+        // Android (and iOS) lifecycle: the activity is going away, so GPU
+        // surfaces tied to the native window must be dropped. Everything is
+        // recreated in `resumed`.
+        self.pixels = None;
+        self.window = None;
+        self.request_redraw();
+    }
+
     fn resumed(&mut self, elwt: &ActiveEventLoop) {
         let attrs = Window::default_attributes()
             .with_title("RustBlox \u{2014} Unofficial Roblox Client")

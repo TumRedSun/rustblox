@@ -1,0 +1,123 @@
+# Mobile builds: experimental Android/iOS artifacts from the `mobile` branch.
+#
+# Android: builds librustblox.so (aarch64) with the NDK. Packaging into a
+# runnable APK (GameActivity/Gradle template) is tracked in docs/MOBILE.md.
+# iOS: builds the static library (aarch64-apple-ios) to embed into an Xcode
+# project — no code signing or app bundle here.
+#
+# Both artifacts are published to the rolling "mobile" pre-release, mirroring
+# how the nightly workflow maintains the "nightly" release on main.
+#
+# Trigger manually: Actions -> Mobile builds -> Run workflow.
+
+name: Mobile builds
+
+on:
+  push:
+    branches: [mobile]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-linux-android
+      - name: Install pinned Android NDK
+        # The ubuntu image ships an SDK already (ANDROID_HOME is set); pin the
+        # NDK version so the clang linker wrapper is deterministic.
+        run: sdkmanager --install "ndk;27.2.12479018" > /dev/null
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+      - name: Build Android library (arm64-v8a)
+        run: cargo ndk -t arm64-v8a build --release -p rustblox-mobile
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/aarch64-linux-android/release/librustblox_mobile.so dist/
+          cp README.md LICENSE dist/
+          cd dist
+          zip -q rustblox-mobile-aarch64-linux-android.zip librustblox_mobile.so README.md LICENSE
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustblox-mobile-aarch64-linux-android
+          path: dist/rustblox-mobile-aarch64-linux-android.zip
+          if-no-files-found: error
+
+  ios:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-apple-ios
+      - name: Build iOS static library (arm64)
+        run: cargo build --release --target aarch64-apple-ios -p rustblox-mobile
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/aarch64-apple-ios/release/librustblox_mobile.a dist/
+          cp README.md LICENSE dist/
+          cd dist
+          zip -q rustblox-mobile-aarch64-apple-ios.zip librustblox_mobile.a README.md LICENSE
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustblox-mobile-aarch64-apple-ios
+          path: dist/rustblox-mobile-aarch64-apple-ios.zip
+          if-no-files-found: error
+
+  release:
+    needs: [android, ios]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Publish / refresh the rolling "mobile" release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # No checkout happens in this job, so tell gh which repository to
+          # target instead of letting it probe the (missing) git remote.
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          DATE=$(date -u +%Y-%m-%d)
+          NOTES=$(cat <<EOF
+          Experimental mobile builds of the \`mobile\` branch (${DATE}).
+
+          | File | Platform |
+          |------|----------|
+          | \`rustblox-mobile-aarch64-linux-android.zip\` | Android ARM64 (librustblox_mobile.so) |
+          | \`rustblox-mobile-aarch64-apple-ios.zip\` | iOS ARM64 (static library) |
+
+          These are library artifacts, not installable apps yet — see
+          docs/MOBILE.md for the packaging roadmap.
+          EOF
+          )
+          if gh release view mobile > /dev/null 2>&1; then
+            gh release edit mobile --title "Mobile build (${DATE})" --notes "$NOTES" --prerelease
+          else
+            gh release create mobile --prerelease --title "Mobile build (${DATE})" --notes "$NOTES"
+          fi
+          gh release upload mobile artifacts/*.zip --clobber
+          echo "Mobile release refreshed for ${DATE}."

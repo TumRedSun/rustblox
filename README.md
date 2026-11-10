@@ -45,6 +45,10 @@ Works on **Windows, Linux and macOS** out of the box (TLS via rustls, no system 
 
 Every night (02:00 UTC) and on demand (*Actions → Nightly builds → Run workflow*) a GitHub Actions pipeline runs the test suite, builds release binaries for **Linux x64 & ARM64, Windows x64 & ARM64, macOS Apple Silicon and macOS Intel**, and publishes them as zip archives to the rolling [`nightly`](../../releases/tag/nightly) pre-release (assets are replaced on each run).
 
+### Mobile (experimental)
+
+The [`mobile`](../../tree/mobile) branch builds for **Android (ARM64)** and **iOS (ARM64)** via *Actions → Mobile builds*. It currently ships library artifacts (`librustblox.so` / `librustblox.a`) published to the rolling [`mobile`](../../releases/tag/mobile) pre-release — packaging into installable apps is in progress, see [docs/MOBILE.md](docs/MOBILE.md).
+
 ## Sign-in methods
 
 ### 1. Password (+ 2-step verification)
@@ -152,6 +156,10 @@ cargo build --release
 ### Ночные сборки
 
 Каждую ночь (02:00 UTC) и по кнопке (*Actions → Nightly builds → Run workflow*) GitHub Actions прогоняет тесты, собирает release-бинарники для **Linux x64 & ARM64, Windows x64 & ARM64, macOS Apple Silicon и macOS Intel** и публикует их zip-архивами в скользящий пререлиз [`nightly`](../../releases/tag/nightly) (ассеты перезаписываются при каждой сборке).
+
+### Мобильные (экспериментально)
+
+Ветка [`mobile`](../../tree/mobile) собирается для **Android (ARM64)** и **iOS (ARM64)** через *Actions → Mobile builds*. Сейчас публикуются библиотечные артефакты (`librustblox.so` / `librustblox.a`) в скользящий пререлиз [`mobile`](../../releases/tag/mobile) — упаковка в устанавливаемые приложения в процессе, подробности в [docs/MOBILE.md](docs/MOBILE.md).
 
 ## Как войти
 
