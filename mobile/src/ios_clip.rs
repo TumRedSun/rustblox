@@ -6,7 +6,7 @@ use objc2_ui_kit::UIPasteboard;
 /// Returns the current clipboard text, if any.
 pub fn get() -> Option<String> {
     unsafe {
-        let pb = UIPasteboard::generalPasteboard()?;
+        let pb = UIPasteboard::generalPasteboard();
         let s = pb.string()?;
         Some(s.to_string())
     }
@@ -15,8 +15,7 @@ pub fn get() -> Option<String> {
 /// Puts `text` onto the clipboard.
 pub fn set(text: &str) {
     unsafe {
-        if let Some(pb) = UIPasteboard::generalPasteboard() {
-            pb.setString(Some(&NSString::from_str(text)));
-        }
+        let pb = UIPasteboard::generalPasteboard();
+        pb.setString(Some(&NSString::from_str(text)));
     }
 }

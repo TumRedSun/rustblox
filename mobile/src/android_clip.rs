@@ -68,7 +68,8 @@ pub fn get() -> Option<String> {
             .l()
             .ok()?;
         let jstr = JString::from(s);
-        Some(env.get_string(&jstr).ok()?.into())
+        let java_str = env.get_string(&jstr).ok()?;
+        Some(String::from(java_str))
     }
 }
 
@@ -85,7 +86,7 @@ pub fn set(text: &str) {
         let env: &mut JNIEnv = &mut guard;
         let activity = JObject::from_raw(app.activity_as_ptr() as *mut jni::sys::_jobject);
 
-        let Some(service) = env.new_string("clipboard") else { return };
+        let Ok(service) = env.new_string("clipboard") else { return };
         let Ok(cb) = env
             .call_method(
                 &activity,
