@@ -330,6 +330,17 @@ impl Gfx {
                 wgpu::VertexAttribute { format: wgpu::VertexFormat::Uint32x4, offset: 64, shader_location: 4 },
             ],
         };
+        // The main pass always owns a Depth32Float attachment, and wgpu 29
+        // requires every pipeline used in that pass to declare the same
+        // depth-stencil format. UI and sky ignore depth: test always, write
+        // never.
+        let overlay_depth = wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Always),
+            stencil: Default::default(),
+            bias: Default::default(),
+        };
         let ui_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("ui-pipeline"),
             layout: Some(&ui_pipeline_layout),
@@ -365,7 +376,7 @@ impl Gfx {
                 cull_mode: None,
                 ..Default::default()
             },
-            depth_stencil: None,
+            depth_stencil: Some(overlay_depth.clone()),
             multisample: Default::default(),
             multiview_mask: None,
             cache: None,
@@ -546,7 +557,7 @@ impl Gfx {
                 cull_mode: None,
                 ..Default::default()
             },
-            depth_stencil: None,
+            depth_stencil: Some(overlay_depth.clone()),
             multisample: Default::default(),
             multiview_mask: None,
             cache: None,
@@ -1130,7 +1141,12 @@ fn ui_flush<'p>(
     clip: Clip,
 ) {
     let (x, y, w, h) = clip_to_scissor(clip, screen_w, screen_h);
-    pass.set_scissor_rect(x, y, w.max(1), h.max(1));
+    // An empty or fully off-screen clip has nothing to draw; a clamped
+    // 1x1 scissor could stick out of the target and fail validation.
+    if w == 0 || h == 0 {
+        return;
+    }
+    pass.set_scissor_rect(x, y, w, h);
     pass.draw(0..6, start..end);
 }
 
