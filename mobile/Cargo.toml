@@ -1,15 +1,16 @@
 [package]
 name = "rustblox-mobile"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 license = "GPL-3.0-only"
-description = "Mobile (Android/iOS) harness for RustBlox: builds the client as a cdylib/staticlib for the platform runtimes."
+description = "Mobile (Android/iOS) harness for RustBlox: builds the client as a cdylib/staticlib/app bundle for the platform runtimes."
 repository = "https://github.com/TumRedSun/rustblox"
 
-# Android: librustblox_mobile.so, loaded by the runtime, exports `android_main`.
+# Android: librustblox_mobile.so, loaded by NativeActivity, exports `android_main`.
+# The extra `lib` type lets the bin target (iOS app executable) link against it.
 [lib]
 name = "rustblox_mobile"
-crate-type = ["cdylib", "staticlib"]
+crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
 rustblox = { path = ".." }
@@ -17,7 +18,15 @@ winit = "0.30.13"
 
 # Android: native-activity glue. winit 0.30 pulls android-activity 0.6
 # itself; the extra `features` line enables the native-activity backend on
-# the shared winit dependency.
+# the shared winit dependency. `jni` gives access to the platform clipboard.
 [target.'cfg(target_os = "android")'.dependencies]
 android-activity = { version = "0.6", features = ["native-activity"] }
 winit = { version = "0.30.13", features = ["android-native-activity"] }
+jni = "0.21"
+
+# iOS: clipboard via UIPasteboard. Versions match winit's objc2 stack so
+# everything unifies into one build.
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2 = "0.5.2"
+objc2-foundation = { version = "0.2.2", features = ["NSString"] }
+objc2-ui-kit = { version = "0.2.2", features = ["UIPasteboard"] }

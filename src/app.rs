@@ -17,7 +17,7 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, Touch, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowLevel};
@@ -67,6 +67,10 @@ pub struct App {
     pub cursor: (f32, f32),
     pub mouse_down: Option<Hit>,
     pub drag_scroll: Option<(f32, f32)>, // (start cursor y, start scroll)
+    /// Touch id of the finger driving the synthetic pointer (mobile).
+    pub pointer_touch: Option<u64>,
+    /// Touch drag over empty content: scroll the active pane 1:1 with the finger.
+    pub content_drag: Option<(f32, f32)>, // (start cursor y, start scroll)
     /// Held scroll arrow (Hit::ScrollUp/ScrollDown) with the next repeat tick.
     pub arrow_hold: Option<(Hit, Instant)>,
     pub mods: ModifiersState,
@@ -108,6 +112,8 @@ impl App {
             cursor: (-1.0, -1.0),
             mouse_down: None,
             drag_scroll: None,
+            pointer_touch: None,
+            content_drag: None,
             arrow_hold: None,
             mods: ModifiersState::empty(),
             focus: None,
@@ -258,14 +264,14 @@ impl App {
         }
     }
 
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn paste_clipboard(&mut self) {
-        if let Some(text) = self
-            .clipboard
-            .as_mut()
-            .and_then(|c| c.get_text().ok())
-            .filter(|t| !t.is_empty())
-        {
+        // Platform backend first (Android/iOS hooks); falls back to arboard
+        // on desktop.
+        let text = crate::platform::clipboard_get();
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let text = text
+            .or_else(|| self.clipboard.as_mut().and_then(|c| c.get_text().ok()));
+        if let Some(text) = text.filter(|t| !t.is_empty()) {
             if let Some(f) = self.focused_field_mut() {
                 f.insert(&text);
                 self.needs_redraw = true;
@@ -273,9 +279,170 @@ impl App {
         }
     }
 
-    /// Paste stub for mobile: no system clipboard backend yet.
-    #[cfg(any(target_os = "android", target_os = "ios"))]
-    fn paste_clipboard(&mut self) {}
+    fn handle_touch(&mut self, touch: Touch) {
+        // Single-finger pointer emulation: the first finger down drives the
+        // synthetic pointer; other fingers are ignored while it is active.
+        match touch.phase {
+            TouchPhase::Started => {
+                if self.pointer_touch.is_some() {
+                    return;
+                }
+                self.pointer_touch = Some(touch.id);
+                self.pointer_moved(touch.location.x as f32, touch.location.y as f32);
+                self.pointer_pressed();
+            }
+            TouchPhase::Moved => {
+                if self.pointer_touch != Some(touch.id) {
+                    return;
+                }
+                self.pointer_moved(touch.location.x as f32, touch.location.y as f32);
+            }
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                if self.pointer_touch != Some(touch.id) {
+                    return;
+                }
+                self.pointer_touch = None;
+                self.pointer_moved(touch.location.x as f32, touch.location.y as f32);
+                self.pointer_released();
+            }
+        }
+    }
+
+    /// Shared pointer-move logic for mouse (`CursorMoved`) and touch (`Moved`).
+    fn pointer_moved(&mut self, x: f32, y: f32) {
+        self.cursor = (x, y);
+        // Scrollbar drag (whichever list is active).
+        if let (Some((start_y, start_scroll)), true) = (
+            self.drag_scroll,
+            self.mouse_down.as_ref().map(|h| matches!(h, Hit::Scrollbar)).unwrap_or(false),
+        ) {
+            if let Screen::Menu(v) = &mut self.screen {
+                let (scroll, k) = match (v.tab, v.friend_pane, v.settings.tab) {
+                    (MenuTab::Home, _, _) => (
+                        &mut v.places_scroll,
+                        v.places_metrics.as_ref().map(|m| (m.content_h / m.h.max(1.0)).max(1.0)).unwrap_or(1.0),
+                    ),
+                    (MenuTab::Friends, FriendPane::Requests, _) => (
+                        &mut v.requests_scroll,
+                        v.requests_metrics.as_ref().map(|m| (m.content_h / m.h.max(1.0)).max(1.0)).unwrap_or(1.0),
+                    ),
+                    (MenuTab::Friends, FriendPane::Search, _) => (
+                        &mut v.add_scroll,
+                        v.add_metrics.as_ref().map(|m| (m.content_h / m.h.max(1.0)).max(1.0)).unwrap_or(1.0),
+                    ),
+                    (MenuTab::Settings, _, SettingsTab::General) | (MenuTab::Settings, _, SettingsTab::Appearance) => (
+                        &mut v.settings_scroll,
+                        v.settings_metrics.as_ref().map(|m| (m.content_h / m.h.max(1.0)).max(1.0)).unwrap_or(1.0),
+                    ),
+                };
+                *scroll = (start_scroll + (y - start_y) * k).max(0.0);
+            }
+        }
+        // Touch: content drag scrolls the active pane 1:1 with the finger
+        // (natural scrolling: finger down moves the content down).
+        if let Some((start_y, start_scroll)) = self.content_drag {
+            if let Screen::Menu(v) = &mut self.screen {
+                let scroll = match (v.tab, v.friend_pane, v.settings.tab) {
+                    (MenuTab::Home, _, _) => &mut v.places_scroll,
+                    (MenuTab::Friends, FriendPane::Requests, _) => &mut v.requests_scroll,
+                    (MenuTab::Friends, FriendPane::Search, _) => &mut v.add_scroll,
+                    (MenuTab::Settings, _, _) => &mut v.settings_scroll,
+                };
+                *scroll = (start_scroll - (y - start_y)).max(0.0);
+            }
+        }
+        self.request_redraw();
+    }
+
+    /// Shared pointer-down logic for mouse (`Pressed`) and touch (`Started`).
+    fn pointer_pressed(&mut self) {
+        let hit = self.hits.at(self.cursor.0, self.cursor.1);
+        if let Hit::Field(id) = hit {
+            self.focus = Some(id);
+            // Reflect the new field's text into the platform IME and show the
+            // soft keyboard on touch devices.
+            let text = self
+                .focused_field_mut()
+                .map(|f| f.value.clone())
+                .unwrap_or_default();
+            crate::platform::ime_push(&text);
+            if cfg!(any(target_os = "android", target_os = "ios")) {
+                if let Some(w) = &self.window {
+                    w.set_ime_allowed(true);
+                }
+            }
+        } else if cfg!(any(target_os = "android", target_os = "ios")) {
+            // Tapping outside a field dismisses the soft keyboard.
+            if self.focus.take().is_some() {
+                if let Some(w) = &self.window {
+                    w.set_ime_allowed(false);
+                }
+            }
+        }
+        if let Hit::Scrollbar = hit {
+            if let Screen::Menu(v) = &mut self.screen {
+                let start = match (v.tab, v.friend_pane, v.settings.tab) {
+                    (MenuTab::Home, _, _) => v.places_scroll,
+                    (MenuTab::Friends, FriendPane::Requests, _) => v.requests_scroll,
+                    (MenuTab::Friends, FriendPane::Search, _) => v.add_scroll,
+                    (MenuTab::Settings, _, _) => v.settings_scroll,
+                };
+                self.drag_scroll = Some((self.cursor.1, start));
+            }
+        }
+        if matches!(hit, Hit::ScrollUp | Hit::ScrollDown) {
+            // First step immediately, then auto-repeat while held.
+            self.scroll_step(&hit);
+            self.arrow_hold = Some((hit.clone(), Instant::now() + Duration::from_millis(ARROW_REPEAT_DELAY_MS)));
+        }
+        // Touch: dragging empty content scrolls the active pane.
+        if self.pointer_touch.is_some() && matches!(hit, Hit::None) {
+            if let Screen::Menu(v) = &mut self.screen {
+                let start = match (v.tab, v.friend_pane, v.settings.tab) {
+                    (MenuTab::Home, _, _) => v.places_scroll,
+                    (MenuTab::Friends, FriendPane::Requests, _) => v.requests_scroll,
+                    (MenuTab::Friends, FriendPane::Search, _) => v.add_scroll,
+                    (MenuTab::Settings, _, _) => v.settings_scroll,
+                };
+                self.content_drag = Some((self.cursor.1, start));
+            }
+        }
+        self.mouse_down = Some(hit);
+        self.needs_redraw = true;
+    }
+
+    /// Shared pointer-release logic for mouse (`Released`) and touch (`Ended`).
+    fn pointer_released(&mut self) {
+        self.content_drag = None;
+        let pressed = self.mouse_down.take();
+        self.drag_scroll = None;
+        self.arrow_hold = None;
+        if let Some(pressed_hit) = pressed {
+            let released_hit = self.hits.at(self.cursor.0, self.cursor.1);
+            if pressed_hit == released_hit {
+                match released_hit {
+                    Hit::TabPassword | Hit::TabCookie | Hit::SignIn | Hit::Verify
+                    | Hit::Resend | Hit::Back | Hit::Logout | Hit::NavFriends | Hit::NavSettings
+                    | Hit::AddSearchBtn | Hit::AddUser(_)
+                    | Hit::SearchPlacesBtn | Hit::SidebarToggle | Hit::Logo
+                    | Hit::TabRequests | Hit::TabSearch | Hit::RequestAccept(_)
+                    | Hit::RequestDecline(_) | Hit::SwitchAccount(_) | Hit::AddAccount
+                    | Hit::ThemePreset(_) | Hit::ToggleRecommendations | Hit::SettingsTab(_)
+                    | Hit::RadiusUp | Hit::RadiusDown | Hit::ColorPrev(_)
+                    | Hit::ColorNext(_) | Hit::ResetAppearance | Hit::CancelAdd
+                    | Hit::ClearField(_)
+                    | Hit::StripLeft | Hit::StripRight | Hit::JoinPlace(_) => {
+                        self.handle_button(released_hit);
+                    }
+                    Hit::Field(id) => {
+                        self.focus = Some(id);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.request_redraw();
+    }
 
     fn primary_action(&mut self) {
         let tx = self.tx.clone();
@@ -648,95 +815,18 @@ impl ApplicationHandler<UserEvent> for App {
                 self.mods = m.state();
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.cursor = (position.x as f32, position.y as f32);
-                // Scrollbar drag (whichever list is active).
-                if let (Some((start_y, start_scroll)), true) = (
-                    self.drag_scroll,
-                    self.mouse_down.as_ref().map(|h| matches!(h, Hit::Scrollbar)).unwrap_or(false),
-                ) {
-                    if let Screen::Menu(v) = &mut self.screen {
-                        let (scroll, k) = match (v.tab, v.friend_pane, v.settings.tab) {
-                            (MenuTab::Home, _, _) => (
-                                &mut v.places_scroll,
-                                v.places_metrics.as_ref().map(|m| (m.content_h / m.h.max(1.0)).max(1.0)).unwrap_or(1.0),
-                            ),
-                            (MenuTab::Friends, FriendPane::Requests, _) => (
-                                &mut v.requests_scroll,
-                                v.requests_metrics.as_ref().map(|m| (m.content_h / m.h.max(1.0)).max(1.0)).unwrap_or(1.0),
-                            ),
-                            (MenuTab::Friends, FriendPane::Search, _) => (
-                                &mut v.add_scroll,
-                                v.add_metrics.as_ref().map(|m| (m.content_h / m.h.max(1.0)).max(1.0)).unwrap_or(1.0),
-                            ),
-                            (MenuTab::Settings, _, SettingsTab::General) | (MenuTab::Settings, _, SettingsTab::Appearance) => (
-                                &mut v.settings_scroll,
-                                v.settings_metrics.as_ref().map(|m| (m.content_h / m.h.max(1.0)).max(1.0)).unwrap_or(1.0),
-                            ),
-                        };
-                        *scroll = (start_scroll + (position.y as f32 - start_y) * k).max(0.0);
-                    }
-                }
-                self.request_redraw();
+                self.pointer_moved(position.x as f32, position.y as f32);
             }
             WindowEvent::CursorLeft { .. } => {
                 self.cursor = (-1.0, -1.0);
                 self.request_redraw();
             }
+            WindowEvent::Touch(touch) => {
+                self.handle_touch(touch);
+            }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => match state {
-                ElementState::Pressed => {
-                    let hit = self.hits.at(self.cursor.0, self.cursor.1);
-                    if let Hit::Field(id) = hit {
-                        self.focus = Some(id);
-                    }
-                    if let Hit::Scrollbar = hit {
-                        if let Screen::Menu(v) = &mut self.screen {
-                            let start = match (v.tab, v.friend_pane, v.settings.tab) {
-                                (MenuTab::Home, _, _) => v.places_scroll,
-                                (MenuTab::Friends, FriendPane::Requests, _) => v.requests_scroll,
-                                (MenuTab::Friends, FriendPane::Search, _) => v.add_scroll,
-                                (MenuTab::Settings, _, _) => v.settings_scroll,
-                            };
-                            self.drag_scroll = Some((self.cursor.1, start));
-                        }
-                    }
-                    if matches!(hit, Hit::ScrollUp | Hit::ScrollDown) {
-                        // First step immediately, then auto-repeat while held.
-                        self.scroll_step(&hit);
-                        self.arrow_hold = Some((hit.clone(), Instant::now() + Duration::from_millis(ARROW_REPEAT_DELAY_MS)));
-                    }
-                    self.mouse_down = Some(hit);
-                    self.needs_redraw = true;
-                }
-                ElementState::Released => {
-                    let pressed = self.mouse_down.take();
-                    self.drag_scroll = None;
-                    self.arrow_hold = None;
-                    if let Some(pressed_hit) = pressed {
-                        let released_hit = self.hits.at(self.cursor.0, self.cursor.1);
-                        if pressed_hit == released_hit {
-                            match released_hit {
-                                Hit::TabPassword | Hit::TabCookie | Hit::SignIn | Hit::Verify
-                                | Hit::Resend | Hit::Back | Hit::Logout | Hit::NavFriends | Hit::NavSettings
-                                | Hit::AddSearchBtn | Hit::AddUser(_)
-                                | Hit::SearchPlacesBtn | Hit::SidebarToggle | Hit::Logo
-                                | Hit::TabRequests | Hit::TabSearch | Hit::RequestAccept(_)
-                                | Hit::RequestDecline(_) | Hit::SwitchAccount(_) | Hit::AddAccount
-                                | Hit::ThemePreset(_) | Hit::ToggleRecommendations | Hit::SettingsTab(_)
-                                | Hit::RadiusUp | Hit::RadiusDown | Hit::ColorPrev(_)
-                                | Hit::ColorNext(_) | Hit::ResetAppearance | Hit::CancelAdd
-                                | Hit::ClearField(_)
-                                | Hit::StripLeft | Hit::StripRight | Hit::JoinPlace(_) => {
-                                    self.handle_button(released_hit);
-                                }
-                                Hit::Field(id) => {
-                                    self.focus = Some(id);
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    self.request_redraw();
-                }
+                ElementState::Pressed => self.pointer_pressed(),
+                ElementState::Released => self.pointer_released(),
             },
             WindowEvent::MouseWheel { delta, .. } => {
                 if let Screen::Menu(v) = &mut self.screen {
@@ -807,6 +897,19 @@ impl ApplicationHandler<UserEvent> for App {
                         v.refreshing = true;
                         let tx = self.tx.clone();
                         let _ = tx.send(Command::StartRefresh);
+                        self.needs_redraw = true;
+                    }
+                }
+            }
+        }
+
+        // Mobile soft keyboard: sync the focused field with the platform IME
+        // state (hooks are no-ops on desktop, so this is free there).
+        if self.focus.is_some() {
+            if let Some(text) = crate::platform::ime_pull() {
+                if let Some(f) = self.focused_field_mut() {
+                    if f.value != text {
+                        f.set_text(&text);
                         self.needs_redraw = true;
                     }
                 }

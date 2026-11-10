@@ -47,7 +47,7 @@ Every night (02:00 UTC) and on demand (*Actions → Nightly builds → Run workf
 
 ### Mobile (experimental)
 
-The [`mobile`](../../tree/mobile) branch builds for **Android (ARM64)** and **iOS (ARM64)** via *Actions → Mobile builds*. It currently ships library artifacts (`librustblox.so` / `librustblox.a`) published to the rolling [`mobile`](../../releases/tag/mobile) pre-release — packaging into installable apps is in progress, see [docs/MOBILE.md](docs/MOBILE.md).
+The [`mobile`](../../tree/mobile) branch builds for **Android (ARM64)** and **iOS (ARM64)** via *Actions → Mobile builds*. It publishes an **installable debug-signed APK**, an **unsigned iOS `.ipa`** (re-sign via AltStore/Sideloadly), plus the raw `.so`/`.a` libraries to the rolling [`mobile`](../../releases/tag/mobile) pre-release. Touch input and the system clipboard work on both platforms — details and known limitations in [docs/MOBILE.md](docs/MOBILE.md).
 
 ## Sign-in methods
 
@@ -159,7 +159,7 @@ cargo build --release
 
 ### Мобильные (экспериментально)
 
-Ветка [`mobile`](../../tree/mobile) собирается для **Android (ARM64)** и **iOS (ARM64)** через *Actions → Mobile builds*. Сейчас публикуются библиотечные артефакты (`librustblox.so` / `librustblox.a`) в скользящий пререлиз [`mobile`](../../releases/tag/mobile) — упаковка в устанавливаемые приложения в процессе, подробности в [docs/MOBILE.md](docs/MOBILE.md).
+Ветка [`mobile`](../../tree/mobile) собирается для **Android (ARM64)** и **iOS (ARM64)** через *Actions → Mobile builds*. Публикуются **устанавливаемый APK** (отладочная подпись), **неподписанный iOS-`.ipa`** (переподписать через AltStore/Sideloadly) и сырые библиотеки `.so`/`.a` — в скользящий пререлиз [`mobile`](../../releases/tag/mobile). Тач-ввод и системный буфер обмена работают на обеих платформах — подробности и ограничения в [docs/MOBILE.md](docs/MOBILE.md).
 
 ## Как войти
 

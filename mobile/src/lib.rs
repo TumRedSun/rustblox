@@ -7,13 +7,52 @@
 //!   (native-activity). The winit event loop is bound to the activity's
 //!   `AndroidApp` handle before it is built; the window itself is created in
 //!   `App::resumed`, dropped in `App::suspended`.
-//! - **iOS** — `rustblox_main`, exported from `librustblox_mobile.a` and
-//!   callable from a Swift/ObjC host application.
+//! - **iOS** — the bin target (`.ipa` app executable) and the
+//!   `rustblox_main` C entry for staticlib hosts; winit's iOS backend calls
+//!   `UIApplicationMain` itself when the event loop runs.
+
+/// JavaVM/activity handle for the JNI-based clipboard (Android).
+#[cfg(target_os = "android")]
+pub(crate) static APP: std::sync::OnceLock<android_activity::AndroidApp> =
+    std::sync::OnceLock::new();
+
+#[cfg(target_os = "android")]
+mod android_clip;
+
+#[cfg(target_os = "ios")]
+mod ios_clip;
+
+/// Entry point of the iOS app executable (`mobile` bin target). Also used by
+/// staticlib hosts through `rustblox_main`.
+pub fn run_ios() {
+    #[cfg(target_os = "ios")]
+    rustblox::platform::register_platform_hooks(rustblox::platform::PlatformHooks {
+        clipboard_get: Some(ios_clip::get),
+        clipboard_set: Some(ios_clip::set),
+        // winit's iOS backend implements UIKeyInput and delivers IME events
+        // natively — no extra sync needed.
+        ime_push: None,
+        ime_pull: None,
+    });
+    rustblox::run_desktop();
+}
 
 #[cfg(target_os = "android")]
 #[no_mangle]
 fn android_main(app: android_activity::AndroidApp) {
     use winit::platform::android::EventLoopBuilderExtAndroid;
+
+    let _ = APP.set(app.clone());
+    rustblox::platform::register_platform_hooks(rustblox::platform::PlatformHooks {
+        clipboard_get: Some(android_clip::get),
+        clipboard_set: Some(android_clip::set),
+        // TODO(roadmap): wire IME text sync when the app moves to the
+        // GameActivity backend — winit 0.30 currently drops android-activity
+        // TextEvents (commitText), so only hardware-style key events reach
+        // the client today (see docs/MOBILE.md).
+        ime_push: None,
+        ime_pull: None,
+    });
 
     let session = rustblox::config::load_session();
     let event_loop = winit::event_loop::EventLoop::<rustblox::net::UserEvent>::with_user_event()
@@ -23,10 +62,9 @@ fn android_main(app: android_activity::AndroidApp) {
     rustblox::run_with(event_loop, session);
 }
 
-/// C entry point for an iOS host application (call this from Swift/ObjC
-/// after the UI is ready). winit's iOS backend uses the standard event loop.
+/// Exported symbol for staticlib hosts (an Xcode project can call this).
 #[cfg(target_os = "ios")]
 #[no_mangle]
 pub extern "C" fn rustblox_main() {
-    rustblox::run_desktop();
+    run_ios();
 }

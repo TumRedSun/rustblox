@@ -3,84 +3,99 @@
 The `mobile` branch carries the work-in-progress Android and iOS support for
 RustBlox. It is built by the **Mobile builds** workflow
 (`.github/workflows/mobile.yml`), which runs on every push to `mobile` and on
-demand. Passing builds publish both artifacts to the rolling
+demand. Passing builds publish all artifacts to the rolling
 [`mobile`](../../releases/tag/mobile) pre-release — the mobile counterpart of
 the `nightly` release on `main`.
 
-## Current status
+## What ships today
+
+| Artifact | Platform | What it is |
+|----------|----------|------------|
+| `rustblox-android-arm64.apk` | Android ARM64 | **Installable APK** (NativeActivity, debug-signed) |
+| `rustblox-ios-arm64.ipa` | iOS ARM64 | App bundle in `Payload/` — **unsigned**, re-sign via AltStore/Sideloadly/Xcode to install |
+| `rustblox-mobile-aarch64-linux-android.zip` | Android ARM64 | `librustblox_mobile.so` (for embedding into your own APK) |
+| `rustblox-mobile-aarch64-apple-ios.zip` | iOS ARM64 | `librustblox_mobile.a` static library |
+
+## Current feature status
 
 | Part | Android | iOS |
 |------|---------|-----|
 | Compiles (release, ARM64) | ✅ `aarch64-linux-android` | ✅ `aarch64-apple-ios` |
-| Entry point wired | ✅ `android_main` (native-activity) | ✅ standard bin entry |
-| Window / GPU surface lifecycle | ✅ created in `resumed`, dropped in `suspended` | ✅ same code path |
-| Networking (ureq + rustls/ring) | ✅ | ✅ |
-| Clipboard (arboard) | ❌ disabled (no mobile backend) | ❌ disabled |
-| Touch input | 🚧 not mapped yet | 🚧 not mapped yet |
-| Soft keyboard (IME) | ❌ | ❌ |
-| Installable package (APK / .ipa) | ❌ | ❌ |
+| Installable package | ✅ APK (aapt2 + zipalign + apksigner) | ✅ .ipa (unsigned) |
+| Touch input | ✅ tap = click, drag = list scroll | ✅ same code path |
+| Clipboard | ✅ JNI → `ClipboardManager` | ✅ `UIPasteboard` |
+| Soft keyboard show/hide | ✅ on field tap / tap-away | ✅ (winit UIKeyInput) |
+| Text input | 🚧 hardware-style keys only (backspace, space, digits; BT keyboards fully work) | ✅ native IME events |
+| Save/restore session | ✅ `.ROBLOSECURITY` config file | ✅ |
 
-## What ships today
-
-- `rustblox-mobile-aarch64-linux-android.zip` — `librustblox_mobile.so`
-  (arm64-v8a), the cdylib the Android runtime loads; `android_main` is
-  exported from the `rustblox-mobile` harness crate and bound to the winit
-  event loop via `with_android_app`.
-- `rustblox-mobile-aarch64-apple-ios.zip` — `librustblox_mobile.a`
-  (aarch64), the static library to link into an Xcode project (entry point:
-  `rustblox_main`).
-
-These are **library artifacts**, not installable apps yet.
-
-## How the port works
+## How it works
 
 The client itself lives in the `rustblox` library crate; the `mobile/`
-workspace member is a thin harness crate (`rustblox-mobile`) that only
-provides the platform entry points, keeping Android/iOS dependencies out of
-the desktop build:
+workspace member is a thin harness crate (`rustblox-mobile`) that provides
+the platform entry points and keeps Android/iOS dependencies out of the
+desktop build:
 
-- desktop — `rustblox::run_desktop()`, used by the root `src/main.rs`;
-- Android — `rustblox_mobile`'s `android_main` binds winit to the activity's
-  `AndroidApp` handle (`EventLoopBuilderExtAndroid::with_android_app`) before
-  building the event loop, then calls `rustblox::run_with`;
-- iOS — `rustblox_mobile`'s `rustblox_main` (C ABI) calls
-  `rustblox::run_desktop`; winit's iOS backend needs no extra handle.
+- **desktop** — `rustblox::run_desktop()`, used by the root `src/main.rs`;
+- **Android** — `android_main` binds winit to the activity's `AndroidApp`
+  handle (`EventLoopBuilderExtAndroid::with_android_app`), then calls
+  `rustblox::run_with`. The window/surface is created in `App::resumed` and
+  dropped in `App::suspended` (required by the Android lifecycle);
+- **iOS** — `rustblox_mobile::run_ios()` (bin target and `rustblox_main` C
+  entry). winit's iOS backend calls `UIApplicationMain` itself when the event
+  loop runs, so no Objective-C bootstrap is needed.
 
-Both paths converge in `rustblox::run_with`, which spawns the network worker
-and runs `app::App`. The Android lifecycle is already respected:
+Shared plumbing lives in `rustblox::platform`: the harness registers function
+pointers (clipboard get/set) that the client calls instead of arboard.
 
-- `App::resumed` creates the window and the pixel surface (on Android this
-  fires *after* the activity is up, which is exactly when window creation is
-  allowed);
-- `App::suspended` drops the surface and window, because the GPU surfaces die
-  with the native window on suspend; the next `resumed` recreates everything.
+Touch input is handled in `App::handle_touch`: the first finger drives a
+synthetic pointer through the same hit-testing pipeline as the mouse
+(`pointer_pressed` / `pointer_moved` / `pointer_released`), and dragging
+empty content scrolls the active list naturally (1:1 with the finger).
 
-`arboard` (desktop clipboard) is a target-specific dependency and the paste
-path is compiled out on mobile targets.
+### Android APK (no Gradle)
 
-## Roadmap
+The APK is assembled manually in CI — fully deterministic, no SDK license
+prompts:
 
-1. **Touch input** — map `winit` `WindowEvent::Touch` onto the existing
-   pointer/hit-testing pipeline (tap = click, drag = scroll).
-2. **Text input** — soft keyboard via platform IME events for the login and
-   search fields (paste stays a no-op until then).
-3. **Android packaging** — Gradle template (GameActivity or NativeActivity)
-   that loads `librustblox_mobile.so` and produces an APK; `cargo ndk`
-   already covers the Rust side.
-4. **iOS packaging** — minimal Xcode project linking `librustblox_mobile.a`
-   with a Metal view; device deployment needs signing.
-5. **UI adaptation** — portrait layouts and density-aware scaling (the current
-   UI targets desktop window sizes ≥ 880×600 logical pixels).
+1. `cargo ndk` builds `librustblox_mobile.so` (NDK r27c, downloaded directly
+   from dl.google.com);
+2. `aapt2` (from the official build-tools zip) compiles `res/` and links
+   `AndroidManifest.xml` + `android.jar` (platform-34) into an unsigned APK;
+3. the `.so` is added under `lib/arm64-v8a/` with plain `zip`;
+4. `zipalign` + `apksigner` sign it with the committed
+   `mobile/android/debug.keystore` (standard debug credentials — dev builds
+   only, `hasCode=false` means no Java code at all).
+
+### iOS .ipa
+
+The bin target (`rustblox-mobile`) is built for `aarch64-apple-ios` and
+wrapped into `Payload/RustBlox.app` (Info.plist, PkgInfo, icons). The result
+is an unsigned .ipa — Apple requires signing for device installation, so
+re-sign it with AltStore, Sideloadly or a personal provisioning profile.
+
+## Known limitations
+
+- **Android soft keyboard text**: winit 0.30's Android backend drops
+  android-activity `TextEvent`s (IME `commitText`), so typed letters do not
+  reach the client yet. Hardware-style keys work (backspace, space, digits —
+  many keyboards send these as key events), and Bluetooth keyboards work
+  fully. Fixing this properly means switching the harness to the
+  GameActivity backend (requires shipping Java classes in the APK) or
+  waiting for winit to forward text events upstream.
+- **iOS .ipa is unsigned** by design (no certificates in CI).
+- **Session storage** uses the shared config directory; on Android it lives
+  in the app sandbox, on iOS in the bundle's Documents dir.
 
 ## Building locally
 
 ```bash
 # Android (requires NDK r26+ and cargo-ndk: cargo install cargo-ndk)
 cargo ndk -t arm64-v8a build --release -p rustblox-mobile
-# artifact: target/aarch64-linux-android/release/librustblox_mobile.so
+# artifacts: target/aarch64-linux-android/release/librustblox_mobile.so
 
 # iOS (requires macOS with Xcode)
 rustup target add aarch64-apple-ios
 cargo build --release --target aarch64-apple-ios -p rustblox-mobile
-# artifact: target/aarch64-apple-ios/release/librustblox_mobile.a
+# artifacts: target/aarch64-apple-ios/release/rustblox-mobile (app exe),
+#            target/aarch64-apple-ios/release/librustblox_mobile.a
 ```

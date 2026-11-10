@@ -1,12 +1,13 @@
-# Mobile builds: experimental Android/iOS artifacts from the `mobile` branch.
+# Mobile builds: Android APK + iOS .ipa from the `mobile` branch.
 #
-# Android: builds librustblox.so (aarch64) with the NDK. Packaging into a
-# runnable APK (GameActivity/Gradle template) is tracked in docs/MOBILE.md.
-# iOS: builds the static library (aarch64-apple-ios) to embed into an Xcode
-# project — no code signing or app bundle here.
+# Android: builds librustblox_mobile.so with the NDK, then assembles a
+# NativeActivity APK (hasCode=false — manifest + .so only) with aapt2 from
+# the official build-tools zip, aligns it and signs it with the committed
+# debug keystore (standard "android" debug credentials — dev builds only).
+# iOS: builds the app executable and wraps it into an unsigned Payload
+# .ipa — re-sign with AltStore/Sideloadly/Xcode to install on a device.
 #
-# Both artifacts are published to the rolling "mobile" pre-release, mirroring
-# how the nightly workflow maintains the "nightly" release on main.
+# All artifacts are published to the rolling "mobile" pre-release.
 #
 # Trigger manually: Actions -> Mobile builds -> Run workflow.
 
@@ -47,7 +48,7 @@ jobs:
         run: cargo install cargo-ndk --locked
       - name: Build Android library (arm64-v8a)
         run: cargo ndk -t arm64-v8a build --release -p rustblox-mobile
-      - name: Package
+      - name: Package shared library
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -55,7 +56,57 @@ jobs:
           cp README.md LICENSE dist/
           cd dist
           zip -q rustblox-mobile-aarch64-linux-android.zip librustblox_mobile.so README.md LICENSE
-      - name: Upload build artifact
+      - name: Install Java (apksigner)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Fetch build-tools and platform (aapt2, android.jar)
+        run: |
+          set -euo pipefail
+          curl -sSfL -o /tmp/bt.zip https://dl.google.com/android/repository/build-tools_r34-linux.zip
+          curl -sSfL -o /tmp/plat.zip https://dl.google.com/android/repository/platform-34-ext7_r03.zip
+          unzip -q /tmp/bt.zip -d /tmp/bt
+          unzip -q /tmp/plat.zip -d /tmp/plat
+          BT=$(find /tmp/bt -maxdepth 1 -type d -name "android-*" | head -1)
+          ANDROID_JAR=$(find /tmp/plat -name android.jar | head -1)
+          test -x "$BT/aapt2" && test -f "$ANDROID_JAR"
+          echo "BT=$BT" >> "$GITHUB_ENV"
+          echo "ANDROID_JAR=$ANDROID_JAR" >> "$GITHUB_ENV"
+      - name: Assemble unsigned APK (manifest + resources + .so)
+        run: |
+          set -euo pipefail
+          cd mobile/android
+          "$BT/aapt2" compile --dir res -o /tmp/res.zip
+          "$BT/aapt2" link -o /tmp/unsigned.apk \
+            -I "$ANDROID_JAR" \
+            --manifest AndroidManifest.xml \
+            -R /tmp/res.zip \
+            --auto-add-overlay
+          mkdir -p /tmp/apkroot/lib/arm64-v8a
+          cp ../../target/aarch64-linux-android/release/librustblox_mobile.so \
+            /tmp/apkroot/lib/arm64-v8a/
+          cd /tmp/apkroot
+          zip -q /tmp/unsigned.apk lib/arm64-v8a/librustblox_mobile.so
+      - name: Align and sign APK (debug keystore)
+        run: |
+          set -euo pipefail
+          "$BT/zipalign" -f 4 /tmp/unsigned.apk /tmp/aligned.apk
+          "$BT/apksigner" sign \
+            --ks mobile/android/debug.keystore \
+            --ks-pass pass:android \
+            --ks-key-alias androiddebugkey \
+            --key-pass pass:android \
+            --out dist/rustblox-android-arm64.apk \
+            /tmp/aligned.apk
+          "$BT/apksigner" verify dist/rustblox-android-arm64.apk
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustblox-android-arm64-apk
+          path: dist/rustblox-android-arm64.apk
+          if-no-files-found: error
+      - name: Upload shared library artifact
         uses: actions/upload-artifact@v4
         with:
           name: rustblox-mobile-aarch64-linux-android
@@ -72,17 +123,34 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: aarch64-apple-ios
-      - name: Build iOS static library (arm64)
+      - name: Build iOS app (arm64)
         run: cargo build --release --target aarch64-apple-ios -p rustblox-mobile
-      - name: Package
+      - name: Assemble unsigned .ipa
         run: |
           set -euo pipefail
+          APP=Payload/RustBlox.app
+          mkdir -p "$APP"
+          cp target/aarch64-apple-ios/release/rustblox-mobile "$APP/RustBlox"
+          cp mobile/ios/Info.plist "$APP/"
+          cp mobile/ios/PkgInfo "$APP/"
+          cp mobile/ios/Assets/*.png "$APP/"
           mkdir -p dist
+          zip -q -r dist/rustblox-ios-arm64.ipa Payload
+          rm -rf Payload
+      - name: Package static library
+        run: |
+          set -euo pipefail
           cp target/aarch64-apple-ios/release/librustblox_mobile.a dist/
           cp README.md LICENSE dist/
           cd dist
           zip -q rustblox-mobile-aarch64-apple-ios.zip librustblox_mobile.a README.md LICENSE
-      - name: Upload build artifact
+      - name: Upload .ipa artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustblox-ios-arm64-ipa
+          path: dist/rustblox-ios-arm64.ipa
+          if-no-files-found: error
+      - name: Upload static library artifact
         uses: actions/upload-artifact@v4
         with:
           name: rustblox-mobile-aarch64-apple-ios
@@ -112,11 +180,15 @@ jobs:
 
           | File | Platform |
           |------|----------|
+          | \`rustblox-android-arm64.apk\` | Android ARM64 (NativeActivity APK, debug-signed) |
+          | \`rustblox-ios-arm64.ipa\` | iOS ARM64 (unsigned .ipa — re-sign via AltStore/Sideloadly) |
           | \`rustblox-mobile-aarch64-linux-android.zip\` | Android ARM64 (librustblox_mobile.so) |
           | \`rustblox-mobile-aarch64-apple-ios.zip\` | iOS ARM64 (static library) |
 
-          These are library artifacts, not installable apps yet — see
-          docs/MOBILE.md for the packaging roadmap.
+          Touch input and the system clipboard work; soft-keyboard text is
+          limited to hardware-style keys until the GameActivity backend lands
+          (see docs/MOBILE.md). The APK is signed with a debug key — reinstall
+          over older builds may require uninstalling first.
           EOF
           )
           if gh release view mobile > /dev/null 2>&1; then
@@ -124,5 +196,5 @@ jobs:
           else
             gh release create mobile --prerelease --title "Mobile build (${DATE})" --notes "$NOTES"
           fi
-          gh release upload mobile artifacts/*.zip --clobber
+          gh release upload mobile artifacts/* --clobber
           echo "Mobile release refreshed for ${DATE}."

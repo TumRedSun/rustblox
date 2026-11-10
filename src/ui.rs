@@ -173,6 +173,18 @@ impl TextField {
         self.scroll = 0.0;
     }
 
+    /// Replaces the whole value (used by the platform IME sync on mobile).
+    pub fn set_text(&mut self, s: &str) {
+        let mut v = s.to_string();
+        while v.len() > self.max_bytes {
+            v.pop();
+        }
+        self.value = v;
+        self.cursor = self.value.len();
+        self.sel = None;
+        self.scroll = 0.0;
+    }
+
     fn clamp_cursor(&mut self) {
         let mut c = self.cursor.min(self.value.len());
         while c > 0 && !self.value.is_char_boundary(c) {

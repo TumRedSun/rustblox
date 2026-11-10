@@ -10,6 +10,7 @@ pub mod login_ui;
 pub mod menu_ui;
 pub mod model;
 pub mod net;
+pub mod platform;
 pub mod roblox;
 pub mod theme;
 pub mod ui;
