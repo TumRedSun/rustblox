@@ -4,15 +4,21 @@
 
 An open-source (**GPL-3.0**) third-party **Roblox client built in Rust**, using the official Roblox web APIs — the same endpoints the official website and official clients talk to. No protocol emulation, no private servers: everything goes to real Roblox infrastructure.
 
-**Milestone 1 scope (this release):**
+**Milestone 2 scope (this release):**
+- **Everything from Milestone 1** (login + friends menu, see below)
+- **Full GPU rewrite — wgpu + winit**: the entire UI (menu, login, HUD) is now rendered by wgpu pipelines (SDF rounded rects, glyph atlas, texture batching) instead of a CPU framebuffer; the 3D scene renderer shares the same device
+- **Joining real places** — the actual Roblox game-join flow: `authentication-ticket/v1` → `gamejoin.roblox.com/v2/join-game` (v1 fallback) → the real game server (ip/port/jobId) → **RakNet** reliable-UDP transport (handshake, reliability, ACK/NACK, split reassembly, connected ping) implemented from the protocol spec
+- **Replication stream parser** (tolerant, version-gated — see the honest status note below) feeding a runtime **DataModel**; the 3D renderer draws the world from it: **PBR-lite shaded parts, directional sun with a 2048px shadow map, hemispheric ambient, fog and a sky shader**, your own character rig from the real avatar appearance data, camera (free-fly, mouse-captured)
 - Sign in to a Roblox account — password + 2-step verification, or a `.ROBLOSECURITY` session cookie
 - Main menu styled after roblox.com home: a **collapsible left sidebar** (the rotated red logo tile doubles as the “R” of the wordmark; profile chip; Home / Add Friends navigation; icon-only mini mode), a **horizontal friends strip** with live statuses — **online / offline / what game they are playing right now** — and left/right scroll arrows (mouse wheel works too)
-- **Places** search by name (`search-api/omni-search`) with a card grid that fills most of the screen — icon, name, creator, like ratio, player count and a green **Join** button (joining itself is a Milestone 2 feature); while the search box is empty a personalized **recommendation feed** is shown (`discovery-api/omni-recommendation`)
+- **Places** search by name (`search-api/omni-search`) with a card grid that fills most of the screen — icon, name, creator, like ratio, player count and a green **Join** button that now starts the live join pipeline; while the search box is empty a personalized **recommendation feed** is shown (`discovery-api/omni-recommendation`)
 - **Add Friends** pane: search users by username (`users.roblox.com/v1/users/search`) and send friend requests in place
 - Automatic presence refresh every **10 seconds** (no manual refresh button)
 - Session persistence
 - Nightly automated builds for Windows / Linux / macOS published to the rolling [nightly release](../../releases/tag/nightly)
 - Nothing more (on purpose — see [Roadmap](#roadmap))
+
+> **Honest status of the live join (read this).** The HTTP join flow (auth ticket, gamejoin, server address), the RakNet transport and the renderer are fully real and tested against live servers (see `cargo run --example join_flow -- <placeId>` with `RUSTBLOX_COOKIE=...`). The layer on top of RakNet — Roblox's binary *replication protocol* — is proprietary and version-gated; its exact byte layout is being reverse-engineered. Until that converges, the connected session reports real diagnostics (ping, packets, decode stats) in the HUD, but the world may render empty. Every unknown packet is hex-logged (`RUSTBLOX_DEBUG=net`) to converge the parser. No fake data is ever rendered.
 
 > **Disclaimer.** This project is not affiliated with, endorsed by, or connected to Roblox Corporation in any way. Roblox's Terms of Use may prohibit third-party clients; using one can put your account at risk. This client was written for educational purposes — use it at your own risk and never share your `.ROBLOSECURITY` token with anyone.
 
@@ -23,12 +29,13 @@ An open-source (**GPL-3.0**) third-party **Roblox client built in Rust**, using 
 | Layer     | Choice                                   | Why |
 |-----------|------------------------------------------|-----|
 | Windowing | [`winit 0.30`](https://crates.io/crates/winit) | The standard, tiny event loop |
-| Rendering | [`pixels 0.17`](https://crates.io/crates/pixels) (wgpu) | A raw GPU-backed pixel framebuffer — minimal overhead now, and a clean path to full 3D place rendering on the same wgpu device later |
-| Text      | [`ab_glyph`](https://crates.io/crates/ab_glyph) | Fast on-the-fly glyph rasterization, embedded DejaVu Sans (Latin + Cyrillic) |
+| Rendering | [`wgpu 29`](https://crates.io/crates/wgpu) | The entire client is GPU-rendered: instanced SDF UI (rounded rects, rings, borders), a glyph-atlas text pass, image batching, plus the 3D scene pipeline (PBR-lite lighting, shadow map, sky, fog) |
+| Text      | [`ab_glyph`](https://crates.io/crates/ab_glyph) | Glyphs are rasterized once into a shared GPU atlas and drawn as instanced quads; embedded DejaVu Sans (Latin + Cyrillic) |
+| Game transport | own **RakNet** client over UDP | The reliable-UDP protocol Roblox game servers speak: offline handshake, reliability layer, fragmentation, ACKs, connected ping |
 | HTTP      | [`ureq 2`](https://crates.io/crates/ureq) + rustls | No async runtime, no OpenSSL; pooled keep-alive connections, gzip |
 | JSON      | `serde` / `serde_json`                   | — |
 
-The UI is drawn software-side into an RGBA8 buffer (rects, glyphs, avatars) and blitted by wgpu — a deliberate "own the pixels" design that keeps the binary small and the frame budget predictable, and later allows the Roblox place renderer to share the same wgpu surface.
+Every UI primitive records into a GPU command list (`draw.rs` keeps the exact same API as the old software rasterizer — a headless soft-renderer path is still used for the PNG previews and tests), then one instanced draw call per batch renders it. The place renderer (`gfx/scene.wgsl`) draws instanced boxes with sun shadows and a procedural sky from the same frame uniform buffer.
 
 ## Building
 
@@ -82,21 +89,43 @@ src/
 ├── login_ui.rs        # login screen (password / cookie tabs, 2FA dialog)
 ├── menu_ui.rs         # main menu: collapsible sidebar, horizontal friends strip, places search + card grid, add-friends pane
 ├── ui.rs              # widgets: text fields (IME!), buttons, hit-testing
-├── draw.rs            # software rasterizer over the pixels framebuffer
-├── font.rs            # ab_glyph text rendering
+├── draw.rs            # dual-mode primitives: GPU command recorder + headless soft rasterizer
+├── font.rs            # ab_glyph → shared glyph atlas (GPU quads) / direct raster (soft path)
 ├── theme.rs           # colors / metrics
 ├── model.rs           # domain models, sorting, humanized "last online"
 ├── config.rs          # session persistence (0600)
 ├── avatar_cache.rs    # disk cache for avatar bitmaps
 ├── net.rs             # background worker thread + avatar pool → EventLoopProxy
+├── raknet.rs          # RakNet client: handshake, reliability, ACKs, splits, ping
+├── gfx/               # the wgpu renderer
+│   ├── mod.rs         # device/surface/pipelines, font atlas, image cache, frame loop
+│   ├── ui.wgsl        # instanced SDF UI shader (rects, rounded rects, rings, glyphs, images)
+│   ├── scene.wgsl     # 3D: instanced parts, sun shadow map, fog; sky gradient shader
+│   ├── scene.rs       # SceneView/Camera/Environment data model
+│   └── math.rs        # dependency-free column-major mat4/vec3
+├── world/             # runtime DataModel (instance tree + properties) → SceneView builder
+├── game/              # live session: join state machine, replication thread, camera controller
 └── roblox/
     ├── client.rs      # ureq agent, cookie jar, CSRF rotation
     ├── auth.rs        # login / 2FA verify / resend / logout
     ├── social.rs      # friends, presence, games, thumbnails (batched)
+    ├── join.rs        # LIVE JOIN: authentication-ticket → gamejoin v2/v1 → server addr + avatar
+    ├── replication.rs # tolerant replication stream parser → DataModel events
     ├── types.rs       # serde models of the API
     ├── dns.rs         # pinned Roblox/CDN IPs (DNS-blocking-proof resolution)
     └── errors.rs      # typed errors with readable messages
 ```
+
+### Joining a place (how it works)
+
+1. Click **Join** on a place card (or `cargo run --example join_flow -- <placeId>` headlessly).
+2. `POST apis.roblox.com/authentication-ticket/v1` exchanges your session for a one-time ticket.
+3. `POST gamejoin.roblox.com/v2/join-game` (v1 fallback) returns the real **ip:port** of a live game server + `jobId`.
+4. A full **RakNet handshake** connects the UDP socket to that server (open-connection 1/2, connection request/accepted, NEW_INCOMING_CONNECTION, connected pings).
+5. Every replication payload is parsed into the DataModel; the renderer rebuilds the scene from it a few times a second. The HUD shows real connection diagnostics.
+6. `Esc` leaves the session (disconnection notification sent).
+
+Debug logging: `RUSTBLOX_DEBUG=net game gfx cargo run`.
 
 The UI thread never blocks: all network work runs on a worker thread (plus a 4-thread avatar pool) that talks back through `winit`'s `EventLoopProxy`, waking the event loop only when data arrives.
 
@@ -111,10 +140,10 @@ The UI thread never blocks: all network work runs on a worker thread (plus a 4-t
 
 ## Roadmap
 
-- **M1 — this release:** login + Roblox-style friends menu (sidebar, add-friends search) with presence ✔
-- **M2:** joining real game servers (the official RakNet-based UDP transport, `gameId` is already captured by the presence API) and rendering places with wgpu on the same window/surface stack — the reserved *Places* strip will host the place cards
-- **M3:** chat, notifications, Charts / Avatar pages (the disabled sidebar entries)
-- **M4:** full place rendering pipeline (instances, replication, input)
+- **M1:** login + Roblox-style friends menu (sidebar, add-friends search) with presence ✔
+- **M2 — this release:** full wgpu rewrite + real join flow (auth ticket → gamejoin → RakNet UDP) + replication parser (reverse-engineering stage) + 3D renderer (PBR-lite, shadows, sky) + character rig from avatar data ✔
+- **M3:** converge the replication protocol on live captures (full world streaming, other players, physics), chat, notifications, Charts / Avatar pages
+- **M4:** full place rendering parity (meshes/decals/terrain streaming, scripts-lite)
 
 ## License
 
@@ -128,15 +157,21 @@ Embedded fonts: DejaVu Sans (free license, see `assets/fonts/LICENSE-DejaVu.txt`
 
 Open-source (**GPL-3.0**) сторонний **клиент Roblox на Rust**, работающий с официальными веб-API Roblox — теми же эндпоинтами, что используют официальный сайт и официальные клиенты. Никакой «своей реализации» серверов: всё ходит в реальную инфраструктуру Roblox.
 
-**Задание №1 (эта версия):**
+**Задание №2 (эта версия):**
+- **Всё из Milestone 1** (вход + меню друзей, см. ниже)
+- **Полный переход на GPU — wgpu + winit**: весь интерфейс (меню, логин, HUD) рисуется wgpu-пайплайнами (SDF-скругления, атлас глифов, батчинг текстур) вместо CPU-фреймбуфера; 3D-рендер мира работает на том же устройстве
+- **Подключение к реальным плейсам** — настоящий игровой join-flow Roblox: `authentication-ticket/v1` → `gamejoin.roblox.com/v2/join-game` (фолбэк v1) → реальный игровой сервер (ip/port/jobId) → транспорт **RakNet** (надёжный UDP: хэндшейк, reliability, ACK/NACK, сборка фрагментов, ping) по спецификации протокола
+- **Парсер потока репликации** (толерантный, версия-зависимый — см. честное примечание ниже), наполняющий рантайм-**DataModel**; 3D-рендер рисует мир из неё: **парты с PBR-упрощённым освещением, направленное солнце с теневой картой 2048px, полусферический ambient, туман и шейдер неба**, ваш персонаж из реальных данных аватара, свободная камера с захватом мыши
 - Вход в аккаунт Roblox — пароль + двухэтапная верификация либо cookie-сессия `.ROBLOSECURITY`
 - Главное меню в стиле домашней страницы roblox.com: **складной левый сайдбар** (повёрнутая красная плитка-логотип служит буквой «R» в названии; чип профиля; навигация Home / Add Friends; мини-режим только с иконками), **горизонтальная полоса друзей** со статусами — **в сети / не в сети / во что сейчас играет** — и стрелками прокрутки влево/вправо (колесо мыши тоже работает)
-- **Поиск Places** по названию (`search-api/omni-search`) с сеткой карточек на большую часть экрана — иконка, название, автор, рейтинг (лайки), число игроков и зелёная кнопка **Join** (само подключение — в Milestone 2); при пустом поиске показывается персональная лента рекомендаций (`discovery-api/omni-recommendation`)
+- **Поиск Places** по названию (`search-api/omni-search`) с сеткой карточек — иконка, название, автор, рейтинг, игроки и зелёная кнопка **Join**, запускающая реальный join-пайплайн; при пустом поиске — персональная лента рекомендаций (`discovery-api/omni-recommendation`)
 - Панель **«Добавить друзей»**: поиск пользователей по нику (`users.roblox.com/v1/users/search`) и отправка заявок в друзья прямо из приложения
 - Автообновление статусов каждые **10 секунд** (без ручной кнопки обновления)
 - Сохранение сессии
 - Ночные автоматические сборки для Windows / Linux / macOS публикуются в скользящем [nightly-релизе](../../releases/tag/nightly)
 - И ничего больше (осознанно — см. [Roadmap](#roadmap))
+
+> **Честный статус live-входа (прочитайте).** HTTP-цепочка входа (auth ticket, gamejoin, адрес сервера), транспорт RakNet и рендерер — полностью реальные и протестированы против живых серверов (см. `cargo run --example join_flow -- <placeId>` с `RUSTBLOX_COOKIE=...`). Слой поверх RakNet — бинарный *протокол репликации* Roblox — проприетарный и зависящий от версии клиента; его точная байтовая раскладка в процессе реверс-инжиниринга. Пока он не сойдётся, подключённая сессия показывает реальные диагностические данные (ping, пакеты, статистика декодирования) в HUD, но мир может отрисоваться пустым. Каждый неизвестный пакет дампится в hex (`RUSTBLOX_DEBUG=net`) для дожима парсера. Фейковые данные не рисуются никогда.
 
 > **Важно.** Проект не связан с Roblox Corporation. Условия использования Roblox могут запрещать сторонние клиенты — используйте на свой риск. Никогда не передавайте свой `.ROBLOSECURITY` никому (включая этот клиент — он хранит токен только локально).
 
@@ -163,17 +198,18 @@ cargo build --release
 
 ## Что внутри (кратко)
 
-- **Стек:** `winit` (окно) + `pixels`/wgpu (пиксельный фреймбуфер — с прицелом на будущий 3D-рендер плейсов на том же wgpu) + `ab_glyph` (текст) + `ureq`/rustls (сеть, без tokio и OpenSSL).
+- **Стек:** `winit` (окно) + **`wgpu` 29** (весь UI — инстансные SDF-примитивы + атлас глифов; 3D-мир — PBR-упрощённое освещение, теневая карта, небо, туман) + `ab_glyph` (атлас текста) + `ureq`/rustls (HTTP) + собственный **RakNet**-клиент (UDP-транспорт игровых серверов).
 - **Как у официального клиента:** ротация `X-CSRF-Token` (403 → свежий токен из ответа + куки → повтор), cookie-jar, батчинг (presence ≤100 id за запрос, игры/аватарки/иконки плейсов пачками), статусы 0/1/2/3/4, `gameId` сервера уже сохраняется для будущего входа в игру.
 - **Поиск плейсов:** `GET apis.roblox.com/search-api/omni-search` по ключевому слову, дефолтная лента — `POST apis.roblox.com/discovery-api/omni-recommendation` (с авторизацией, как на сайте); иконки карточек — `GET /v1/places/gameicons` пачками.
-- **Оптимизации:** LTO fat + codegen-units=1, отрисовка по требованию (без постоянного цикла), растеризация только видимых строк, дисковый кэш аватарок, ~5 HTTP-запросов на полный рефреш 200 друзей.
+- **Как работает вход в плейс:** карточка **Join** → `authentication-ticket/v1` → `gamejoin/v2` (ip:port + jobId) → полный RakNet-хэндшейк → парсинг репликации в DataModel → сцена перерисовывается из мира несколько раз в секунду; HUD показывает живые диагностики. `Esc` — выход (disconnection notification). Дебаг-логи: `RUSTBLOX_DEBUG=net game gfx cargo run`.
+- **Оптимизации:** LTO fat + codegen-units=1, инстансная отрисовка (один draw call на батч UI и на весь мир), атлас глифов и кэш текстур аватарок, дисковый кэш аватарок, ~5 HTTP-запросов на полный рефреш 200 друзей.
 
 ## Дорожная карта
 
-1. **M1 (текущая):** вход + меню в стиле Roblox (складной сайдбар, полоса друзей, поиск и карточки плейсов, заявки в друзья) со статусами ✔
-2. **M2:** подключение к реальным игровым серверам (официальный UDP-транспорт на базе RakNet) и рендеринг плейсов на wgpu — кнопка **Join** на карточках уже на месте
-3. **M3:** чат, уведомления, страницы Charts / Avatar (неактивные пункты сайдбара)
-4. **M4:** полный пайплайн рендеринга плейса
+1. **M1:** вход + меню в стиле Roblox (складной сайдбар, полоса друзей, поиск и карточки плейсов, заявки в друзья) со статусами ✔
+2. **M2 (текущая):** полный переход на wgpu + реальный join-flow (auth ticket → gamejoin → RakNet UDP) + парсер репликации (стадия реверс-инжиниринга) + 3D-рендер (PBR-lite, тени, небо) + риг персонажа из данных аватара ✔
+3. **M3:** дожим протокола репликации на живых дамках (полный стриминг мира, другие игроки, физика), чат, уведомления, страницы Charts / Avatar
+4. **M4:** полный паритет рендеринга плейса (меши/декали/стриминг терраина)
 
 ## Лицензия
 

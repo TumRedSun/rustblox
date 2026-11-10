@@ -4,6 +4,7 @@
 use crate::config::{self, Session};
 use crate::draw::FB;
 use crate::font::Fonts;
+use crate::game::{GameController, GameEvent, GamePhase, GameSession};
 use crate::login_ui::LoginView;
 use crate::menu_ui::{FriendPane, MenuTab, MenuView, SettingsTab};
 use crate::model::{build_rows, UserProfile};
@@ -35,6 +36,19 @@ pub const ARROW_REPEAT_MS: u64 = 110;
 pub enum Screen {
     Login(LoginView),
     Menu(MenuView),
+    Game(GameView),
+}
+
+/// The live game screen: joining (HTTP pipeline) or connected (UDP session).
+pub enum GameView {
+    Joining { place_id: u64, user_id: u64, status: String },
+    Active {
+        session: GameSession,
+        ctrl: GameController,
+        place_name: String,
+        last_frame: Instant,
+        fps: f32,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -59,7 +73,7 @@ pub struct UiCtx<'a> {
 
 pub struct App {
     pub window: Option<Arc<Window>>,
-    pub pixels: Option<pixels::Pixels<'static>>,
+    pub gfx: Option<crate::gfx::Gfx>,
     pub fonts: Fonts,
     pub hits: HitMap,
     pub cursor: (f32, f32),
@@ -95,7 +109,7 @@ impl App {
         theme::apply(theme::by_id(&settings.theme, settings.custom));
         App {
             window: None,
-            pixels: None,
+            gfx: None,
             fonts: Fonts::load(),
             hits: HitMap::default(),
             cursor: (-1.0, -1.0),
@@ -134,10 +148,9 @@ impl App {
     // -----------------------------------------------------------------
 
     fn draw_frame(&mut self) {
-        let Some(mut px) = self.pixels.take() else { return };
+        let Some(gfx) = self.gfx.as_mut() else { return };
         {
-            let frame = px.frame_mut();
-            let mut fb = FB::new(frame, self.fbw, self.fbh);
+            let mut fb = FB::gpu(self.fbw, self.fbh);
             // Immediate-mode hit testing: the map holds ONLY what the current
             // frame drew. Without this clear, hits from previously visited
             // screens/menus stay clickable at their old coordinates (e.g.
@@ -173,10 +186,84 @@ impl App {
                     };
                     crate::menu_ui::draw(view, &mut ctx, &mut fb);
                 }
+                Screen::Game(gv) => {
+                    Self::draw_game_hud(&self.fonts, self.scale, fb.w, fb.h, gv, &mut fb, now_ms);
+                }
+            }
+            let prims = fb.take_prims();
+            let atlas = self.fonts.atlas.lock().unwrap();
+            // The 3D scene comes from the live session (if connected).
+            let scene = match &self.screen {
+                Screen::Game(GameView::Active { session, .. }) => {
+                    let st = session.state.lock().unwrap();
+                    Some(st.scene.clone())
+                }
+                _ => None,
+            };
+            let _ = gfx.render(&prims, &atlas, scene.as_ref());
+        }
+    }
+
+    /// HUD overlay for the game screen (joining spinner / live diagnostics).
+    /// Explicit field args (not &self) so it can run inside the
+    /// `&mut self.screen` match without aliasing.
+    fn draw_game_hud(
+        fonts: &Fonts,
+        scale: f32,
+        screen_w: i32,
+        screen_h: i32,
+        gv: &GameView,
+        fb: &mut FB,
+        now_ms: u64,
+    ) {
+        let t = theme::cur();
+        let s = scale;
+        let w = screen_w;
+        let h = screen_h;
+        match gv {
+            GameView::Joining { place_id, status, .. } => {
+                let box_w = 460.0 * s;
+                let box_h = 150.0 * s;
+                let (bx, by) = ((w as f32 - box_w) / 2.0, (h as f32 - box_h) / 2.0);
+                fb.rect_rounded(bx as i32, by as i32, box_w as i32, box_h as i32, 14, t.surface);
+                crate::font::draw(fonts, fb, bx + 24.0 * s, by + 44.0 * s,
+                    &format!("Joining place {}", place_id), 20.0 * s, t.text, true, 0.0);
+                crate::font::draw(fonts, fb, bx + 24.0 * s, by + 76.0 * s,
+                    status, 14.0 * s, t.text_dim, false, 0.0);
+                // Spinner.
+                let ang = (now_ms % 900) as f32 / 900.0 * std::f32::consts::TAU;
+                let cx = (bx + box_w - 40.0 * s) as i32;
+                let cy = (by + 44.0 * s) as i32;
+                fb.ring(cx, cy, (7.0 * s) as i32, (5.0 * s) as i32, t.text_faint);
+                fb.circle(cx + (ang.cos() * 6.0 * s) as i32, cy + (ang.sin() * 6.0 * s) as i32, (3.0 * s) as i32, t.accent);
+                crate::font::draw(fonts, fb, bx + 24.0 * s, by + box_h - 20.0 * s,
+                    "Esc — cancel", 12.0 * s, t.text_dim, false, 0.0);
+            }
+            GameView::Active { session, place_name, fps, .. } => {
+                let st = session.state.lock().unwrap();
+                let pad = 14.0 * s;
+                let lines: Vec<(String, f32)> = vec![
+                    (place_name.clone(), 17.0 * s),
+                    (format!("state: {:?}", st.phase), 13.0 * s),
+                    (format!("server: {}  job: {}…", st.server, st.job_id.chars().take(8).collect::<String>()), 13.0 * s),
+                    (format!("ping: {}   fps: {:.0}   inst: {}   pkts: {} (ok {} / skip {})",
+                        st.ping_ms.map(|p| format!("{:.0} ms", p)).unwrap_or("-".into()),
+                        fps, st.instances, st.packets, st.decoded, st.skipped), 13.0 * s),
+                ];
+                let box_w = 430.0 * s;
+                let box_h = 20.0 * s + lines.iter().map(|l| l.1 + 8.0 * s).sum::<f32>();
+                fb.rect_rounded(pad as i32, pad as i32, box_w as i32, box_h as i32, 12, t.surface);
+                let mut y = pad + 26.0 * s;
+                for (i, (line, size)) in lines.iter().enumerate() {
+                    let color = if i == 0 { t.text } else { t.text_dim };
+                    crate::font::draw(fonts, fb, pad + 12.0 * s, y, line, *size, color, i == 0, 0.0);
+                    y += size + 8.0 * s;
+                }
+                crate::font::draw(fonts, fb, pad + 12.0 * s, h as f32 - pad - 8.0 * s,
+                    "Esc — leave   LMB — capture mouse   WASD — fly   Space/Shift — up/down",
+                    12.0 * s, t.text_dim, false, 0.0);
             }
         }
-        let _ = px.render();
-        self.pixels = Some(px);
     }
 
     /// Earliest future redraw needed for animations (spinner, countdown).
@@ -189,6 +276,8 @@ impl App {
             Screen::Menu(v) => {
                 v.refreshing || v.add.searching || v.places_searching || v.requests.loading
             }
+            Screen::Game(GameView::Joining { .. }) => true,
+            Screen::Game(GameView::Active { .. }) => false,
         };
         if spinner {
             wakes.push(now + Duration::from_millis(90));
@@ -220,6 +309,7 @@ impl App {
                 (MenuTab::Friends, FriendPane::Search) => &[FieldId::AddSearch],
                 _ => &[],
             },
+            Screen::Game(_) => &[],
         };
         match self.focus {
             None => self.focus = order.first().copied(),
@@ -246,6 +336,7 @@ impl App {
                 (FieldId::AddSearch, MenuTab::Friends, FriendPane::Search) => Some(&mut v.add.query),
                 _ => None,
             },
+            Screen::Game(_) => None,
         }
     }
 
@@ -313,6 +404,7 @@ impl App {
                 (MenuTab::Friends, FriendPane::Search) => self.run_user_search(),
                 _ => {}
             },
+            Screen::Game(_) => {}
         }
     }
 
@@ -375,6 +467,80 @@ impl App {
         self.focus = None;
         self.restoring = false;
         self.request_redraw();
+    }
+
+    /// Start joining a place (click on a place card). The running menu is
+    /// parked so Esc/leave restores it.
+    fn enter_game_joining(&mut self, place_id: u64, user_id: u64) {
+        let prev = std::mem::replace(
+            &mut self.screen,
+            Screen::Game(GameView::Joining {
+                place_id,
+                user_id,
+                status: "Requesting a server…".into(),
+            }),
+        );
+        if let Screen::Menu(m) = prev {
+            self.suspended_menu = Some(m);
+        }
+        self.focus = None;
+        self.send_command(Command::JoinPlace { place_id });
+        self.request_redraw();
+    }
+
+    /// Attach a successfully joined session (from GameEvent::Joined).
+    fn attach_session(&mut self, resp: crate::roblox::join::JoinResponse, place_name: String, user_id: u64) {
+        let session = GameSession::start(resp, place_name.clone(), user_id);
+        self.screen = Screen::Game(GameView::Active {
+            session,
+            ctrl: GameController::default(),
+            place_name,
+            last_frame: Instant::now(),
+            fps: 60.0,
+        });
+        self.focus = None;
+        self.request_redraw();
+    }
+
+    /// Leave the game and restore the parked menu (Esc / connection lost).
+    fn leave_game(&mut self, notice: Option<String>) {
+        if let Screen::Game(GameView::Active { session, .. }) = &self.screen {
+            session.stop();
+        }
+        self.release_pointer();
+        self.screen = match self.suspended_menu.take() {
+            Some(m) => Screen::Menu(m),
+            None => {
+                self.enter_login(None);
+                return;
+            }
+        };
+        if let Some(n) = notice {
+            if let Screen::Menu(v) = &mut self.screen {
+                v.notice = Some((n, Instant::now() + Duration::from_secs(5)));
+            }
+        }
+        self.request_redraw();
+    }
+
+    fn release_pointer(&self) {
+        if let Some(w) = self.window.as_ref() {
+            let _ = w.set_cursor_grab(winit::window::CursorGrabMode::None);
+            w.set_cursor_visible(true);
+        }
+    }
+
+    fn capture_pointer(&mut self) {
+        let Some(w) = self.window.as_ref() else { return };
+        let grabbed = w
+            .set_cursor_grab(winit::window::CursorGrabMode::Locked)
+            .or_else(|_| w.set_cursor_grab(winit::window::CursorGrabMode::Confined));
+        if grabbed.is_ok() {
+            w.set_cursor_visible(false);
+            if let Screen::Game(GameView::Active { ctrl, .. }) = &mut self.screen {
+                ctrl.pointer_locked = true;
+            }
+        }
     }
 
     // -----------------------------------------------------------------
@@ -570,6 +736,9 @@ impl App {
                     }
                 }
             }
+            WorkerEvent::Game(_) => {
+                // Handled by on_game_event in the user_event dispatcher.
+            }
             WorkerEvent::LoggedOut => {
                 // Remove the signed-out account from the switcher.
                 if let Screen::Menu(v) = &self.screen {
@@ -581,6 +750,30 @@ impl App {
                 self.adding_account = false;
                 self.suspended_menu = None;
                 self.enter_login(None);
+            }
+        }
+    }
+}
+
+impl App {
+    /// Join pipeline events from the worker thread.
+    fn on_game_event(&mut self, ev: GameEvent) {
+        match ev {
+            GameEvent::Progress(msg) => {
+                if let Screen::Game(GameView::Joining { status, .. }) = &mut self.screen {
+                    *status = msg;
+                    self.request_redraw();
+                }
+            }
+            GameEvent::Joined { resp, place_name } => {
+                let user_id = match &self.screen {
+                    Screen::Game(GameView::Joining { user_id, .. }) => *user_id,
+                    _ => return, // join was cancelled from the UI
+                };
+                self.attach_session(resp, place_name, user_id);
+            }
+            GameEvent::JoinFailed(msg) => {
+                self.leave_game(Some(format!("Could not join: {}", msg)));
             }
         }
     }
@@ -600,9 +793,7 @@ impl ApplicationHandler<UserEvent> for App {
         self.scale = window.scale_factor() as f32;
         self.fbw = size.width.max(1) as i32;
         self.fbh = size.height.max(1) as i32;
-        let surface = pixels::SurfaceTexture::new(size.width.max(1), size.height.max(1), window.clone());
-        self.pixels = Some(pixels::Pixels::new(self.fbw as u32, self.fbh as u32, surface)
-            .expect("create pixel surface"));
+        self.gfx = Some(crate::gfx::Gfx::new(&window));
         self.window = Some(window);
         self.request_redraw();
     }
@@ -616,9 +807,8 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Resized(size) => {
                 self.fbw = size.width.max(1) as i32;
                 self.fbh = size.height.max(1) as i32;
-                if let (Some(px), Some(w)) = (self.pixels.as_mut(), self.window.as_ref()) {
-                    let _ = px.resize_buffer(size.width.max(1), size.height.max(1));
-                    let _ = px.resize_surface(size.width.max(1), size.height.max(1));
+                if let (Some(gfx), Some(w)) = (self.gfx.as_mut(), self.window.as_ref()) {
+                    gfx.resize(size.width.max(1), size.height.max(1));
                     self.scale = w.scale_factor() as f32;
                 }
                 self.request_redraw();
@@ -627,7 +817,13 @@ impl ApplicationHandler<UserEvent> for App {
                 self.mods = m.state();
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.cursor = (position.x as f32, position.y as f32);
+                let new_pos = (position.x as f32, position.y as f32);
+                if let Screen::Game(GameView::Active { ctrl, .. }) = &mut self.screen {
+                    ctrl.mouse_delta(new_pos.0, new_pos.1);
+                    self.request_redraw();
+                    return;
+                }
+                self.cursor = new_pos;
                 // Scrollbar drag (whichever list is active).
                 if let (Some((start_y, start_scroll)), true) = (
                     self.drag_scroll,
@@ -663,6 +859,16 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => match state {
                 ElementState::Pressed => {
+                    if let Screen::Game(GameView::Active { ctrl, .. }) = &mut self.screen {
+                        if !ctrl.pointer_locked {
+                            self.capture_pointer();
+                        }
+                        self.needs_redraw = true;
+                        return;
+                    }
+                    if let Screen::Game(_) = &self.screen {
+                        return;
+                    }
                     let hit = self.hits.at(self.cursor.0, self.cursor.1);
                     if let Hit::Field(id) = hit {
                         self.focus = Some(id);
@@ -740,6 +946,26 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                // Game screen consumes keys first (movement + Esc).
+                if let Screen::Game(GameView::Active { ctrl, .. }) = &mut self.screen {
+                    if event.state == ElementState::Pressed {
+                        ctrl.keys.insert(event.physical_key);
+                        if matches!(event.logical_key, Key::Named(NamedKey::Escape)) {
+                            self.leave_game(None);
+                        }
+                    } else {
+                        ctrl.keys.remove(&event.physical_key);
+                    }
+                    return;
+                }
+                if let Screen::Game(GameView::Joining { .. }) = &self.screen {
+                    if event.state == ElementState::Pressed
+                        && matches!(event.logical_key, Key::Named(NamedKey::Escape))
+                    {
+                        self.leave_game(None);
+                    }
+                    return;
+                }
                 if event.state == ElementState::Pressed {
                     self.on_key(event);
                 }
@@ -760,7 +986,10 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, _elwt: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::Worker(ev) => self.on_worker_event(ev),
+            UserEvent::Worker(ev) => match ev {
+                WorkerEvent::Game(ge) => self.on_game_event(ge),
+                other => self.on_worker_event(other),
+            },
             UserEvent::ImageReady { kind, rgba } => {
                 match kind {
                     ImageKind::User(id) => {
@@ -777,6 +1006,27 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn about_to_wait(&mut self, elwt: &ActiveEventLoop) {
         let now = Instant::now();
+
+        // Game screen: advance the camera, watch the session health and
+        // redraw every frame.
+        if let Screen::Game(GameView::Active { session, ctrl, last_frame, fps, .. }) = &mut self.screen {
+            let dt = last_frame.elapsed().as_secs_f32().min(0.1);
+            *last_frame = now;
+            *fps = *fps * 0.9 + (1.0 / dt.max(1.0 / 240.0)) * 0.1;
+            ctrl.step(dt);
+            let st = session.state.lock().unwrap();
+            let phase = st.phase.clone();
+            drop(st);
+            if matches!(phase, GamePhase::Failed(_) | GamePhase::Left) {
+                let msg = match phase {
+                    GamePhase::Failed(m) => Some(m),
+                    _ => None,
+                };
+                self.leave_game(msg);
+            } else {
+                self.needs_redraw = true;
+            }
+        }
 
         // Auto refresh timer.
         if let Screen::Menu(v) = &mut self.screen {
@@ -1114,14 +1364,11 @@ impl App {
                 self.scroll_step(&hit);
             }
             Hit::JoinPlace(place_id) => {
-                let _ = place_id; // joining a server is not implemented yet
-                if let Screen::Menu(v) = &mut self.screen {
-                    v.notice = Some((
-                        "Joining places is not implemented yet \u{2014} coming soon".into(),
-                        Instant::now() + Duration::from_secs(4),
-                    ));
-                }
-                self.needs_redraw = true;
+                let user_id = match &self.screen {
+                    Screen::Menu(v) => v.profile.id,
+                    _ => 0,
+                };
+                self.enter_game_joining(place_id, user_id);
             }
             Hit::AddUser(user_id) => {
                 if let Screen::Menu(v) = &mut self.screen {
@@ -1204,6 +1451,9 @@ impl App {
                         } else {
                             self.focus = None;
                         }
+                    }
+                    Screen::Game(_) => {
+                        self.leave_game(None);
                     }
                 }
                 self.request_redraw();

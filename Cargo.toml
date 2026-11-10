@@ -1,16 +1,18 @@
 [package]
 name = "rustblox"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 license = "GPL-3.0-only"
-description = "Open-source Roblox client built in Rust. Milestone 1: account login and friends menu with live presence."
+description = "Open-source Roblox client built in Rust. wgpu-accelerated UI + 3D place renderer with live server join."
 repository = "https://github.com/TumRedSun/rustblox"
 keywords = ["roblox", "client", "rust", "gpl"]
 categories = ["games", "network-programming"]
 
 [dependencies]
 winit = "0.30.13"
-pixels = "0.17"
+wgpu = "29.0.4"
+bytemuck = { version = "1.18", features = ["derive"] }
+pollster = "0.4"
 ab_glyph = "0.2.32"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -18,6 +20,7 @@ ureq = { version = "2.10", default-features = false, features = ["tls", "gzip"] 
 image = { version = "0.25", default-features = false, features = ["png"] }
 dirs = "5.0"
 arboard = "3.7"
+flate2 = "1"
 
 [profile.release]
 opt-level = 3
