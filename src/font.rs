@@ -210,14 +210,17 @@ fn rasterize(font: &FontArc, px: f32, ch: char) -> Option<GlyphMask> {
     let glyph = id.with_scale(scale);
     let outlined = font.outline_glyph(glyph)?;
     let bounds = outlined.px_bounds();
-    let (bx, by) = (bounds.min.x as i32, bounds.min.y as i32);
     let w = bounds.width().ceil().max(1.0) as u16;
     let h = bounds.height().ceil().max(1.0) as u16;
     let mut data = vec![0u8; w as usize * h as usize];
+    // ab_glyph's OutlinedGlyph::draw yields (u32, u32) coordinates that are
+    // ALREADY relative to the outline bounds origin (0..w, 0..h) — they are
+    // NOT pen-relative, so bounds.min must NOT be subtracted here (doing so
+    // pushes every row out of the mask and renders empty glyphs).
     outlined.draw(|gx, gy, alpha| {
-        let (ix, iy) = (gx as i32 - bx, gy as i32 - by);
-        if ix >= 0 && iy >= 0 && (ix as u16) < w && (iy as u16) < h {
-            let idx = iy as usize * w as usize + ix as usize;
+        let (ix, iy) = (gx as usize, gy as usize);
+        if ix < w as usize && iy < h as usize {
+            let idx = iy * w as usize + ix;
             data[idx] = (alpha * 255.0).round().min(255.0) as u8;
         }
     });
