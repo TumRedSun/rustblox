@@ -70,6 +70,7 @@ The token is stored locally in your user config directory (`%APPDATA%/rustblox/s
 - **Place discovery** — keyword search via `GET apis.roblox.com/search-api/omni-search`, default feed via `POST apis.roblox.com/discovery-api/omni-recommendation`; card icons via `GET /v1/places/gameicons` (batched).
 - **Presence types** — `0` Offline, `1` Online (website), `2` InGame (with `universeId` → game title lookup, `gameId` = server job id, kept for the future "join game" milestone), `3` Studio, `4` Invisible.
 - **Avatars** — decoded PNGs are cached on disk (keyed by thumbnail URL) and kept in GPU-uploadable RGBA8 form in memory; unchanged thumbnails are never re-downloaded.
+- **Pinned DNS** — every API host (`auth/users/friends/presence/thumbnails/games/apis.roblox.com`) and the `tr/t0–t7.rbxcdn.com` thumbnail CDN resolve to hand-pinned IPs (`src/roblox/dns.rs`), verified by a full TLS + SNI handshake. API hosts never touch the system resolver at all, so DNS blocking/poisoning (e.g. RKN) cannot take the client down; the real hostname still goes into SNI and the `Host` header, so certificate validation and vhost routing are unaffected.
 - **Session validation** — `GET /v1/users/authenticated`; a dead session drops you back to the login screen automatically.
 
 ## Architecture
@@ -93,6 +94,7 @@ src/
     ├── auth.rs        # login / 2FA verify / resend / logout
     ├── social.rs      # friends, presence, games, thumbnails (batched)
     ├── types.rs       # serde models of the API
+    ├── dns.rs         # pinned Roblox/CDN IPs (DNS-blocking-proof resolution)
     └── errors.rs      # typed errors with readable messages
 ```
 

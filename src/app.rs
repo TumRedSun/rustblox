@@ -140,6 +140,12 @@ impl App {
         {
             let frame = px.frame_mut();
             let mut fb = FB::new(frame, self.fbw, self.fbh);
+            // Immediate-mode hit testing: the map holds ONLY what the current
+            // frame drew. Without this clear, hits from previously visited
+            // screens/menus stay clickable at their old coordinates (e.g.
+            // theme presets firing from the Home tab, or sidebar items
+            // reacting while the sidebar is collapsed).
+            self.hits.clear();
             fb.fill(theme::cur().bg);
             let now_ms = self.start_instant.elapsed().as_millis() as u64;
             match &mut self.screen {

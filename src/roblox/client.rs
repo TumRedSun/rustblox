@@ -7,6 +7,7 @@
 //!  * the authenticated session is the `.ROBLOSECURITY` cookie sent as
 //!    `Cookie: .ROBLOSECURITY=<token>` on every request.
 
+use crate::roblox::dns::PinnedResolver;
 use crate::roblox::errors::ApiError;
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -71,6 +72,9 @@ fn build_agent() -> ureq::Agent {
         .timeout(Duration::from_secs(30))
         .redirects(0)
         .user_agent(UA)
+        // Pinned Roblox IPs (see dns): DNS is bypassed entirely for the API
+        // hosts so resolver blocking/poisoning cannot take the client down.
+        .resolver(PinnedResolver)
         .build()
 }
 

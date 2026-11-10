@@ -9,6 +9,9 @@ pub fn cdn_agent() -> Agent {
         .timeout_connect(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))
         .user_agent(crate::roblox::client::UA)
+        // Pinned CDN IPs first (see roblox::dns) with system DNS as fallback:
+        // thumbnail hosts are DNS-blocked on the same networks as the API.
+        .resolver(crate::roblox::dns::PinnedResolver)
         .build()
 }
 

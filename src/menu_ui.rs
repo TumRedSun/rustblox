@@ -334,9 +334,9 @@ fn draw_sidebar(v: &mut MenuView, ctx: &mut UiCtx, fb: &mut FB, w: i32, h: i32) 
     }
     y += avatar_sz + (12.0 * s) as i32;
 
-    // Navigation (no Home button: the logo does that). In mini mode the
-    // Settings item is dropped here — the bottom gear button covers it, so
-    // there is exactly one Settings entry point per sidebar layout.
+    // Navigation (no Home button: the logo does that; no Settings entry
+    // either — the only one is the gear pinned to the bottom of the sidebar
+    // below, in both mini and full layout, so there is exactly one).
     let item_h = (34.0 * s) as i32;
     let item_pad = if mini { (6.0 * s) as i32 } else { pad };
     let item_w = w - 2 * item_pad;
@@ -344,13 +344,6 @@ fn draw_sidebar(v: &mut MenuView, ctx: &mut UiCtx, fb: &mut FB, w: i32, h: i32) 
         ctx, fb, item_pad, y, item_w, item_h, "Friends", icon_person_add,
         v.tab == MenuTab::Friends, true, Hit::NavFriends, None, mini,
     );
-    y += item_h + (5.0 * s) as i32;
-    if !mini {
-        nav_item(
-            ctx, fb, item_pad, y, item_w, item_h, "Settings", icon_gear,
-            v.tab == MenuTab::Settings, true, Hit::NavSettings, None, mini,
-        );
-    }
     y += item_h + (9.0 * s) as i32;
 
     if !mini {
@@ -368,25 +361,26 @@ fn draw_sidebar(v: &mut MenuView, ctx: &mut UiCtx, fb: &mut FB, w: i32, h: i32) 
         y += item_h + (5.0 * s) as i32;
     }
 
-    // Bottom: version (account actions live in Settings now).
-    if mini {
-        let bw = (34.0 * s) as i32;
-        let bx = (w - bw) / 2;
-        let by = h - bw - (12.0 * s) as i32;
-        let hovered = Rect { x: bx, y: by, w: bw, h: bw }.contains(ctx.cursor.0, ctx.cursor.1);
-        if hovered {
-            fb.rect_rounded(bx, by, bw, bw, (8.0 * s) as i32, t.surface_2);
-        }
-        icon_gear(
-            fb, bx + (bw - (16.0 * s) as i32) / 2, by + (bw - (16.0 * s) as i32) / 2,
-            (16.0 * s) as i32, if hovered { t.text } else { t.text_dim },
-        );
-        ctx.hits.add(Rect { x: bx, y: by, w: bw, h: bw }, Hit::NavSettings);
-    } else {
+    // Bottom: THE single Settings entry point — the gear, pinned here in
+    // both sidebar layouts (account actions live in Settings). In full mode
+    // the version label sits next to it, right-aligned.
+    let bw = (34.0 * s) as i32;
+    let bx = if mini { (w - bw) / 2 } else { pad };
+    let by = h - bw - (12.0 * s) as i32;
+    let hovered = Rect { x: bx, y: by, w: bw, h: bw }.contains(ctx.cursor.0, ctx.cursor.1);
+    if hovered {
+        fb.rect_rounded(bx, by, bw, bw, (8.0 * s) as i32, t.surface_2);
+    }
+    icon_gear(
+        fb, bx + (bw - (16.0 * s) as i32) / 2, by + (bw - (16.0 * s) as i32) / 2,
+        (16.0 * s) as i32, if hovered { t.text } else { t.text_dim },
+    );
+    ctx.hits.add(Rect { x: bx, y: by, w: bw, h: bw }, Hit::NavSettings);
+    if !mini {
         let ver = format!("RustBlox v{}", env!("CARGO_PKG_VERSION"));
         let vw = font::measure(ctx.fonts, &ver, 10.5 * s, false);
         font::draw(
-            ctx.fonts, fb, (w - pad) as f32 - vw, h as f32 - 12.0 * s,
+            ctx.fonts, fb, (w - pad) as f32 - vw, by as f32 + bw as f32 * 0.5 + 10.5 * s * 0.35,
             &ver, 10.5 * s, t.text_faint, false, 0.0,
         );
     }
