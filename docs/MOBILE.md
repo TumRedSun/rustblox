@@ -91,8 +91,10 @@ re-sign it with AltStore, Sideloadly or a personal provisioning profile.
   GameActivity backend (requires shipping Java classes in the APK) or
   waiting for winit to forward text events upstream.
 - **iOS .ipa is unsigned** by design (no certificates in CI).
-- **Session storage** uses the shared config directory; on Android it lives
-  in the app sandbox, on iOS in the bundle's Documents dir.
+- **Session storage** uses the shared config directory through the
+  `app_data_dir` platform hook: on Android it is the activity's private
+  files dir (`internalDataPath`, so sessions and settings survive
+  restarts), on iOS the bundle sandbox.
 
 ## Building locally
 
