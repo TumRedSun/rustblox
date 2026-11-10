@@ -17,7 +17,7 @@ pub fn get() -> Option<String> {
         let mut guard = vm.attach_current_thread().ok()?;
         let env: &mut JNIEnv = &mut guard;
         // Global ref owned by the activity itself — do not wrap or delete.
-        let activity = JObject::from_raw(app.activity_as_ptr() as *mut jni::sys::jobject);
+        let activity = JObject::from_raw(app.activity_as_ptr() as *mut jni::sys::_jobject);
 
         let service = env.new_string("clipboard").ok()?;
         let cb = env
@@ -83,9 +83,9 @@ pub fn set(text: &str) {
             return;
         };
         let env: &mut JNIEnv = &mut guard;
-        let activity = JObject::from_raw(app.activity_as_ptr() as *mut jni::sys::jobject);
+        let activity = JObject::from_raw(app.activity_as_ptr() as *mut jni::sys::_jobject);
 
-        let Some(service) = env.new_string("clipboard").ok() else { return };
+        let Some(service) = env.new_string("clipboard") else { return };
         let Ok(cb) = env
             .call_method(
                 &activity,
@@ -93,7 +93,6 @@ pub fn set(text: &str) {
                 "(Ljava/lang/String;)Ljava/lang/Object;",
                 &[JValue::Object(&service)],
             )
-            .ok()
             .and_then(|v| v.l())
         else {
             return;
@@ -110,7 +109,6 @@ pub fn set(text: &str) {
                 "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Landroid/content/ClipData;",
                 &[JValue::Object(&label), JValue::Object(&jtext)],
             )
-            .ok()
             .and_then(|v| v.l())
         else {
             return;
