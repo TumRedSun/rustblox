@@ -742,15 +742,18 @@ fn draw_home_content(v: &mut MenuView, ctx: &mut UiCtx, fb: &mut FB, x: i32, y: 
                 if iy + msg_h < y as f32 {
                     continue;
                 }
-                let mw = font::measure(ctx.fonts, text, 14.0 * s, false);
+                // Wrap long messages (hints, errors) instead of letting them
+                // clip at the pane edge on narrow screens.
+                let max_w = (w as f32 - 32.0 * s).max(80.0);
+                let cx = x as f32 + w as f32 / 2.0;
                 let my = iy + msg_h * 0.5;
-                font::draw(
-                    ctx.fonts, fb, x as f32 + w as f32 / 2.0 - mw / 2.0, my,
-                    text, 14.0 * s, t.text_faint, false, 0.0,
+                font::draw_wrapped_centered(
+                    ctx.fonts, fb, cx, my, max_w, text, 14.0 * s, t.text_faint, false,
                 );
                 if *spin {
+                    let first_w = font::measure(ctx.fonts, text, 14.0 * s, false).min(max_w);
                     ui::draw_spinner(
-                        fb, x as f32 + w as f32 / 2.0 - mw / 2.0 - 18.0 * s, my - 5.0 * s,
+                        fb, cx - first_w / 2.0 - 18.0 * s, my - 5.0 * s,
                         7.0 * s, ctx.now_ms, t.accent, s,
                     );
                 }
@@ -1078,10 +1081,10 @@ fn draw_requests_pane(v: &mut MenuView, ctx: &mut UiCtx, fb: &mut FB, x: i32, w:
         } else {
             ("No incoming friend requests".into(), false)
         };
-        let mw = font::measure(ctx.fonts, &msg, 14.0 * s, false);
-        font::draw(
-            ctx.fonts, fb, x as f32 + w as f32 / 2.0 - mw / 2.0, top + list_h / 2.0,
-            &msg, 14.0 * s, t.text_faint, false, 0.0,
+        let mw = font::measure(ctx.fonts, &msg, 14.0 * s, false).min(rows_w);
+        font::draw_wrapped_centered(
+            ctx.fonts, fb, x as f32 + w as f32 / 2.0, top + list_h / 2.0,
+            rows_w, &msg, 14.0 * s, t.text_faint, false,
         );
         if spin {
             ui::draw_spinner(
@@ -1213,10 +1216,10 @@ fn draw_search_pane(v: &mut MenuView, ctx: &mut UiCtx, fb: &mut FB, x: i32, w: i
         } else {
             ("Type at least 2 characters of a username and press Enter".into(), false)
         };
-        let mw = font::measure(ctx.fonts, &msg, 14.0 * s, false);
-        font::draw(
-            ctx.fonts, fb, x as f32 + w as f32 / 2.0 - mw / 2.0, list_top + list_h / 2.0,
-            &msg, 14.0 * s, t.text_faint, false, 0.0,
+        let mw = font::measure(ctx.fonts, &msg, 14.0 * s, false).min(rows_w);
+        font::draw_wrapped_centered(
+            ctx.fonts, fb, x as f32 + w as f32 / 2.0, list_top + list_h / 2.0,
+            rows_w, &msg, 14.0 * s, t.text_faint, false,
         );
         if spin {
             ui::draw_spinner(

@@ -8,6 +8,7 @@
 //! third-party CDN hosts).
 
 use crate::config::Session;
+use crate::game::GameEvent;
 use crate::model::{PlaceCard, Presence, PresenceKind, Snapshot, UserEntry};
 use crate::roblox::auth::{self, AuthOutcome};
 use crate::roblox::client::RobloxClient;
@@ -33,6 +34,8 @@ pub enum Command {
     FetchFriendRequests,
     /// Accept (true) or decline (false) an incoming friend request.
     RespondFriendRequest { user_id: u64, accept: bool },
+    /// Enter a live place server (desktop): runs the real join flow.
+    JoinPlace { place_id: u64 },
     Logout,
     Shutdown,
 }
@@ -50,6 +53,8 @@ pub enum WorkerEvent {
     /// Recently played places (discovery "continue" row + local tracking).
     RecentlyPlayedDone { result: Vec<PlaceCard> },
     LoggedOut,
+    /// Live-game join pipeline events.
+    Game(GameEvent),
 }
 
 /// Which slot a downloaded bitmap belongs to (users and places are kept in
@@ -277,6 +282,19 @@ pub fn spawn(proxy: EventLoopProxy<UserEvent>, session: Option<Session>) -> Work
                             }
                             let _ = proxy.send_event(UserEvent::Worker(WorkerEvent::RequestResponded { user_id, accept, result }));
                         }
+                        Command::JoinPlace { place_id } => {
+                            let _ = proxy.send_event(UserEvent::Worker(WorkerEvent::Game(GameEvent::Progress("Запрашиваем сервер…".into()))));
+                            match crate::roblox::join::join_game(&mut client, place_id) {
+                                Ok(resp) => {
+                                    let place_name = fetch_place_name(&mut client, place_id)
+                                        .unwrap_or_else(|| format!("Place {}", place_id));
+                                    let _ = proxy.send_event(UserEvent::Worker(WorkerEvent::Game(GameEvent::Joined { resp, place_name })));
+                                }
+                                Err(e) => {
+                                    let _ = proxy.send_event(UserEvent::Worker(WorkerEvent::Game(GameEvent::JoinFailed(format!("{}", e)))));
+                                }
+                            }
+                        }
                     }
                 }
             })
@@ -354,6 +372,16 @@ fn collect_recently_played(
         push_place_icons(c, &out, &job_tx, icons_pushed);
     }
     out
+}
+
+/// Best-effort place display name for the HUD.
+fn fetch_place_name(c: &mut RobloxClient, place_id: u64) -> Option<String> {
+    let url = format!(
+        "https://games.roblox.com/v1/games/multiget-place-details?placeIds={}",
+        place_id
+    );
+    let v: serde_json::Value = c.get_json(&url).ok()?;
+    v.as_array()?.first()?.get("name")?.as_str().map(|s| s.to_string())
 }
 
 /// Full refresh pipeline: friends -> presence -> last-online -> game names,

@@ -370,7 +370,12 @@ impl TextField {
         fb.set_clip(text_clip);
 
         if self.value.is_empty() && !focused {
-            font::draw(ctx.fonts, fb, inner_x as f32, baseline, self.placeholder, font_px, t.text_faint, false, 0.0);
+            // Placeholder: truncate with an ellipsis so it never clips at
+            // the field edge on narrow screens.
+            font::draw_ellipsis(
+                ctx.fonts, fb, inner_x as f32, baseline, self.placeholder,
+                font_px, t.text_faint, false, inner_w as f32,
+            );
         } else {
             // Selection highlight.
             if let Some((a, b)) = self.sel {

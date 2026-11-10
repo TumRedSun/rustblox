@@ -1,9 +1,15 @@
-//! Minimal software rasterizer on top of the `pixels` RGBA8 frame buffer.
+//! UI drawing primitives with two interchangeable backends.
 //!
-//! Everything draws through [`FB`], which carries the frame buffer, its size
-//! and a scissor rectangle so widgets can clip themselves (scroll lists etc.).
+//! * [`FB::new`] — the original software rasterizer writing into an RGBA8
+//!   buffer (used by the headless `render_preview` example and unit tests).
+//! * [`FB::gpu`] — records the same primitives into a command list that
+//!   [`crate::gfx`] renders on the GPU (the live path).
+//!
+//! Keeping one API for both means every widget draws through the same code
+//! no matter which backend is active.
 
 use crate::theme::Rgba;
+use std::sync::Arc;
 
 fn vec_len(x: f32, y: f32) -> f32 {
     (x * x + y * y).sqrt()
@@ -40,12 +46,56 @@ impl Clip {
     }
 }
 
-/// A writable RGBA8 frame buffer with clipping.
+/// A glyph placed from the shared font atlas (GPU path). The soft backend
+/// rasterizes text directly, so it never builds these.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GlyphSlot {
+    /// Atlas page (0 = the single page today) and pixel rect inside it.
+    pub page: u32,
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+    /// Offset of the glyph's top-left corner from the pen position.
+    pub left: f32,
+    pub top: f32,
+}
+
+/// One recorded primitive (GPU backend).
+#[derive(Clone, Debug)]
+pub enum Prim {
+    Rect { x: i32, y: i32, w: i32, h: i32, color: Rgba },
+    /// SDF rounded rectangle; `radius` is already scaled by the theme.
+    RoundRect { x: i32, y: i32, w: i32, h: i32, radius: f32, color: Rgba },
+    /// SDF rounded rectangle rotated around its center (angle in radians).
+    RoundRectRot { cx: i32, cy: i32, w: i32, h: i32, radius: f32, angle: f32, color: Rgba },
+    /// Stroked rounded rectangle (GPU-only, from outline_rounded).
+    RoundRectBorder { cx: i32, cy: i32, w: i32, h: i32, radius: f32, angle: f32, border: f32, color: Rgba },
+    Circle { cx: i32, cy: i32, r: i32, color: Rgba },
+    Ring { cx: i32, cy: i32, ro: i32, ri: i32, color: Rgba },
+    /// Texture from the image cache (`hash` keys the GPU-side cache).
+    Image { x: i32, y: i32, sw: i32, sh: i32, dw: i32, dh: i32, corner: i32, hash: u64, data: Arc<Vec<u8>> },
+    /// Glyph quad sampled from the font atlas (alpha in the R channel).
+    Glyph { x: f32, y: f32, slot: GlyphSlot, color: Rgba },
+    /// Single pixel (from set/set_f; only a handful of call sites exist).
+    Pix { x: f32, y: f32, color: Rgba },
+}
+
+#[derive(Debug)]
+pub enum Backing<'a> {
+    Soft(&'a mut [u8]),
+    /// (primitive, clip at record time) — the renderer batches by clip for
+    /// scissor changes.
+    Gpu(Vec<(Prim, Clip)>),
+}
+
+/// A drawable surface: either a writable RGBA8 buffer with clipping, or a
+/// GPU primitive recorder. Both carry the same size + scissor state.
 pub struct FB<'a> {
-    pub buf: &'a mut [u8],
     pub w: i32,
     pub h: i32,
     pub clip: Clip,
+    backing: Backing<'a>,
     scratch: Vec<u8>,
 }
 
@@ -67,8 +117,41 @@ fn blend_px(dst: &mut [u8], c: Rgba) {
 }
 
 impl<'a> FB<'a> {
+    /// Software backend: draw straight into `buf` (w*h*4 bytes, RGBA8).
     pub fn new(buf: &'a mut [u8], w: i32, h: i32) -> Self {
-        FB { buf, w, h, clip: Clip::full(w, h), scratch: Vec::new() }
+        FB { w, h, clip: Clip::full(w, h), backing: Backing::Soft(buf), scratch: Vec::new() }
+    }
+
+    /// GPU backend: record primitives for the wgpu renderer.
+    pub fn gpu(w: i32, h: i32) -> Self {
+        FB { w, h, clip: Clip::full(w, h), backing: Backing::Gpu(Vec::with_capacity(4096)), scratch: Vec::new() }
+    }
+
+    pub fn is_gpu(&self) -> bool {
+        matches!(self.backing, Backing::Gpu(_))
+    }
+
+    /// Take the recorded (primitive, clip) list (GPU backend only).
+    pub fn take_prims(&mut self) -> Vec<(Prim, Clip)> {
+        match &mut self.backing {
+            Backing::Gpu(prims) => std::mem::take(prims),
+            Backing::Soft(_) => Vec::new(),
+        }
+    }
+
+    /// Push a primitive in GPU mode (no-op in soft mode; soft methods paint).
+    fn push(&mut self, p: Prim) {
+        if let Backing::Gpu(prims) = &mut self.backing {
+            prims.push((p, self.clip));
+        }
+    }
+
+    /// Glyph quad from the shared font atlas (GPU mode; soft mode ignores it
+    /// because `font::draw` rasterizes text directly in soft mode).
+    pub fn push_glyph(&mut self, x: f32, y: f32, slot: GlyphSlot, color: Rgba) {
+        if let Backing::Gpu(prims) = &mut self.backing {
+            prims.push((Prim::Glyph { x, y, slot, color }, self.clip));
+        }
     }
 
     pub fn set_clip(&mut self, clip: Clip) {
@@ -87,14 +170,22 @@ impl<'a> FB<'a> {
 
     /// Fast filled rectangle: builds one row then memcpy's it per scanline.
     pub fn rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: Rgba) {
+        if color[3] == 0 {
+            return;
+        }
+        if self.is_gpu() {
+            self.push(Prim::Rect { x, y, w, h, color });
+            return;
+        }
         let c = self.clip;
         let x0 = x.max(c.x0);
         let y0 = y.max(c.y0);
         let x1 = (x + w).min(c.x1);
         let y1 = (y + h).min(c.y1);
-        if x0 >= x1 || y0 >= y1 || color[3] == 0 {
+        if x0 >= x1 || y0 >= y1 {
             return;
         }
+        let Backing::Soft(buf) = &mut self.backing else { return };
         let rw = (x1 - x0) as usize;
         if color[3] == 255 {
             // Opaque fast path: scratch row + row-wise memcpy.
@@ -108,28 +199,34 @@ impl<'a> FB<'a> {
             }
             for yy in y0..y1 {
                 let off = (yy as usize * self.w as usize + x0 as usize) * 4;
-                self.buf[off..off + rw * 4].copy_from_slice(&self.scratch[..rw * 4]);
+                buf[off..off + rw * 4].copy_from_slice(&self.scratch[..rw * 4]);
             }
         } else {
             for yy in y0..y1 {
                 let off = (yy as usize * self.w as usize + x0 as usize) * 4;
                 for xx in 0..rw {
-                    let px = &mut self.buf[off + xx * 4..off + xx * 4 + 4];
+                    let px = &mut buf[off + xx * 4..off + xx * 4 + 4];
                     blend_px(px, color);
                 }
             }
         }
     }
 
-    /// Filled rounded rectangle (radius in px). Center uses the fast path,
-    /// only corner tiles do per-pixel work. The radius is scaled by the
+    /// Filled rounded rectangle (radius in px). The radius is scaled by the
     /// theme's global rounding multiplier (Settings → Appearance).
     pub fn rect_rounded(&mut self, x: i32, y: i32, w: i32, h: i32, radius: i32, color: Rgba) {
         if radius <= 0 {
             self.rect(x, y, w, h, color);
             return;
         }
+        if color[3] == 0 {
+            return;
+        }
         let radius = (radius as f32 * crate::theme::cur().radius_scale).round() as i32;
+        if self.is_gpu() {
+            self.push(Prim::RoundRect { x, y, w, h, radius: radius.min(w / 2).min(h / 2) as f32, color });
+            return;
+        }
         let r = radius.min(w / 2).min(h / 2);
         // Center band + middle columns.
         self.rect(x + r, y, w - 2 * r, h, color);
@@ -158,15 +255,21 @@ impl<'a> FB<'a> {
     }
 
     /// Filled rounded rectangle rotated around its center (SDF-based).
-    /// Used for the rotated logo tile; the area is small so the per-pixel
-    /// cost is negligible.
+    /// Used for the rotated logo tile.
     pub fn rect_rounded_rot(&mut self, cx: i32, cy: i32, w: i32, h: i32, radius: i32, angle: f32, color: Rgba) {
         if angle.abs() < 0.001 {
             self.rect_rounded(cx - w / 2, cy - h / 2, w, h, radius, color);
             return;
         }
+        if color[3] == 0 {
+            return;
+        }
+        let radius = (radius as f32 * crate::theme::cur().radius_scale).max(0.0);
+        if self.is_gpu() {
+            self.push(Prim::RoundRectRot { cx, cy, w, h, radius, angle, color });
+            return;
+        }
         let (hw, hh) = (w as f32 / 2.0, h as f32 / 2.0);
-        let r = (radius as f32 * crate::theme::cur().radius_scale).max(0.0);
         let (sin, cos) = angle.sin_cos();
         // Bounding box big enough for the rotation (hypotenuse of half-size).
         let bound = (hw * hw + hh * hh).sqrt().ceil() as i32 + 2;
@@ -176,9 +279,9 @@ impl<'a> FB<'a> {
                 // Inverse-rotate the pixel offset into the tile's local space.
                 let (lx, ly) = (dx as f32 * cos + dy as f32 * sin, -dx as f32 * sin + dy as f32 * cos);
                 // Rounded-box signed distance.
-                let qx = lx.abs() - (hw - r);
-                let qy = ly.abs() - (hh - r);
-                let dist = vec_len(qx.max(0.0), qy.max(0.0)) + qx.max(qy).min(0.0) - r;
+                let qx = lx.abs() - (hw - radius);
+                let qy = ly.abs() - (hh - radius);
+                let dist = vec_len(qx.max(0.0), qy.max(0.0)) + qx.max(qy).min(0.0) - radius;
                 let aa = (0.5 - dist).clamp(0.0, 1.0);
                 if aa > 0.0 {
                     let mut c = color;
@@ -204,6 +307,20 @@ impl<'a> FB<'a> {
             return;
         }
         let radius = (radius as f32 * crate::theme::cur().radius_scale).round() as i32;
+        if self.is_gpu() {
+            let r = radius.min(w / 2).min(h / 2) as f32;
+            self.push(Prim::RoundRectBorder {
+                cx: x + w / 2,
+                cy: y + h / 2,
+                w,
+                h,
+                radius: r,
+                angle: 0.0,
+                border: 1.0,
+                color,
+            });
+            return;
+        }
         let r = radius.min(w / 2).min(h / 2);
         self.rect(x + r, y, w - 2 * r, 1, color);
         self.rect(x + r, y + h - 1, w - 2 * r, 1, color);
@@ -212,6 +329,8 @@ impl<'a> FB<'a> {
         let cx1 = (x + r - 1) as f32;
         let cy1 = (y + r - 1) as f32;
         let cx2 = (x + w - r) as f32;
+        let cy2 = (y + r) as f32;
+        let _ = cy2;
         let cy2 = (y + h - r) as f32;
         for corner in [(cx1, cy1), (cx2, cy1), (cx1, cy2), (cx2, cy2)] {
             for a in 0..(r * 2) {
@@ -228,9 +347,14 @@ impl<'a> FB<'a> {
         }
     }
 
+
     /// Filled circle (fast: one sqrt per scanline).
     pub fn circle(&mut self, cx: i32, cy: i32, r: i32, color: Rgba) {
-        if r <= 0 {
+        if r <= 0 || color[3] == 0 {
+            return;
+        }
+        if self.is_gpu() {
+            self.push(Prim::Circle { cx, cy, r, color });
             return;
         }
         for dy in -r..=r {
@@ -244,7 +368,11 @@ impl<'a> FB<'a> {
     /// Unlike a filled circle punched with the background color this works
     /// on any surface, so icons stay correct on hover highlights.
     pub fn ring(&mut self, cx: i32, cy: i32, ro: i32, ri: i32, color: Rgba) {
-        if ro <= 0 {
+        if ro <= 0 || color[3] == 0 {
+            return;
+        }
+        if self.is_gpu() {
+            self.push(Prim::Ring { cx, cy, ro, ri: ri.max(0), color });
             return;
         }
         let ri = ri.max(0).min(ro - 1);
@@ -267,14 +395,13 @@ impl<'a> FB<'a> {
     }
 
     /// Blit an RGBA8 source image (opaque or alpha-blended), optionally with
-    /// rounded corners. The source is scaled (nearest neighbor) from
-    /// `sw` x `sh` into the `dw` x `dh` destination box, so the buffer and
-    /// the on-screen size may differ (UI scale, chip vs row avatars).
+    /// rounded corners. The source is scaled (bilinear on GPU, nearest on
+    /// CPU) from `sw` x `sh` into the `dw` x `dh` destination box.
     pub fn image(
         &mut self,
         x: i32,
         y: i32,
-        src: &[u8],
+        src: &Arc<Vec<u8>>,
         sw: i32,
         sh: i32,
         dw: i32,
@@ -282,6 +409,20 @@ impl<'a> FB<'a> {
         corner_radius: i32,
     ) {
         if sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0 {
+            return;
+        }
+        if self.is_gpu() {
+            self.push(Prim::Image {
+                x,
+                y,
+                sw,
+                sh,
+                dw,
+                dh,
+                corner: corner_radius,
+                hash: image_hash(src, sw, sh),
+                data: Arc::clone(src),
+            });
             return;
         }
         let c = self.clip;
@@ -324,15 +465,30 @@ impl<'a> FB<'a> {
 
     /// Set a single pixel with alpha blending (clipped).
     pub fn set(&mut self, x: i32, y: i32, color: Rgba) {
+        if color[3] == 0 {
+            return;
+        }
+        if self.is_gpu() {
+            self.push(Prim::Pix { x: x as f32, y: y as f32, color });
+            return;
+        }
         if !self.clip.contains(x, y) || x < 0 || y < 0 || x >= self.w || y >= self.h {
             return;
         }
+        let Backing::Soft(buf) = &mut self.backing else { return };
         let off = (y as usize * self.w as usize + x as usize) * 4;
-        blend_px(&mut self.buf[off..off + 4], color);
+        blend_px(&mut buf[off..off + 4], color);
     }
 
     /// Anti-aliased pixel (splits coverage over 4 neighbors).
     pub fn set_f(&mut self, x: f32, y: f32, color: Rgba) {
+        if color[3] == 0 {
+            return;
+        }
+        if self.is_gpu() {
+            self.push(Prim::Pix { x, y, color });
+            return;
+        }
         let fx = x - x.floor();
         let fy = y - y.floor();
         let x = x.floor() as i32;
@@ -355,4 +511,40 @@ impl<'a> FB<'a> {
     pub fn hline(&mut self, x: i32, y: i32, w: i32, color: Rgba) {
         self.rect(x, y, w, 1, color);
     }
+}
+
+/// Cheap content hash for the GPU image cache. Samples the buffer so the
+/// cost stays low even for large icons.
+pub fn image_hash(src: &[u8], sw: i32, sh: i32) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    let step = |b: u8, h: &mut u64| {
+        *h ^= b as u64;
+        *h = h.wrapping_mul(0x100000001b3);
+    };
+    step(sw as u8, &mut h);
+    step((sw >> 8) as u8, &mut h);
+    step(sh as u8, &mut h);
+    step((sh >> 8) as u8, &mut h);
+    let len = src.len();
+    step(len as u8, &mut h);
+    step((len >> 8) as u8, &mut h);
+    step((len >> 16) as u8, &mut h);
+    step((len >> 24) as u8, &mut h);
+    // Sample evenly: first/last 16 bytes + every (len/32)th byte.
+    let n = src.len();
+    for i in 0..16.min(n) {
+        step(src[i], &mut h);
+    }
+    if n > 16 {
+        for i in 0..16.min(n) {
+            step(src[n - 1 - i], &mut h);
+        }
+    }
+    let stride = (n / 37).max(1);
+    let mut i = stride;
+    while i < n {
+        step(src[i], &mut h);
+        i += stride;
+    }
+    h
 }

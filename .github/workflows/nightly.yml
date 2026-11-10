@@ -1,6 +1,8 @@
 # Nightly builds: every night (and on demand) RustBlox is compiled for all
-# supported platforms; the release step publishes/updates a rolling
-# "nightly" GitHub Release whose assets are replaced (clobbered) on each run.
+# supported platforms; the release step republishes the rolling "nightly"
+# GitHub Release (a full, non-prerelease release, so GitHub shows it as the
+# "Latest" release on the repository page) and then triggers the mobile
+# builds for the same night.
 #
 # Trigger manually: Actions -> Nightly builds -> Run workflow.
 
@@ -14,6 +16,8 @@ on:
 
 permissions:
   contents: write
+  # Needed to dispatch mobile.yml at the end of the nightly run.
+  actions: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -129,10 +133,24 @@ jobs:
           | \`rustblox-nightly-x86_64-apple-darwin.zip\` | macOS Intel |
           EOF
           )
-          if gh release view nightly > /dev/null 2>&1; then
-            gh release edit nightly --title "Nightly build (${DATE})" --notes "$NOTES" --prerelease
-          else
-            gh release create nightly --prerelease --title "Nightly build (${DATE})" --notes "$NOTES"
-          fi
+          # Recreate the release from scratch so the "nightly" tag always
+          # points at the exact commit that was built.
+          gh release delete nightly --yes --cleanup-tag 2>/dev/null || true
+          # A half-deleted release can leave the tag behind; drop it too.
+          curl -sf -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${GH_REPO}/git/refs/tags/nightly" || true
+          # Full (non-prerelease) release => GitHub badges it as "Latest"
+          # and /releases/latest resolves to it right from the repo page.
+          gh release create nightly --target "${GITHUB_SHA}" --latest \
+            --title "Nightly build (${DATE})" --notes "$NOTES"
+          # Pin the Latest badge explicitly (gh bool flags are unreliable
+          # here, and later mobile runs must never steal it).
+          NIGHTLY_RID=$(gh api "repos/${GH_REPO}/releases/tags/nightly" --jq .id)
+          gh api -X PATCH "repos/${GH_REPO}/releases/${NIGHTLY_RID}" -f make_latest=true > /dev/null
           gh release upload nightly artifacts/*.zip --clobber
           echo "Nightly release refreshed for ${DATE}."
+      - name: Trigger the nightly mobile build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh workflow run mobile.yml --ref mobile

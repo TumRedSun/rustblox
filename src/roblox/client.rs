@@ -216,6 +216,50 @@ impl RobloxClient {
         self.send(url, Some(body))
     }
 
+    /// POST JSON with extra headers (game join needs Referer/Origin).
+    /// Runs the same CSRF-rotation dance as `send`.
+    pub fn post_with_headers(
+        &mut self,
+        url: &str,
+        body: &serde_json::Value,
+        headers: &[(&str, &str)],
+    ) -> Result<RawResponse, ApiError> {
+        let mut attempts = 0usize;
+        loop {
+            attempts += 1;
+            let mut req = self.agent.post(url);
+            req = req.set("Accept", "application/json");
+            req = req.set("Content-Type", "application/json");
+            if let Some(tok) = &self.csrf {
+                req = req.set("X-CSRF-Token", tok);
+            }
+            if let Some(cookie) = self.cookie_header() {
+                req = req.set("Cookie", &cookie);
+            }
+            for (k, v) in headers {
+                req = req.set(k, v);
+            }
+            let sent = req.send_bytes(
+                &serde_json::to_vec(body).map_err(|e| ApiError::Network(e.to_string()))?,
+            );
+            let raw = match sent {
+                Ok(resp) => into_raw(resp),
+                Err(ureq::Error::Status(_code, resp)) => into_raw(resp),
+                Err(ureq::Error::Transport(t)) => return Err(ApiError::Network(t.to_string())),
+            };
+            self.apply_set_cookies(&raw);
+            if let Some(tok) = &raw.csrf {
+                self.csrf = Some(tok.clone());
+            }
+            let token_invalid = raw.status == 403
+                && String::from_utf8_lossy(&raw.body).contains("Token Validation Failed");
+            if token_invalid && attempts < 3 && raw.csrf.is_some() {
+                continue;
+            }
+            return Ok(raw);
+        }
+    }
+
     /// Plain GET without auth headers (CDN downloads).
     pub fn get_cdn_bytes(&self, url: &str) -> Result<Vec<u8>, ApiError> {
         let sent = self.agent.get(url).set("Accept", "*/*").call();
