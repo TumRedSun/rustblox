@@ -34,14 +34,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: aarch64-linux-android
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
       - name: Install pinned Android NDK
-        # Install a pinned NDK so the clang linker wrapper is deterministic,
-        # then point cargo-ndk at it explicitly.
+        # Building the cdylib needs only the (self-contained) NDK, not the
+        # full SDK: download the pinned NDK zip directly and point cargo-ndk
+        # at it. This avoids sdkmanager license prompts entirely.
         run: |
-          sdkmanager --install "ndk;27.2.12479018" > /dev/null
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+          set -euo pipefail
+          curl -sSfL -o /tmp/ndk.zip https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
+          unzip -q /tmp/ndk.zip -d "$HOME/ndk"
+          echo "ANDROID_NDK_HOME=$HOME/ndk/android-ndk-r27c" >> "$GITHUB_ENV"
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
       - name: Build Android library (arm64-v8a)
