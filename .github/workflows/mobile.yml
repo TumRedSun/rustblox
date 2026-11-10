@@ -34,10 +34,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: aarch64-linux-android
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
       - name: Install pinned Android NDK
-        # The ubuntu image ships an SDK already (ANDROID_HOME is set); pin the
-        # NDK version so the clang linker wrapper is deterministic.
-        run: sdkmanager --install "ndk;27.2.12479018" > /dev/null
+        # Install a pinned NDK so the clang linker wrapper is deterministic,
+        # then point cargo-ndk at it explicitly.
+        run: |
+          sdkmanager --install "ndk;27.2.12479018" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
       - name: Build Android library (arm64-v8a)
