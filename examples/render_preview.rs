@@ -317,4 +317,31 @@ fn main() {
         rustblox::menu_ui::draw(&mut view, &mut ctx, &mut fb);
         save(&buf, w, h, &format!("{dir}/preview_appearance.png"));
     }
+
+    // 11. Menu: Settings — Logs tab with a failed-join trace.
+    {
+        rustblox::logs::clear();
+        rustblox::logs::push("app", "join requested: place 3286111298");
+        rustblox::logs::push(
+            "net",
+            "https://apis.roblox.com/authentication-ticket/v1 -> HTTP 200: {\"ticket\":\"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.example\"}",
+        );
+        rustblox::logs::push(
+            "net",
+            "https://gamejoin.roblox.com/v2/join-game -> HTTP 200: {\"jobId\":null,\"status\":5,\"joinError\":{\"joinStatusCode\":6,\"errorCode\":6,\"description\":\"You cannot join this experience\"}}",
+        );
+        rustblox::logs::push("net", "join: server refused the join: status 5, joinStatusCode=6, errorCode=6, \"You cannot join this experience\"");
+        rustblox::logs::push("app", "join failed: Failed to parse API response: server refused the join: status 5");
+        let mut p = Painter::new(&fonts);
+        let mut view = blank_menu_view();
+        view.tab = rustblox::menu_ui::MenuTab::Settings;
+        view.settings.tab = rustblox::menu_ui::SettingsTab::Logs;
+        let mut buf = blank_canvas(w, h);
+        let mut fb = FB::new(&mut buf, w, h);
+        fb.fill(theme::cur().bg);
+        let mut ctx = p.ctx(None);
+        rustblox::menu_ui::draw(&mut view, &mut ctx, &mut fb);
+        save(&buf, w, h, &format!("{dir}/preview_logs.png"));
+        rustblox::logs::clear();
+    }
 }

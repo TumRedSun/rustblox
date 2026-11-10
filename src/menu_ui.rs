@@ -10,6 +10,7 @@ use crate::app::UiCtx;
 use crate::config::Session;
 use crate::draw::FB;
 use crate::font;
+use crate::font::Fonts;
 use crate::model::{
     avatar_placeholder_color, format_count, FriendRow, PlaceCard, PresenceKind, UserEntry,
 };
@@ -38,6 +39,7 @@ pub enum FriendPane {
 pub enum SettingsTab {
     General,
     Appearance,
+    Logs,
 }
 
 pub struct ListMetrics {
@@ -46,6 +48,12 @@ pub struct ListMetrics {
     /// Vertical lists: view height. Horizontal strip: view width.
     pub h: f32,
     pub content_h: f32,
+}
+
+impl Clone for ListMetrics {
+    fn clone(&self) -> Self {
+        ListMetrics { top: self.top, h: self.h, content_h: self.content_h }
+    }
 }
 
 /// Clamp a scroll offset into `[0, content - view]`.
@@ -137,6 +145,9 @@ impl RequestsState {
 #[derive(Clone, Copy, Debug)]
 pub struct SettingsState {
     pub tab: SettingsTab,
+    /// Logs pane: keep pinned to the newest line while the user is at the
+    /// bottom (set false as soon as they scroll up).
+    pub logs_follow: bool,
 }
 
 pub struct MenuView {
@@ -189,6 +200,20 @@ pub struct MenuView {
 }
 
 impl MenuView {
+    /// After a manual scroll change on the Settings screen: keep the Logs
+    /// pane pinned to the newest line only while the user sits at the bottom.
+    pub fn settings_sync_logs_follow(&mut self) {
+        if self.settings.tab != SettingsTab::Logs {
+            return;
+        }
+        let at_bottom = self
+            .settings_metrics
+            .as_ref()
+            .map(|m| self.settings_scroll + m.h >= m.content_h - 1.0)
+            .unwrap_or(false);
+        self.settings.logs_follow = at_bottom;
+    }
+
     pub fn new(profile: crate::model::UserProfile) -> MenuView {
         MenuView {
             profile,
@@ -215,7 +240,7 @@ impl MenuView {
             add: AddFriendsState::new(),
             add_scroll: 0.0,
             add_metrics: None,
-            settings: SettingsState { tab: SettingsTab::General },
+            settings: SettingsState { tab: SettingsTab::General, logs_follow: true },
             settings_scroll: 0.0,
             settings_metrics: None,
             last_update: None,
@@ -1327,7 +1352,7 @@ fn draw_settings(v: &mut MenuView, ctx: &mut UiCtx, fb: &mut FB, x: i32, w: i32,
     let status_h = (theme::STATUSBAR_H * s) as i32;
 
     font::draw(ctx.fonts, fb, x as f32 + pad as f32, header_h as f32 / 2.0 + 9.5 * s, "Settings", 19.0 * s, t.text, true, 0.0);
-    let hint = "Account, themes and appearance";
+    let hint = "Account, themes and diagnostics";
     let hw = font::measure(ctx.fonts, hint, 12.5 * s, false);
     font::draw(
         ctx.fonts, fb, (x + w - pad) as f32 - hw, header_h as f32 / 2.0 + 12.5 * s * 0.35,
@@ -1336,40 +1361,206 @@ fn draw_settings(v: &mut MenuView, ctx: &mut UiCtx, fb: &mut FB, x: i32, w: i32,
     fb.hline(x, header_h, w, [0x1E, 0x20, 0x22, 0xFF]);
 
     let tab_h = (32.0 * s) as i32;
-    let tw = (((w - 2 * pad) as f32 - (8.0 * s)) / 2.0).min(150.0 * s) as i32;
-    draw_seg_tab(ctx, fb, Rect { x: x + pad, y: header_h + (tabs_h - tab_h) / 2, w: tw, h: tab_h }, "General", v.settings.tab == SettingsTab::General, Hit::SettingsTab(0));
-    draw_seg_tab(ctx, fb, Rect { x: x + pad + tw + (8.0 * s) as i32, y: header_h + (tabs_h - tab_h) / 2, w: tw, h: tab_h }, "Appearance", v.settings.tab == SettingsTab::Appearance, Hit::SettingsTab(1));
+    let tw = (((w - 2 * pad) as f32 - 2.0 * (8.0 * s)) / 3.0).min(120.0 * s) as i32;
+    let tabs_y = header_h + (tabs_h - tab_h) / 2;
+    draw_seg_tab(ctx, fb, Rect { x: x + pad, y: tabs_y, w: tw, h: tab_h }, "General", v.settings.tab == SettingsTab::General, Hit::SettingsTab(0));
+    draw_seg_tab(ctx, fb, Rect { x: x + pad + tw + (8.0 * s) as i32, y: tabs_y, w: tw, h: tab_h }, "Appearance", v.settings.tab == SettingsTab::Appearance, Hit::SettingsTab(1));
+    draw_seg_tab(ctx, fb, Rect { x: x + pad + 2 * (tw + (8.0 * s) as i32), y: tabs_y, w: tw, h: tab_h }, "Logs", v.settings.tab == SettingsTab::Logs, Hit::SettingsTab(2));
 
     let top = (header_h + tabs_h) as f32;
     let view_h = (h - status_h) as f32 - top;
+    // The Logs pane reserves a fixed footer row for the action buttons.
+    let footer_h = if v.settings.tab == SettingsTab::Logs { 46.0 * s } else { 0.0 };
+    let list_view = (view_h - footer_h).max(0.0);
 
-    // Measure content first (both tabs can exceed the viewport).
+    // Measure content first (any tab can exceed the viewport).
+    let scroll_w = (theme::SCROLL_W * s) as i32;
+    let inner_w = (w - 2 * pad - scroll_w) as f32;
     let content_h = match v.settings.tab {
         SettingsTab::General => measure_general(v, s),
         SettingsTab::Appearance => measure_appearance(s),
+        SettingsTab::Logs => measure_logs(ctx.fonts, inner_w, s),
     };
-    v.settings_scroll = clamp_scroll(v.settings_scroll, content_h, view_h);
-    v.settings_metrics = Some(ListMetrics { top, h: view_h, content_h });
+    if v.settings.logs_follow && v.settings.tab == SettingsTab::Logs {
+        v.settings_scroll = (content_h - list_view).max(0.0);
+    }
+    v.settings_scroll = clamp_scroll(v.settings_scroll, content_h, list_view);
+    v.settings_metrics = Some(ListMetrics { top, h: list_view, content_h });
 
-    let clip = crate::draw::Clip { x0: x, y0: top as i32, x1: x + w, y1: (top + view_h) as i32 };
+    let clip = crate::draw::Clip { x0: x, y0: top as i32, x1: x + w, y1: (top + list_view) as i32 };
     let old_clip = fb.clip();
     fb.set_clip(clip);
-    let scroll_w = (theme::SCROLL_W * s) as i32;
-    let inner_w = (w - 2 * pad - scroll_w) as f32;
     let mut y = top - v.settings_scroll;
     match v.settings.tab {
         SettingsTab::General => draw_general(v, ctx, fb, x + pad, &mut y, inner_w, s),
         SettingsTab::Appearance => draw_appearance(ctx, fb, x + pad, &mut y, inner_w, s, &mut v.app_settings),
+        SettingsTab::Logs => draw_logs(ctx, fb, x + pad, &mut y, inner_w, s),
     }
     fb.set_clip(old_clip);
 
-    if content_h > view_h + 0.5 {
+    if content_h > list_view + 0.5 {
         draw_scrollbar(
             ctx, fb,
-            x + w - pad - scroll_w + scroll_w / 2, top as i32, scroll_w, view_h as i32,
-            v.settings_scroll, content_h, view_h, s,
+            x + w - pad - scroll_w + scroll_w / 2, top as i32, scroll_w, list_view as i32,
+            v.settings_scroll, content_h, list_view, s,
         );
     }
+
+    // Logs footer: action buttons pinned under the log view.
+    if v.settings.tab == SettingsTab::Logs {
+        let btn_h = (30.0 * s) as i32;
+        let fy = (top + view_h - 46.0 * s) as i32;
+        let copy_w = (140.0 * s) as i32;
+        let r1 = Rect { x: x + pad, y: fy, w: copy_w, h: btn_h };
+        let b1 = draw_button(ctx, fb, r1, "Copy logs", BtnStyle::Primary, false);
+        ctx.hits.add(b1, Hit::CopyLogs);
+        let clear_w = (110.0 * s) as i32;
+        let r2 = Rect { x: x + pad + copy_w + (10.0 * s) as i32, y: fy, w: clear_w, h: btn_h };
+        let b2 = draw_button(ctx, fb, r2, "Clear", BtnStyle::Secondary, false);
+        ctx.hits.add(b2, Hit::ClearLogs);
+        let count = crate::logs::len();
+        let label = if count == 1 { "1 line".to_string() } else { format!("{} lines", count) };
+        let lw = font::measure(ctx.fonts, &label, 11.5 * s, false);
+        font::draw(
+            ctx.fonts, fb,
+            (x + w - pad) as f32 - lw,
+            fy as f32 + btn_h as f32 / 2.0 + 11.5 * s * 0.35,
+            &label, 11.5 * s, t.text_dim, false, 0.0,
+        );
+    }
+}
+
+/// Diagnostic log pane: every buffered line, greedy-wrapped to the pane
+/// width. Newest lines sit at the bottom; the follow flag pins the view to
+/// the tail until the user scrolls up.
+const LOG_LINE_H: f32 = 17.0;
+
+fn measure_logs(fonts: &Fonts, inner_w: f32, s: f32) -> f32 {
+    let px = 11.5 * s;
+    let line_h = LOG_LINE_H * s;
+    let mut h = 8.0 * s;
+    let lines = crate::logs::lines();
+    if lines.is_empty() {
+        h += line_h * 2.0;
+    } else {
+        for l in &lines {
+            h += log_layout(fonts, l, inner_w, px).2.len() as f32 * line_h;
+        }
+    }
+    h + 12.0 * s
+}
+
+fn draw_logs(ctx: &mut UiCtx, fb: &mut FB, x: i32, y: &mut f32, w: f32, s: f32) {
+    let t = theme::cur();
+    let px = 11.5 * s;
+    let line_h = LOG_LINE_H * s;
+    section_label(ctx, fb, x, y, "DIAGNOSTIC LOG", s);
+    let lines = crate::logs::lines();
+    if lines.is_empty() {
+        font::draw(ctx.fonts, fb, x as f32, *y + 14.0 * s, "No events yet.", px, t.text_faint, false, 0.0);
+        font::draw(
+            ctx.fonts, fb, x as f32, *y + 14.0 * s + line_h,
+            "Try joining a place — every request, response and error lands here.",
+            px, t.text_faint, false, 0.0,
+        );
+        *y += line_h * 2.0;
+        return;
+    }
+    for l in &lines {
+        let (head, head_w, segs) = log_layout(ctx.fonts, l, w, px);
+        for (k, seg) in segs.iter().enumerate() {
+            let (sx, base) = if k == 0 {
+                (x as f32 + head_w, *y)
+            } else {
+                (x as f32, *y + k as f32 * line_h)
+            };
+            if seg.is_empty() {
+                continue;
+            }
+            let color = if k == 0 { t.text } else { t.text_dim };
+            if k == 0 && !head.is_empty() {
+                font::draw(ctx.fonts, fb, x as f32, *y + px * 0.85, &head, px, t.text_dim, false, 0.0);
+            }
+            font::draw(ctx.fonts, fb, sx, base + px * 0.85, seg, px, color, false, 0.0);
+        }
+        *y += segs.len() as f32 * line_h;
+    }
+}
+
+/// Split a stored log line "[HH:MM:SS] [kind] message" into the dim header
+/// (timestamp + kind tag) and the message, then greedy-wrap the message to
+/// the pane width (long words are broken per character). The first visual
+/// line starts after the header, the rest span the full width. Used for
+/// BOTH measuring and drawing so the scroll height can never drift.
+fn log_layout(fonts: &Fonts, line: &str, max_w: f32, px: f32) -> (String, f32, Vec<String>) {
+    let space_w = font::measure(fonts, " ", px, false);
+    // Header = up to the second "]" ("[21:53:21]" + "[net]").
+    let first_br = line.find(']');
+    let (head, msg) = match first_br {
+        Some(fb1) => {
+            let rest = &line[fb1 + 1..];
+            match rest.find("] ") {
+                Some(off) => {
+                    let second = fb1 + 1 + off + 1;
+                    (line[..second + 1].to_string(), &line[second + 2..])
+                }
+                None => (String::new(), line),
+            }
+        }
+        None => (String::new(), line),
+    };
+    let head_w = if head.is_empty() {
+        0.0
+    } else {
+        font::measure(fonts, &head, px, false) + space_w
+    };
+    let first_w = (max_w - head_w).max(32.0);
+    let mut segs: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0.0f32;
+    let mut cap = first_w;
+    let flush = |segs: &mut Vec<String>, cur: &mut String, cur_w: &mut f32| {
+        segs.push(std::mem::take(cur));
+        *cur_w = 0.0;
+    };
+    for word in msg.split(' ') {
+        if word.is_empty() {
+            continue;
+        }
+        let ww = font::measure(fonts, word, px, false);
+        if !cur.is_empty() && cur_w + space_w + ww > cap {
+            flush(&mut segs, &mut cur, &mut cur_w);
+            cap = max_w;
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+            cur_w += space_w;
+        }
+        if ww > cap {
+            // Hard-break a word wider than the whole line.
+            for ch in word.chars() {
+                let c = ch.to_string();
+                let cw = font::measure(fonts, &c, px, false);
+                if cur_w + cw > cap && !cur.is_empty() {
+                    flush(&mut segs, &mut cur, &mut cur_w);
+                    cap = max_w;
+                }
+                cur.push_str(&c);
+                cur_w += cw;
+            }
+        } else {
+            cur.push_str(word);
+            cur_w += ww;
+        }
+    }
+    let _ = cur_w;
+    if !cur.is_empty() {
+        segs.push(cur);
+    }
+    if segs.is_empty() {
+        segs.push(String::new());
+    }
+    (head, head_w, segs)
 }
 
 /// Rough content height of the General tab (kept in sync with draw_general).

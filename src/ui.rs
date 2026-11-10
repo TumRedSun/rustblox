@@ -83,6 +83,10 @@ pub enum Hit {
     ColorNext(usize),
     /// Appearance tab: restore default (dark) colors.
     ResetAppearance,
+    /// Settings → Logs: copy the whole diagnostic log buffer to the clipboard.
+    CopyLogs,
+    /// Settings → Logs: wipe the diagnostic log buffer.
+    ClearLogs,
 }
 
 #[derive(Clone, Copy, Debug)]

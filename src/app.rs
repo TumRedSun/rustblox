@@ -354,6 +354,23 @@ impl App {
         }
     }
 
+    /// Put `text` onto the system clipboard (best effort). Returns false
+    /// only when every backend is unavailable or errors out.
+    fn copy_text_to_clipboard(&mut self, text: &str) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+        // Android/iOS hook (JNI UIPasteboard / ClipboardManager).
+        if cfg!(any(target_os = "android", target_os = "ios")) {
+            crate::platform::clipboard_set(text);
+            return true;
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if let Some(c) = self.clipboard.as_mut() {
+            return c.set_text(text).is_ok();
+        }
+        false
+    }
     fn primary_action(&mut self) {
         let tx = self.tx.clone();
         match &mut self.screen {
@@ -773,6 +790,7 @@ impl App {
                 self.attach_session(resp, place_name, user_id);
             }
             GameEvent::JoinFailed(msg) => {
+                crate::logs::push("app", &format!("join failed: {}", msg));
                 self.leave_game(Some(format!("Could not join: {}", msg)));
             }
         }
@@ -843,12 +861,13 @@ impl ApplicationHandler<UserEvent> for App {
                                 &mut v.add_scroll,
                                 v.add_metrics.as_ref().map(|m| (m.content_h / m.h.max(1.0)).max(1.0)).unwrap_or(1.0),
                             ),
-                            (MenuTab::Settings, _, SettingsTab::General) | (MenuTab::Settings, _, SettingsTab::Appearance) => (
+                            (MenuTab::Settings, _, SettingsTab::General) | (MenuTab::Settings, _, SettingsTab::Appearance) | (MenuTab::Settings, _, SettingsTab::Logs) => (
                                 &mut v.settings_scroll,
                                 v.settings_metrics.as_ref().map(|m| (m.content_h / m.h.max(1.0)).max(1.0)).unwrap_or(1.0),
                             ),
                         };
                         *scroll = (start_scroll + (position.y as f32 - start_y) * k).max(0.0);
+                        v.settings_sync_logs_follow();
                     }
                 }
                 self.request_redraw();
@@ -910,6 +929,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 | Hit::RadiusUp | Hit::RadiusDown | Hit::ColorPrev(_)
                                 | Hit::ColorNext(_) | Hit::ResetAppearance | Hit::CancelAdd
                                 | Hit::ClearField(_)
+                                | Hit::CopyLogs | Hit::ClearLogs
                                 | Hit::StripLeft | Hit::StripRight | Hit::JoinPlace(_) => {
                                     self.handle_button(released_hit);
                                 }
@@ -939,7 +959,10 @@ impl ApplicationHandler<UserEvent> for App {
                             (MenuTab::Home, _, _) => v.places_scroll = (v.places_scroll - amount).max(0.0),
                             (MenuTab::Friends, FriendPane::Requests, _) => v.requests_scroll = (v.requests_scroll - amount).max(0.0),
                             (MenuTab::Friends, FriendPane::Search, _) => v.add_scroll = (v.add_scroll - amount).max(0.0),
-                            (MenuTab::Settings, _, _) => v.settings_scroll = (v.settings_scroll - amount).max(0.0),
+                            (MenuTab::Settings, _, _) => {
+                                v.settings_scroll = (v.settings_scroll - amount).max(0.0);
+                                v.settings_sync_logs_follow();
+                            }
                         }
                     }
                     self.request_redraw();
@@ -1110,10 +1133,14 @@ impl App {
                     let max = v.add_metrics.as_ref().map(|m| (m.content_h - m.h).max(0.0)).unwrap_or(0.0);
                     v.add_scroll = (v.add_scroll + d).min(max);
                 }
-                (MenuTab::Settings, _, _, Hit::ScrollUp) => v.settings_scroll = (v.settings_scroll - d).max(0.0),
+                (MenuTab::Settings, _, _, Hit::ScrollUp) => {
+                    v.settings_scroll = (v.settings_scroll - d).max(0.0);
+                    v.settings_sync_logs_follow();
+                }
                 (MenuTab::Settings, _, _, Hit::ScrollDown) => {
                     let max = v.settings_metrics.as_ref().map(|m| (m.content_h - m.h).max(0.0)).unwrap_or(0.0);
                     v.settings_scroll = (v.settings_scroll + d).min(max);
+                    v.settings_sync_logs_follow();
                 }
                 (_, _, _, Hit::StripLeft) => {
                     let d = 3.0 * (theme::STRIP_CARD_W + 8.0) * self.scale;
@@ -1272,10 +1299,40 @@ impl App {
             }
             Hit::SettingsTab(i) => {
                 if let Screen::Menu(v) = &mut self.screen {
-                    v.settings.tab = if i == 1 { SettingsTab::Appearance } else { SettingsTab::General };
+                    v.settings.tab = match i {
+                        1 => SettingsTab::Appearance,
+                        2 => SettingsTab::Logs,
+                        _ => SettingsTab::General,
+                    };
+                    // The Logs pane opens pinned to the newest line.
+                    v.settings.logs_follow = v.settings.tab == SettingsTab::Logs;
                     v.settings_scroll = 0.0;
                 }
                 self.focus = None;
+                self.needs_redraw = true;
+            }
+            Hit::CopyLogs => {
+                let text = crate::logs::text();
+                let n = crate::logs::len();
+                let ok = self.copy_text_to_clipboard(&text);
+                if let Screen::Menu(v) = &mut self.screen {
+                    v.notice = Some((
+                        if ok {
+                            format!("Logs copied to the clipboard ({} lines)", n)
+                        } else {
+                            "Could not access the clipboard".into()
+                        },
+                        Instant::now() + Duration::from_secs(4),
+                    ));
+                }
+                self.needs_redraw = true;
+            }
+            Hit::ClearLogs => {
+                crate::logs::clear();
+                if let Screen::Menu(v) = &mut self.screen {
+                    v.settings.logs_follow = true;
+                    v.settings_scroll = 0.0;
+                }
                 self.needs_redraw = true;
             }
             Hit::RadiusUp | Hit::RadiusDown => {
