@@ -575,10 +575,10 @@ fn draw_home(v: &mut MenuView, ctx: &mut UiCtx, fb: &mut FB, x: i32, w: i32, h: 
     let status_h = (theme::STATUSBAR_H * s) as i32;
     let mut y = (14.0 * s) as i32;
 
-    // -- Places search row (field + button) --
+    // -- Places search row (fixed above the scroll area) --
     let field_h = (34.0 * s) as i32;
     let btn_w = (92.0 * s) as i32;
-    let field_w = (w - 2 * pad - btn_w - (10.0 * s) as i32).min((560.0 * s) as i32);
+    let field_w = (w - 2 * pad - btn_w - (10.0 * s) as i32).max((120.0 * s) as i32).min((560.0 * s) as i32);
     v.search.draw(ctx, fb, x + pad, y, field_w, field_h, FieldId::Search, None);
     let btn_rect = draw_button(
         ctx, fb,
@@ -596,31 +596,22 @@ fn draw_home(v: &mut MenuView, ctx: &mut UiCtx, fb: &mut FB, x: i32, w: i32, h: 
     }
     y += field_h + (16.0 * s) as i32;
 
-    // -- Friends section --
-    font::draw(ctx.fonts, fb, x as f32 + pad as f32, y as f32 + 11.0 * s, "Friends", 15.0 * s, t.text, true, 0.0);
-    let online = v.rows.iter().filter(|r| r.presence.kind != PresenceKind::Offline && r.presence.kind != PresenceKind::Invisible).count();
-    let ingame = v.rows.iter().filter(|r| r.presence.kind == PresenceKind::InGame).count();
-    let summary = format!("{} online \u{b7} {} in game \u{b7} {} friends", online, ingame, v.rows.len());
-    let sum_w = font::measure(ctx.fonts, &summary, 11.5 * s, false);
-    font::draw(
-        ctx.fonts, fb, (x + w - pad) as f32 - sum_w, y as f32 + 11.5 * s * 0.35 + 4.0 * s,
-        &summary, 11.5 * s, t.text_dim, false, 0.0,
-    );
-    y += (26.0 * s) as i32;
-
-    let strip_h = (theme::STRIP_H * s) as i32;
-    draw_friends_strip(v, ctx, fb, x + pad, y, w - 2 * pad, strip_h);
-    y += strip_h + (14.0 * s) as i32;
-
-    // -- Sectioned places content (fills the rest of the screen) --
+    // -- Everything below — the friends strip AND the place sections —
+    // scrolls as one page: swiping the places list carries the friends
+    // strip away with it (and back, when scrolled up again).
     draw_home_content(v, ctx, fb, x + pad, y, w - 2 * pad, h - status_h - (8.0 * s) as i32 - y);
 }
 
-/// One entry of the scrolling Home content: a section header or a place card.
-/// Owned data (cards cloned) so the layout pass can freely update the view's
-/// scroll metrics while iterating.
+/// One entry of the scrolling Home content: the friends strip, a section
+/// header, an inline status message or a place card. Owned data (cards
+/// cloned) so the layout pass can freely update the view's scroll metrics
+/// while iterating.
 enum HomeItem {
+    /// "Friends" title + summary + horizontal strip (scrolls with the page).
+    Friends,
     Header(String),
+    /// Centered status message (loading / error / empty feed states).
+    Message { text: String, spin: bool },
     Card(PlaceCard),
 }
 
@@ -631,31 +622,37 @@ fn draw_home_content(v: &mut MenuView, ctx: &mut UiCtx, fb: &mut FB, x: i32, y: 
         return;
     }
 
-    // Build the item list: search results, or recently played + recommended.
+    let gap = (14.0 * s) as i32;
+    let friends_h = (26.0 * s) as f32 + (theme::STRIP_H * s);
+
+    // Build the item list: the friends section always leads; after it come
+    // search results, or recently played + recommended, or a status message.
     let query = v.search.value.trim().to_string();
-    let mut items: Vec<HomeItem> = Vec::new();
+    let mut items: Vec<HomeItem> = vec![HomeItem::Friends];
+    let mut have_sections = false;
     if query.is_empty() {
         if !v.recent.is_empty() {
             items.push(HomeItem::Header("Recently played".into()));
             for card in &v.recent {
                 items.push(HomeItem::Card(card.clone()));
             }
+            have_sections = true;
         }
         if v.app_settings.show_recommendations && !v.places.is_empty() {
             items.push(HomeItem::Header("Recommended for you".into()));
             for card in &v.places {
                 items.push(HomeItem::Card(card.clone()));
             }
+            have_sections = true;
         }
     } else if !v.places.is_empty() {
         items.push(HomeItem::Header("Results".into()));
         for card in &v.places {
             items.push(HomeItem::Card(card.clone()));
         }
+        have_sections = true;
     }
-
-    // Empty / loading / error states instead of the list.
-    if items.is_empty() {
+    if !have_sections {
         let (msg, spin): (String, bool) = if v.places_searching {
             ("Loading places\u{2026}".into(), true)
         } else if let Some(err) = &v.places_error {
@@ -669,28 +666,16 @@ fn draw_home_content(v: &mut MenuView, ctx: &mut UiCtx, fb: &mut FB, x: i32, y: 
         } else {
             ("No recommendations right now".into(), false)
         };
-        let mw = font::measure(ctx.fonts, &msg, 14.0 * s, false);
-        font::draw(
-            ctx.fonts, fb, x as f32 + w as f32 / 2.0 - mw / 2.0, y as f32 + h as f32 / 2.0,
-            &msg, 14.0 * s, t.text_faint, false, 0.0,
-        );
-        if spin {
-            ui::draw_spinner(
-                fb, x as f32 + w as f32 / 2.0 - mw / 2.0 - 18.0 * s, y as f32 + h as f32 / 2.0 - 5.0 * s,
-                7.0 * s, ctx.now_ms, t.accent, s,
-            );
-        }
-        v.places_metrics = None;
-        return;
+        items.push(HomeItem::Message { text: msg, spin });
     }
 
     let scroll_w = (theme::SCROLL_W * s) as i32;
     let grid_w = w - scroll_w - (4.0 * s) as i32;
-    let card_w = (theme::PLACE_CARD_W * s) as i32;
-    let gap = (14.0 * s) as i32;
+    let card_w = ((theme::PLACE_CARD_W * s) as i32).min(grid_w);
     let cols = (((grid_w + gap) / (card_w + gap)).max(1)) as usize;
     let card_h = card_w + (88.0 * s) as i32;
     let header_h = (26.0 * s) as i32;
+    let msg_h = (h as f32 - friends_h - gap as f32).max(120.0 * s);
 
     // Layout pass: y offset for every item + total content height.
     let mut offsets: Vec<f32> = Vec::with_capacity(items.len());
@@ -699,6 +684,14 @@ fn draw_home_content(v: &mut MenuView, ctx: &mut UiCtx, fb: &mut FB, x: i32, y: 
     for it in &items {
         offsets.push(yy);
         match it {
+            HomeItem::Friends => {
+                yy += friends_h + gap as f32;
+                col = 0;
+            }
+            HomeItem::Message { .. } => {
+                yy += msg_h + gap as f32;
+                col = 0;
+            }
             HomeItem::Header(_) => {
                 yy += (header_h + gap) as f32;
                 col = 0;
@@ -717,7 +710,7 @@ fn draw_home_content(v: &mut MenuView, ctx: &mut UiCtx, fb: &mut FB, x: i32, y: 
     v.places_scroll = clamp_scroll(v.places_scroll, content_h, h as f32);
     v.places_metrics = Some(ListMetrics { top: y as f32, h: h as f32, content_h });
 
-    let clip = crate::draw::Clip { x0: x, y0: y, x1: x + grid_w, y1: y + h };
+    let clip = crate::draw::Clip { x0: x, y0: y, x1: x + w, y1: y + h };
     let old_clip = fb.clip();
     fb.set_clip(clip);
     for (i, it) in items.iter().enumerate() {
@@ -726,6 +719,42 @@ fn draw_home_content(v: &mut MenuView, ctx: &mut UiCtx, fb: &mut FB, x: i32, y: 
             break;
         }
         match it {
+            HomeItem::Friends => {
+                // Fully scrolled out of view: forget the strip rect so
+                // wheel/drag routing never targets an off-screen strip.
+                if iy + friends_h < y as f32 {
+                    v.strip_rect = None;
+                    continue;
+                }
+                font::draw(ctx.fonts, fb, x as f32, iy + 11.0 * s, "Friends", 15.0 * s, t.text, true, 0.0);
+                let online = v.rows.iter().filter(|r| r.presence.kind != PresenceKind::Offline && r.presence.kind != PresenceKind::Invisible).count();
+                let ingame = v.rows.iter().filter(|r| r.presence.kind == PresenceKind::InGame).count();
+                let summary = format!("{} online \u{b7} {} in game \u{b7} {} friends", online, ingame, v.rows.len());
+                let sum_w = font::measure(ctx.fonts, &summary, 11.5 * s, false);
+                font::draw(
+                    ctx.fonts, fb, (x + w) as f32 - sum_w, iy + 11.5 * s * 0.35 + 4.0 * s,
+                    &summary, 11.5 * s, t.text_dim, false, 0.0,
+                );
+                let strip_y = (iy + 26.0 * s) as i32;
+                draw_friends_strip(v, ctx, fb, x, strip_y, w, (theme::STRIP_H * s) as i32);
+            }
+            HomeItem::Message { text, spin } => {
+                if iy + msg_h < y as f32 {
+                    continue;
+                }
+                let mw = font::measure(ctx.fonts, text, 14.0 * s, false);
+                let my = iy + msg_h * 0.5;
+                font::draw(
+                    ctx.fonts, fb, x as f32 + w as f32 / 2.0 - mw / 2.0, my,
+                    text, 14.0 * s, t.text_faint, false, 0.0,
+                );
+                if *spin {
+                    ui::draw_spinner(
+                        fb, x as f32 + w as f32 / 2.0 - mw / 2.0 - 18.0 * s, my - 5.0 * s,
+                        7.0 * s, ctx.now_ms, t.accent, s,
+                    );
+                }
+            }
             HomeItem::Header(text) => {
                 if iy + (header_h as f32) < y as f32 {
                     continue;
@@ -760,7 +789,7 @@ fn col_of(items: &[HomeItem], i: usize) -> usize {
     let mut col = 0usize;
     for it in items.iter().take(i) {
         match it {
-            HomeItem::Header(_) => col = 0,
+            HomeItem::Header(_) | HomeItem::Friends | HomeItem::Message { .. } => col = 0,
             HomeItem::Card(_) => col += 1,
         }
     }
@@ -794,12 +823,13 @@ fn draw_friends_strip(v: &mut MenuView, ctx: &mut UiCtx, fb: &mut FB, x: i32, y:
         return;
     }
 
-    let card_w = (theme::STRIP_CARD_W * s) as i32;
-    let gap = (8.0 * s) as i32;
     let arrow_w = (26.0 * s) as i32;
     let inset = (6.0 * s) as i32;
-    let content_w = v.rows.len() as f32 * (card_w + gap) as f32;
     let view_w = (w - 2 * arrow_w - 2 * inset) as f32;
+    // Card width scales with the theme but never overflows the strip view.
+    let card_w = ((theme::STRIP_CARD_W * s) as i32).min(view_w as i32).max(1);
+    let gap = (8.0 * s) as i32;
+    let content_w = v.rows.len() as f32 * (card_w + gap) as f32;
     v.strip_scroll = clamp_scroll(v.strip_scroll, content_w, view_w);
     v.strip_metrics = Some(ListMetrics { top: x as f32, h: view_w, content_h: content_w });
     let scrollable = content_w > view_w + 0.5;
@@ -991,9 +1021,9 @@ fn draw_friends(v: &mut MenuView, ctx: &mut UiCtx, fb: &mut FB, x: i32, w: i32, 
     );
     fb.hline(x, header_h, w, [0x1E, 0x20, 0x22, 0xFF]);
 
-    // Pane tabs.
+    // Pane tabs (share the row; never overflow narrow screens).
     let tab_h = (32.0 * s) as i32;
-    let tw = (200.0 * s) as i32;
+    let tw = (((w - 2 * pad) as f32 - (8.0 * s)) / 2.0).min(200.0 * s) as i32;
     draw_seg_tab(ctx, fb, Rect { x: x + pad, y: header_h + (tabs_h - tab_h) / 2, w: tw, h: tab_h }, "Requests", v.friend_pane == FriendPane::Requests, Hit::TabRequests);
     draw_seg_tab(ctx, fb, Rect { x: x + pad + tw + (8.0 * s) as i32, y: header_h + (tabs_h - tab_h) / 2, w: tw, h: tab_h }, "Find friends", v.friend_pane == FriendPane::Search, Hit::TabSearch);
 
@@ -1306,7 +1336,7 @@ fn draw_settings(v: &mut MenuView, ctx: &mut UiCtx, fb: &mut FB, x: i32, w: i32,
     fb.hline(x, header_h, w, [0x1E, 0x20, 0x22, 0xFF]);
 
     let tab_h = (32.0 * s) as i32;
-    let tw = (150.0 * s) as i32;
+    let tw = (((w - 2 * pad) as f32 - (8.0 * s)) / 2.0).min(150.0 * s) as i32;
     draw_seg_tab(ctx, fb, Rect { x: x + pad, y: header_h + (tabs_h - tab_h) / 2, w: tw, h: tab_h }, "General", v.settings.tab == SettingsTab::General, Hit::SettingsTab(0));
     draw_seg_tab(ctx, fb, Rect { x: x + pad + tw + (8.0 * s) as i32, y: header_h + (tabs_h - tab_h) / 2, w: tw, h: tab_h }, "Appearance", v.settings.tab == SettingsTab::Appearance, Hit::SettingsTab(1));
 
@@ -1491,7 +1521,7 @@ fn draw_appearance(ctx: &mut UiCtx, fb: &mut FB, x: i32, y: &mut f32, w: f32, s:
         let sw = (26.0 * s) as i32;
         let sh = (22.0 * s) as i32;
         let row_cy = *y + 17.0 * s;
-        font::draw(ctx.fonts, fb, x as f32, row_cy + 4.0 * s, label, 12.5 * s, t.text_dim, false, w - (150.0 * s));
+        font::draw(ctx.fonts, fb, x as f32, row_cy + 4.0 * s, label, 12.5 * s, t.text_dim, false, 0.0);
         let chip_x = (x as f32 + w - (58.0 * s)) as i32;
         // Prev / next arrows around the swatch.
         let aw = (18.0 * s) as i32;

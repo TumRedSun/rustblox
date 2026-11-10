@@ -59,10 +59,21 @@ impl LoginView {
 /// account: shows a hint and a Back button that returns to the running app
 /// without touching the current session.
 pub fn draw(v: &mut LoginView, ctx: &mut UiCtx, fb: &mut FB, restoring: bool, adding: bool) {
-    let s = ctx.scale;
     let t = theme::cur();
     let w = fb.w;
     let h = fb.h;
+
+    // Adaptive scale: every login widget shares one scale that always fits
+    // the current window. On narrow phone screens the card shrinks
+    // proportionally instead of being clipped at both edges; desktop is
+    // unaffected (its scale already fits).
+    let real_scale = ctx.scale;
+    ctx.scale = ctx
+        .scale
+        .min(w as f32 / 500.0)
+        .min(h as f32 / 560.0)
+        .max(1.0);
+    let s = ctx.scale;
 
     // Restoring banner: full-screen dim + centered card.
     if restoring {
@@ -77,6 +88,7 @@ pub fn draw(v: &mut LoginView, ctx: &mut UiCtx, fb: &mut FB, restoring: bool, ad
             ctx.fonts, fb, w as f32 / 2.0 - 20.0 * s, cy as f32 + card_h as f32 / 2.0 + 5.0 * s,
             "Restoring saved session\u{2026}", 14.0 * s, t.text_dim, false, 0.0,
         );
+        ctx.scale = real_scale;
         return;
     }
 
@@ -183,6 +195,7 @@ pub fn draw(v: &mut LoginView, ctx: &mut UiCtx, fb: &mut FB, restoring: bool, ad
     }
 
     draw_footer(ctx, fb, w, h);
+    ctx.scale = real_scale;
 }
 
 fn draw_two_step(v: &mut LoginView, ctx: &mut UiCtx, fb: &mut FB, x: i32, y: &mut i32, inner_w: i32, card_y: i32, content_h: i32) {

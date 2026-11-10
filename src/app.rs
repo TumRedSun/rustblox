@@ -52,8 +52,6 @@ pub struct UiCtx<'a> {
     pub focus: Option<FieldId>,
     pub scale: f32,
     pub now_ms: u64,
-    /// Set by a text field when a caret was visible (schedules blink redraw).
-    pub caret_anim: bool,
     pub avatars: &'a mut HashMap<u64, Arc<Vec<u8>>>,
     /// Decoded square game icons keyed by root place id.
     pub icons: &'a mut HashMap<u64, Arc<Vec<u8>>>,
@@ -157,7 +155,6 @@ impl App {
                         focus: self.focus,
                         scale: self.scale,
                         now_ms,
-                        caret_anim: false,
                         avatars: &mut self.avatars,
                         icons: &mut self.place_icons,
                     };
@@ -171,7 +168,6 @@ impl App {
                         focus: self.focus,
                         scale: self.scale,
                         now_ms,
-                        caret_anim: false,
                         avatars: &mut self.avatars,
                         icons: &mut self.place_icons,
                     };
@@ -183,7 +179,7 @@ impl App {
         self.pixels = Some(px);
     }
 
-    /// Earliest future redraw needed for animations (spinner, caret, countdown).
+    /// Earliest future redraw needed for animations (spinner, countdown).
     fn schedule_anim(&mut self) -> Option<Instant> {
         let now = Instant::now();
         let mut wakes: Vec<Instant> = Vec::with_capacity(3);
@@ -196,9 +192,6 @@ impl App {
         };
         if spinner {
             wakes.push(now + Duration::from_millis(90));
-        }
-        if self.focus.is_some() {
-            wakes.push(now + Duration::from_millis(530));
         }
         if matches!(self.screen, Screen::Menu(_)) {
             wakes.push(now + Duration::from_millis(1000));
@@ -600,6 +593,8 @@ impl ApplicationHandler<UserEvent> for App {
             .with_inner_size(winit::dpi::LogicalSize::new(WINDOW_W, WINDOW_H))
             .with_min_inner_size(winit::dpi::LogicalSize::new(880.0, 600.0))
             .with_window_level(WindowLevel::Normal);
+        // Launch straight into borderless fullscreen.
+        let attrs = attrs.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
         let window = Arc::new(elwt.create_window(attrs).expect("create window"));
         let size = window.inner_size();
         self.scale = window.scale_factor() as f32;

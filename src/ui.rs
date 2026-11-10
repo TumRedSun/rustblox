@@ -335,14 +335,14 @@ impl TextField {
 
         let shown = if self.masked { font::masked_str(ctx.fonts, &self.value) } else { self.value.clone() };
 
-        // Horizontal scrolling: keep the caret visible.
-        let caret_x_rel = font::measure_prefix(ctx.fonts, &shown, self.cursor, font_px, false);
+        // Horizontal scrolling: keep the cursor position in view.
+        let cursor_x_rel = font::measure_prefix(ctx.fonts, &shown, self.cursor, font_px, false);
         let text_w = font::measure(ctx.fonts, &shown, font_px, false);
-        if caret_x_rel - self.scroll > inner_w as f32 - 14.0 * s {
-            self.scroll = caret_x_rel - inner_w as f32 + 14.0 * s;
+        if cursor_x_rel - self.scroll > inner_w as f32 - 14.0 * s {
+            self.scroll = cursor_x_rel - inner_w as f32 + 14.0 * s;
         }
-        if caret_x_rel - self.scroll < 0.0 {
-            self.scroll = (caret_x_rel - 14.0 * s).max(0.0);
+        if cursor_x_rel - self.scroll < 0.0 {
+            self.scroll = (cursor_x_rel - 14.0 * s).max(0.0);
         }
         if text_w < self.scroll {
             self.scroll = (text_w - inner_w as f32).max(0.0);
@@ -384,21 +384,10 @@ impl TextField {
                 false,
                 0.0,
             );
-            // Caret.
-            if focused {
-                let cx = inner_x as f32 + caret_x_rel - self.scroll;
-                let blink_on = (ctx.now_ms / 530) % 2 == 0;
-                if blink_on {
-                    fb.rect(
-                        cx as i32,
-                        y + (7.0 * s) as i32,
-                        (2.0 * s).max(1.0) as i32,
-                        h - (14.0 * s) as i32,
-                        t.accent,
-                    );
-                }
-                ctx.caret_anim = true;
-            }
+            // No blinking caret: focus is already shown by the accent
+            // underline above, and the software caret rendered at the wrong
+            // spot on touch devices. Cursor positioning (scroll) still uses
+            // `cursor_x_rel` so long values stay in view while typing.
         }
         fb.set_clip(old_clip);
 
