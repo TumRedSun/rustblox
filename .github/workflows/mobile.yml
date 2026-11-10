@@ -202,7 +202,9 @@ jobs:
           gh release create mobile --target "${GITHUB_SHA}" \
             --title "Mobile build (${DATE})" --notes "$NOTES"
           # Keep the "Latest" badge on the desktop nightly release; this one
-          # stays a normal, clickable release right below it.
-          gh release edit mobile --latest=false
+          # stays a normal, clickable release right below it. gh bool flags
+          # are unreliable here, so patch the API directly.
+          MOBILE_RID=$(gh api "repos/${GH_REPO}/releases/tags/mobile" --jq .id)
+          gh api -X PATCH "repos/${GH_REPO}/releases/${MOBILE_RID}" -f make_latest=false > /dev/null
           gh release upload mobile artifacts/* --clobber
           echo "Mobile release refreshed for ${DATE}."
