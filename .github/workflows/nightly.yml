@@ -16,6 +16,8 @@ on:
 
 permissions:
   contents: write
+  # Needed to dispatch mobile.yml at the end of the nightly run.
+  actions: write
 
 env:
   CARGO_TERM_COLOR: always
