@@ -39,6 +39,9 @@ pub fn run_ios() {
         // Fullscreen is handled declaratively via Info.plist
         // (UIStatusBarHidden + UIViewControllerBasedStatusBarAppearance).
         window_ready: None,
+        // iOS sandboxes the app (HOME points inside the bundle), so the
+        // dirs-based config dir fallback works — no hook needed.
+        app_data_dir: None,
     });
     rustblox::run_desktop();
 }
