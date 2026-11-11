@@ -177,3 +177,20 @@ fn clear(env: &mut JNIEnv) {
 pub fn app_data_dir() -> Option<std::path::PathBuf> {
     crate::APP.get().and_then(|app| app.internal_data_path())
 }
+
+/// Register the log mirror in the app's *external* files dir
+/// (`/storage/emulated/0/Android/data/<package>/files/rustblox/logs/`).
+///
+/// The primary log lives in app-private storage (see [`app_data_dir`]),
+/// which stock Android does not let the user open without root or adb.
+/// The external dir is writable by the app unconditionally and reachable
+/// from a file manager (Android ≤ 10) or USB from a PC — so a crash log
+/// can leave the device even without root. Best effort: if the shared
+/// storage is unmounted or restricted, the mirror silently stays absent
+/// and the in-app Settings → Logs + internal file still work.
+pub fn register_log_mirror() {
+    let Some(path) = crate::APP.get().and_then(|app| app.external_data_path()) else {
+        return;
+    };
+    rustblox::logs::add_mirror_file(&path.join("rustblox").join("logs").join("client.log"));
+}

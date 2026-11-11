@@ -32,6 +32,18 @@ use crate::net::UserEvent;
 /// crate in `mobile/`) configure the event loop however their platform
 /// requires and then delegate here.
 pub fn run_with(event_loop: winit::event_loop::EventLoop<UserEvent>, session: Option<Session>) {
+    // Crash-proofing first: the panic hook + persistent log file must be up
+    // before any other subsystem can panic. On Android this resolves the
+    // app-private data dir (the APP handle is set by the harness before it
+    // calls us), on desktop the regular config dir.
+    logs::install_panic_hook();
+    logs::init_file();
+    if let Some(p) = logs::log_file_path() {
+        logs::push("app", &format!("log file: {}", p.display()));
+    }
+    // Make a crash from the previous session visible in Settings → Logs.
+    logs::load_previous_crash();
+
     let proxy = event_loop.create_proxy();
     let worker = net::spawn(proxy, session.clone());
     let mut app = app::App::new(worker.tx, session.is_some());
@@ -45,6 +57,11 @@ pub fn run_with(event_loop: winit::event_loop::EventLoop<UserEvent>, session: Op
 /// Used by the desktop binary and by the iOS harness — winit's iOS backend
 /// needs no extra platform handle.
 pub fn run_desktop() {
+    // Crash-proofing from the very first line — event loop construction and
+    // config loading below can panic too. run_with re-calls both; they are
+    // idempotent. (The iOS harness enters through here as well.)
+    logs::install_panic_hook();
+    logs::init_file();
     let session = config::load_session();
     let event_loop = winit::event_loop::EventLoop::<UserEvent>::with_user_event()
         .build()

@@ -52,6 +52,10 @@ fn android_main(app: android_activity::AndroidApp) {
     use winit::platform::android::EventLoopBuilderExtAndroid;
 
     let _ = APP.set(app.clone());
+    // Mirror the persistent log into the external files dir before anything
+    // else runs, so a crash log can be pulled off the device without root
+    // (see docs/MOBILE.md → Logging & crash reports).
+    android_ui::register_log_mirror();
     rustblox::platform::register_platform_hooks(rustblox::platform::PlatformHooks {
         clipboard_get: Some(android_clip::get),
         clipboard_set: Some(android_clip::set),
@@ -68,6 +72,11 @@ fn android_main(app: android_activity::AndroidApp) {
         // App-private storage dir — sessions/settings survive restarts.
         app_data_dir: Some(android_ui::app_data_dir),
     });
+    // Crash-proofing before the event loop is built (its `.expect` can
+    // panic on exotic devices): panic hook + persistent log file. run_with
+    // re-calls both; they are idempotent.
+    rustblox::logs::install_panic_hook();
+    rustblox::logs::init_file();
     // Best-effort early apply (the window exists before the surface does);
     // the resumed hook re-applies it on every lifecycle change.
     android_ui::enter_immersive_mode();

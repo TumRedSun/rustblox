@@ -81,6 +81,38 @@ wrapped into `Payload/RustBlox.app` (Info.plist, PkgInfo, icons). The result
 is an unsigned .ipa — Apple requires signing for device installation, so
 re-sign it with AltStore, Sideloadly or a personal provisioning profile.
 
+## Logging & crash reports
+
+Everything the client logs (network worker, join flow, game session, UI)
+goes to three places at once:
+
+1. **In-memory ring buffer** — visible live in *Settings → Logs*; the
+   *Copy logs* button hands the whole buffer to the system clipboard (the
+   way to report a problem without any file access at all).
+2. **Persistent log file** — survives crashes and restarts, flushed per
+   line. Location:
+   - Android (app-private, root/adb only):
+     `/data/data/com.tumredsun.rustblox/files/rustblox/logs/client.log`
+   - Android mirror (external files dir, reachable from a file manager on
+     Android ≤ 10 or over USB):
+     `/storage/emulated/0/Android/data/com.tumredsun.rustblox/files/rustblox/logs/client.log`
+   - Desktop: `<config dir>/rustblox/logs/client.log`
+     (`~/.config/rustblox/logs/client.log` on Linux,
+     `%APPDATA%\rustblox\logs\client.log` on Windows)
+3. **Clipboard on demand** — *Settings → Logs → Copy logs*.
+
+Every Rust panic is stamped into the log file by a panic hook (thread,
+message, `file:line`) followed by the last 40 buffered lines, so a crash
+keeps its diagnostics. On the next launch the client rescans the log file
+and shows `previous session crashed! …` with the recovered panic lines at
+the top of *Settings → Logs* — that is how a crash on a phone with no PC
+and no root gets reported: reproduce it, relaunch, *Copy logs*, paste.
+
+Files rotate at 1 MiB (`client.log` → `client.prev.log`). Note that a hard
+native abort (SIGSEGV in driver/JNI code, OOM kill) cannot run Rust code;
+everything logged *before* the abort is still in the file, and with adb
+connected the abort itself is visible via `adb logcat`.
+
 ## Known limitations
 
 - **Android soft keyboard text**: winit 0.30's Android backend drops
