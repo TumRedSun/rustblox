@@ -14,6 +14,11 @@ use std::io::Read;
 use std::time::Duration;
 
 pub const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 RustBlox/0.1.0";
+/// The User-Agent the official game client sends to gamejoin.roblox.com
+/// ("WinInet" = the Windows HTTP stack the client uses). The join service
+/// refuses browser-shaped requests with status 12 even when the session is
+/// valid, so game-join traffic must present this identity.
+pub const CLIENT_UA: &str = "Roblox/WinInet";
 
 pub const AUTH_BASE: &str = "https://auth.roblox.com";
 pub const USERS_BASE: &str = "https://users.roblox.com";
@@ -30,9 +35,23 @@ pub struct RawResponse {
     pub body: Vec<u8>,
     pub csrf: Option<String>,
     pub set_cookies: Vec<String>,
+    /// Every response header as (name, value) pairs — needed for endpoints
+    /// that deliver results in headers (the authentication ticket arrives in
+    /// `rbx-authentication-ticket`, not in the body).
+    pub headers: Vec<(String, String)>,
 }
 
 impl RawResponse {
+    /// Case-insensitive single-value header lookup (HTTP header names are
+    /// case-insensitive; servers emit both `RBX-Authentication-Ticket` and
+    /// `rbx-authentication-ticket`).
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
     pub fn header_cookies_find(&self, name: &str) -> Option<String> {
         for c in &self.set_cookies {
             let prefix = format!("{}=", name);
@@ -292,9 +311,39 @@ fn into_raw(resp: ureq::Response) -> RawResponse {
         .into_iter()
         .map(|s| s.to_string())
         .collect();
+    // Capture the full header set BEFORE the response is moved into the
+    // body reader.
+    let headers: Vec<(String, String)> = resp
+        .headers_names()
+        .into_iter()
+        .filter_map(|name| resp.header(&name).map(|v| (name, v.to_string())))
+        .collect();
     let mut body = Vec::new();
     let _ = resp.into_reader().take(4 * 1024 * 1024).read_to_end(&mut body);
-    RawResponse { status, body, csrf, set_cookies }
+    RawResponse { status, body, csrf, set_cookies, headers }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_header_lookup_is_case_insensitive() {
+        let raw = RawResponse {
+            status: 200,
+            body: b"{}".to_vec(),
+            csrf: None,
+            set_cookies: Vec::new(),
+            headers: vec![
+                ("content-type".to_string(), "application/json".to_string()),
+                ("RBX-Authentication-Ticket".to_string(), "TICKET".to_string()),
+            ],
+        };
+        assert_eq!(raw.header("rbx-authentication-ticket"), Some("TICKET"));
+        assert_eq!(raw.header("RBX-AUTHENTICATION-TICKET"), Some("TICKET"));
+        assert_eq!(raw.header("content-TYPE"), Some("application/json"));
+        assert_eq!(raw.header("missing"), None);
+    }
 }
 
 /// Normalize a pasted `.ROBLOSECURITY` value: accepts the bare token, a full
