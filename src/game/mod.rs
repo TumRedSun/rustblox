@@ -136,33 +136,44 @@ fn game_thread(
     // UDMUX proxy on the SAME port instead. Resolve that proxy up front and
     // log every decision so a failed join is diagnosable from the log alone.
     let mut dial = resp.ip.clone();
-    match resp.ip.parse::<std::net::Ipv4Addr>() {
-        Ok(ip) if crate::roblox::udmux::is_private(ip) => {
-            match crate::roblox::udmux::proxy_for(ip) {
-                Some(proxy) => {
-                    netlog!(
-                        net,
-                        "rcc {} is private — dialing udmux proxy {}:{} (same port)",
-                        ip,
-                        proxy,
-                        resp.port
-                    );
-                    dial = proxy.to_string();
-                }
-                None => {
-                    netlog!(
-                        net,
-                        "rcc {} is private and no udmux proxy is known for the 10.{}.x.x prefix \
-                         — direct dial will not leave the LAN (set RUSTBLOX_UDMUX=10.{}=<proxy-ip>)",
-                        ip,
-                        ip.octets()[1],
-                        ip.octets()[1]
-                    );
+    if !resp.udmux_host.is_empty() {
+        netlog!(
+            net,
+            "join script supplies udmux endpoint {} — dialing it (rcc {}:{})",
+            resp.udmux_host,
+            resp.ip,
+            resp.port
+        );
+        dial = resp.udmux_host.clone();
+    } else {
+        match resp.ip.parse::<std::net::Ipv4Addr>() {
+            Ok(ip) if crate::roblox::udmux::is_private(ip) => {
+                match crate::roblox::udmux::proxy_for(ip) {
+                    Some(proxy) => {
+                        netlog!(
+                            net,
+                            "rcc {} is private — dialing udmux proxy {}:{} (same port)",
+                            ip,
+                            proxy,
+                            resp.port
+                        );
+                        dial = proxy.to_string();
+                    }
+                    None => {
+                        netlog!(
+                            net,
+                            "rcc {} is private and no udmux proxy is known for the 10.{}.x.x prefix \
+                             — direct dial will not leave the LAN (set RUSTBLOX_UDMUX=10.{}=<proxy-ip>)",
+                            ip,
+                            ip.octets()[1],
+                            ip.octets()[1]
+                        );
+                    }
                 }
             }
+            Ok(_) => {}
+            Err(_) => netlog!(net, "rcc address {:?} is not an IPv4 literal", resp.ip),
         }
-        Ok(_) => {}
-        Err(_) => netlog!(net, "rcc address {:?} is not an IPv4 literal", resp.ip),
     }
     netlog!(game, "connecting to {} (rcc {}:{})", dial, resp.ip, resp.port);
     // RakNet handshake with several protocol version guesses (the Roblox

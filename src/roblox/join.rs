@@ -71,6 +71,17 @@ pub struct JoinResponse {
     /// v2 responses name the transport (e.g. "RakNet").
     #[serde(default, deserialize_with = "null_to_default", alias = "connection_type")]
     pub connection_type: String,
+    /// UDMUX proxy endpoint from the join script (`UdmuxEndpoints[0]`) when
+    /// Roblox supplies one — the real client dials THIS for private RCC
+    /// addresses, not a guessed proxy IP.
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub udmux_host: String,
+    /// Per-session udmux routing token (`TokenValue` / `UdmuxToken`) and its
+    /// pepper (`PepperId`). Carried for the handshake wrapper and diagnostics.
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub udmux_token: String,
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub udmux_pepper: u64,
 }
 
 impl JoinResponse {
@@ -393,6 +404,31 @@ fn join_request(
             resp.port = port;
         }
     }
+    // Udmux routing material straight from the join script — the real client
+    // wraps every RakNet packet with a token-derived header, so without these
+    // fields the proxy silently drops our handshake (observed 2026-11).
+    if let Some(js) = v.get("joinScript").and_then(|j| j.as_object()) {
+        let (host, token, pepper) = extract_udmux(js);
+        if let Some(h) = &host {
+            crate::netlog!(info, "join: udmux endpoint from join script: {}", h);
+            if resp.udmux_host.is_empty() {
+                resp.udmux_host = h.clone();
+                if resp.port == 0 {
+                    resp.port = h.rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(0);
+                }
+            }
+        }
+        if let Some(t) = &token {
+            crate::netlog!(info, "join: udmux token present ({} chars)", t.len());
+            if resp.udmux_token.is_empty() {
+                resp.udmux_token = t.clone();
+            }
+        }
+        if let Some(p) = pepper {
+            crate::netlog!(info, "join: udmux pepper {}", p);
+            resp.udmux_pepper = p;
+        }
+    }
     if resp.server_addr().is_none() {
         return Err(ApiError::Parse(format!(
             "server accepted the join but returned no server address (jobId {})",
@@ -410,43 +446,115 @@ fn join_request(
     Ok(resp)
 }
 
+/// Pull the udmux routing material out of a join-script JSON object:
+/// `UdmuxEndpoints[0].Address:Port`, the routing token (`TokenValue` or
+/// legacy `UdmuxToken`) and `PepperId`. All optional.
+fn extract_udmux(
+    js: &serde_json::Map<String, serde_json::Value>,
+) -> (Option<String>, Option<String>, Option<u64>) {
+    let mut host = None;
+    if let Some(ep) = first_endpoint_list(js.get("UdmuxEndpoints")) {
+        host = Some(if ep.1 > 0 { format!("{}:{}", ep.0, ep.1) } else { ep.0 });
+    }
+    let token = ["TokenValue", "UdmuxToken"]
+        .iter()
+        .find_map(|k| js.get(*k).and_then(|t| t.as_str()).map(str::to_string))
+        .filter(|t| !t.is_empty());
+    let pepper = js.get("PepperId").and_then(|p| p.as_u64());
+    (host, token, pepper)
+}
+
+/// Log name lists in chunks so the 240-char log-line clamp never eats the
+/// tail — the truncated key list is exactly what hid the udmux fields from us.
+fn log_name_chunks(prefix: &str, names: &[String]) {
+    if names.is_empty() {
+        return;
+    }
+    const PER_LINE: usize = 12;
+    let mut sorted = names.to_vec();
+    sorted.sort();
+    let lines: Vec<&[String]> = sorted.chunks(PER_LINE).collect();
+    for (i, chunk) in lines.iter().enumerate() {
+        crate::netlog!(info, "{}/{}: {}", prefix, lines.len(), chunk.join(", "));
+    }
+}
+
+/// Token-ish join fields are logged as lengths only — the values are bearer
+/// credentials, everything else (addresses, ports, booleans) is printable.
+fn is_secret_join_field(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    ["ticket", "token", "session", "cookie", "pubkey", "pepper", "security", "seed"]
+        .iter()
+        .any(|s| k.contains(s))
+}
+
+/// Presence + safe values for every field that matters to the connection
+/// layer, so one log shows exactly which endpoint dialect a join used.
+fn log_join_object_shape(obj: &serde_json::Map<String, serde_json::Value>) {
+    const INTERESTING: [&str; 22] = [
+        "MachineAddress", "ClientPort", "ServerPort", "ServerConnections",
+        "UdmuxEndpoints", "UdmuxToken", "TokenValue", "PepperId",
+        "DirectServerReturn", "DataCenterId", "NetStackConfig", "NetStackPort",
+        "NetStackTokenValue", "GameFqdn", "gameFqdn", "EphemeralEarlyPubKey",
+        "ClientPublicKeyData", "JobId", "GameId", "SeleniumTestMode",
+        "IsLocalDebugRcc", "JoinRequestType",
+    ];
+    for key in INTERESTING {
+        let Some(val) = obj.get(key) else { continue };
+        match val {
+            serde_json::Value::String(s) => {
+                if is_secret_join_field(key) || s.chars().count() > 60 {
+                    crate::netlog!(info, "join shape: {} = <str len {}>", key, s.len());
+                } else {
+                    crate::netlog!(info, "join shape: {} = {:?}", key, s);
+                }
+            }
+            serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+                crate::netlog!(info, "join shape: {} = {}", key, val);
+            }
+            other => crate::netlog!(info, "join shape: {} = {}", key, other),
+        }
+    }
+}
+
 /// Log the SHAPE of a join response — top-level keys plus the join script's
 /// field names (XML tags or JSON keys). Names only, never values: the script
 /// carries authentication tickets. This makes a failed join diagnosable from
 /// the log alone — if Roblox starts handing out a udmux proxy address (or any
 /// other endpoint dialect) the next log shows the exact field name to parse.
 fn dump_join_shape(v: &serde_json::Value) {
-    let mut top: Vec<&str> = v
+    let top: Vec<String> = v
         .as_object()
-        .map(|o| o.keys().map(|k| k.as_str()).collect())
+        .map(|o| o.keys().cloned().collect())
         .unwrap_or_default();
-    top.sort_unstable();
-    crate::netlog!(info, "join response fields: {}", top.join(", "));
+    log_name_chunks("join response fields", &top);
 
     let Some(js) = v.get("joinScript") else { return };
     if let Some(s) = js.as_str() {
         let trimmed = s.trim_start();
         if trimmed.starts_with('{') {
             if let Ok(jv) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                let mut keys: Vec<String> = jv
+                let keys: Vec<String> = jv
                     .as_object()
                     .map(|o| o.keys().cloned().collect())
                     .unwrap_or_default();
-                keys.sort();
-                crate::netlog!(info, "join script (json, {} bytes) keys: {}", s.len(), keys.join(", "));
+                log_name_chunks(&format!("join script (json, {} bytes) keys", s.len()), &keys);
+                if let Some(obj) = jv.as_object() {
+                    log_join_object_shape(obj);
+                }
                 return;
             }
         }
         let tags = xml_tag_names(s);
         if !tags.is_empty() {
-            crate::netlog!(info, "join script (xml, {} bytes) tags: {}", s.len(), tags.join(", "));
+            log_name_chunks(&format!("join script (xml, {} bytes) tags", s.len()), &tags);
         } else {
             crate::netlog!(info, "join script: {} bytes, no recognizable tags/keys", s.len());
         }
     } else if let Some(obj) = js.as_object() {
-        let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
-        keys.sort_unstable();
-        crate::netlog!(info, "join script (object) keys: {}", keys.join(", "));
+        let keys: Vec<String> = obj.keys().cloned().collect();
+        log_name_chunks("join script (object) keys", &keys);
+        log_join_object_shape(obj);
     }
 }
 
@@ -837,6 +945,40 @@ mod tests {
         )
         .unwrap();
         assert_eq!(extract_endpoint(&v4), None);
+    }
+
+    #[test]
+    fn extract_udmux_from_join_script_object() {
+        // Field set mirrored from a real TeamTest join script (devforum
+        // 4580722): UdmuxEndpoints + TokenValue + PepperId + DSR.
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"MachineAddress":"10.186.12.41","ServerPort":53928,"ClientPort":0,
+                "ServerConnections":[{"Address":"10.186.12.41","Port":53928}],
+                "UdmuxEndpoints":[{"Address":"128.116.48.33","Port":53928}],
+                "DirectServerReturn":true,"PepperId":1776353748,
+                "TokenValue":"SECRET-TOKEN","NetStackPort":54115,"NetStackTokenValue":""}"#,
+        )
+        .unwrap();
+        let js = v.as_object().unwrap();
+        let (host, token, pepper) = extract_udmux(js);
+        assert_eq!(host.as_deref(), Some("128.116.48.33:53928"));
+        assert_eq!(token.as_deref(), Some("SECRET-TOKEN"));
+        assert_eq!(pepper, Some(1776353748));
+        // Legacy token field name, no endpoints.
+        let v2: serde_json::Value = serde_json::from_str(
+            r#"{"UdmuxToken":"LEGACY","PepperId":7}"#,
+        )
+        .unwrap();
+        let (host2, token2, pepper2) = extract_udmux(v2.as_object().unwrap());
+        assert_eq!(host2, None);
+        assert_eq!(token2.as_deref(), Some("LEGACY"));
+        assert_eq!(pepper2, Some(7));
+        // Nothing at all.
+        let v3: serde_json::Value = serde_json::from_str(r#"{"UserId":1}"#).unwrap();
+        let (host3, token3, pepper3) = extract_udmux(v3.as_object().unwrap());
+        assert_eq!(host3, None);
+        assert_eq!(token3, None);
+        assert_eq!(pepper3, None);
     }
 
     #[test]
