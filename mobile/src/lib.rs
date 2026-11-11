@@ -42,6 +42,9 @@ pub fn run_ios() {
         // iOS sandboxes the app (HOME points inside the bundle), so the
         // dirs-based config dir fallback works — no hook needed.
         app_data_dir: None,
+        // The JNI MediaStore exporter is Android-only; iOS keeps the
+        // in-app Logs screen + clipboard path (no Downloads backend yet).
+        log_export: None,
     });
     rustblox::run_desktop();
 }

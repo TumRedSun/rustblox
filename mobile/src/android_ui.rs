@@ -301,12 +301,10 @@ fn export_via_mediastore(
         return false;
     }
     let Ok(arr) = env.byte_array_from_slice(data) else { return false };
-    let Ok(()) = env.call_method(
-        &out,
-        "write",
-        "([B)V",
-        &[JValue::Object(&arr)],
-    ) else {
+    if env
+        .call_method(&out, "write", "([B)V", &[JValue::Object(&arr)])
+        .is_err()
+    {
         return false;
     };
     // close() must run even if the write path already failed above. Local
