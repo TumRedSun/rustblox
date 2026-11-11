@@ -86,6 +86,24 @@ pub fn push(kind: &str, line: &str) {
     }
 }
 
+/// Like [`push`], but the FILE copy keeps the full unclamped text while the
+/// ring buffer still shows the truncated form. Use for error payloads that
+/// wgpu and friends make multi-KB: the UI cannot render them, but they are
+/// exactly what the Downloads export must preserve.
+pub fn push_unclamped(kind: &str, line: &str) {
+    let Ok(mut guard) = LOGS.lock() else { return };
+    let buf = guard.get_or_insert_with(|| VecDeque::with_capacity(CAP));
+    let stamped = stamp();
+    push_into(buf, &stamped, kind, line);
+    for part in line.lines() {
+        let part = part.trim_end();
+        if part.is_empty() {
+            continue;
+        }
+        file_write(&format!("{} [{}] {}\n", stamped, kind, part));
+    }
+}
+
 /// Path of the persistent log file (not created yet is fine).
 pub fn log_file_path() -> Option<PathBuf> {
     crate::config::app_dir().map(|d| d.join("logs").join("client.log"))
@@ -177,18 +195,101 @@ pub fn add_mirror_file(path: &std::path::Path) {
     }
 }
 
+/// Seconds since the UNIX epoch — compact unique suffix for export names
+/// (no chrono dependency).
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Collect the persistent log files (old + current; falls back to the
+/// in-memory ring when the files are unreadable).
+fn collect_log_text() -> Vec<u8> {
+    let Some(path) = log_file_path() else { return text().into_bytes() };
+    let Some(dir) = path.parent() else { return text().into_bytes() };
+    let mut out = Vec::new();
+    for name in ["client.prev.log", "client.log"] {
+        if let Ok(data) = std::fs::read_to_string(dir.join(name)) {
+            out.extend_from_slice(data.as_bytes());
+            if !data.ends_with('\n') {
+                out.push(b'\n');
+            }
+        }
+    }
+    if out.is_empty() {
+        return text().into_bytes();
+    }
+    out
+}
+
+/// Save the whole persistent log into the platform's Downloads location as
+/// `rustblox-client-<unix>.log`. Returns the export name on success.
+pub fn export_logs() -> Option<String> {
+    let name = format!("rustblox-client-{}.log", unix_secs());
+    if crate::platform::export_log(&name, &collect_log_text()) {
+        push("app", &format!("log exported to Downloads as {name}"));
+        Some(name)
+    } else {
+        push("app", "log export failed (no Downloads backend on this platform)");
+        None
+    }
+}
+
+/// Save the log under a crash-report name (called from
+/// [`load_previous_crash`]); appends the one-shot marker to the log file.
+fn export_files(name: &str) -> bool {
+    let ok = crate::platform::export_log(name, &collect_log_text());
+    if ok {
+        push("app", &format!("crash report exported to Downloads as {name}"));
+    }
+    ok
+}
 /// Surface panics from earlier sessions: scan the persistent log files and
 /// re-push every `[panic]` entry into the ring buffer (buffer only — they
 /// are not echoed back into the file), so a crash is visible and copyable
 /// in Settings → Logs on the next launch even though the old process is
 /// gone. Called once at startup, right after [`init_file`].
+///
+/// Additionally, panics not yet reported are exported to the platform's
+/// user-visible Downloads location as `rustblox-crash-<unix>.log` — the
+/// no-root, no-PC way to get a full crash report off a phone (the internal
+/// log is unreadable for the user, and Android ≥ 11 hides Android/data).
+/// A `[app] crash report exported …` marker line in the file keeps the
+/// export one-shot per panic.
 pub fn load_previous_crash() {
     let Some(path) = log_file_path() else { return };
     let Some(dir) = path.parent() else { return };
     let mut crashes: Vec<String> = Vec::new();
+    let mut unexported = 0usize;
     for name in ["client.prev.log", "client.log"] {
         let Ok(data) = std::fs::read_to_string(dir.join(name)) else { continue };
-        crashes.extend(data.lines().filter(|l| l.contains(" [panic] ")).map(|l| l.to_string()));
+        for line in data.lines() {
+            if line.contains(" [panic] ") {
+                crashes.push(line.to_string());
+                unexported += 1;
+            } else if line.contains("crash report exported") {
+                // Everything before the last export marker is already off
+                // the device.
+                unexported = 0;
+            }
+        }
+    }
+    if unexported > 0 {
+        let name = format!("rustblox-crash-{}.log", unix_secs());
+        let exported = export_files(&name);
+        push(
+            "app",
+            &if exported {
+                format!(
+                    "crash report exported to Downloads as {name} ({} new panic line(s))",
+                    unexported
+                )
+            } else {
+                "crash report export unavailable (no Downloads backend) — use Copy logs".to_string()
+            },
+        );
     }
     if crashes.is_empty() {
         return;

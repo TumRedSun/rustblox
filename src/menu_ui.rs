@@ -1421,12 +1421,16 @@ fn draw_settings(v: &mut MenuView, ctx: &mut UiCtx, fb: &mut FB, x: i32, w: i32,
     if v.settings.tab == SettingsTab::Logs {
         let btn_h = (30.0 * s) as i32;
         let fy = (top + view_h - 46.0 * s) as i32;
-        let copy_w = (140.0 * s) as i32;
+        let copy_w = (120.0 * s) as i32;
         let r1 = Rect { x: x + pad, y: fy, w: copy_w, h: btn_h };
         let b1 = draw_button(ctx, fb, r1, "Copy logs", BtnStyle::Primary, false);
         ctx.hits.add(b1, Hit::CopyLogs);
-        let clear_w = (110.0 * s) as i32;
-        let r2 = Rect { x: x + pad + copy_w + (10.0 * s) as i32, y: fy, w: clear_w, h: btn_h };
+        let save_w = (86.0 * s) as i32;
+        let r3 = Rect { x: x + pad + copy_w + (10.0 * s) as i32, y: fy, w: save_w, h: btn_h };
+        let b3 = draw_button(ctx, fb, r3, "Save", BtnStyle::Primary, false);
+        ctx.hits.add(b3, Hit::SaveLogs);
+        let clear_w = (90.0 * s) as i32;
+        let r2 = Rect { x: x + pad + copy_w + save_w + (20.0 * s) as i32, y: fy, w: clear_w, h: btn_h };
         let b2 = draw_button(ctx, fb, r2, "Clear", BtnStyle::Secondary, false);
         ctx.hits.add(b2, Hit::ClearLogs);
         let count = crate::logs::len();

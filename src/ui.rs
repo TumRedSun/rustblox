@@ -85,6 +85,10 @@ pub enum Hit {
     ResetAppearance,
     /// Settings → Logs: copy the whole diagnostic log buffer to the clipboard.
     CopyLogs,
+    /// Settings → Logs: save the persistent log file into the user-visible
+    /// Downloads location (Android MediaStore) — the no-root way to send a
+    /// full crash report.
+    SaveLogs,
     /// Settings → Logs: wipe the diagnostic log buffer.
     ClearLogs,
 }
@@ -173,6 +177,18 @@ impl TextField {
     pub fn clear(&mut self) {
         self.value.clear();
         self.cursor = 0;
+        self.sel = None;
+        self.scroll = 0.0;
+    }
+
+    /// Replaces the whole value (used by the platform IME sync on mobile).
+    pub fn set_text(&mut self, s: &str) {
+        let mut v = s.to_string();
+        while v.len() > self.max_bytes {
+            v.pop();
+        }
+        self.value = v;
+        self.cursor = self.value.len();
         self.sel = None;
         self.scroll = 0.0;
     }
@@ -362,7 +378,12 @@ impl TextField {
         fb.set_clip(text_clip);
 
         if self.value.is_empty() && !focused {
-            font::draw(ctx.fonts, fb, inner_x as f32, baseline, self.placeholder, font_px, t.text_faint, false, 0.0);
+            // Placeholder: truncate with an ellipsis so it never clips at
+            // the field edge on narrow screens.
+            font::draw_ellipsis(
+                ctx.fonts, fb, inner_x as f32, baseline, self.placeholder,
+                font_px, t.text_faint, false, inner_w as f32,
+            );
         } else {
             // Selection highlight.
             if let Some((a, b)) = self.sel {
