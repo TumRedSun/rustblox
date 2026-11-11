@@ -219,6 +219,26 @@ impl Gfx {
             ..Default::default()
         }))
         .expect("request wgpu device");
+        // Log the GPU that won the adapter request: driver/renderer quirks
+        // are the usual root cause of platform-specific render bugs, and
+        // this line pins them into the log the user already knows how to
+        // export.
+        let info = adapter.get_info();
+        crate::logs::push(
+            "debug",
+            &format!(
+                "gpu: {:?} — {} ({:?}, vendor {:#06x}, device {:#06x}, driver {}/{}), surface {}x{}",
+                info.backend,
+                info.name,
+                info.device_type,
+                info.vendor,
+                info.device,
+                info.driver,
+                info.driver_info,
+                window.inner_size().width,
+                window.inner_size().height,
+            ),
+        );
         // Replace wgpu's default uncaptured-error handler (which PANICS —
         // the reported "client just crashes when joining") with a logging
         // one: the full validation message lands in the persistent log

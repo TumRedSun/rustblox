@@ -41,6 +41,29 @@ pub fn run_with(event_loop: winit::event_loop::EventLoop<UserEvent>, session: Op
     if let Some(p) = logs::log_file_path() {
         logs::push("app", &format!("log file: {}", p.display()));
     }
+    // Startup environment block ("debug" lines): pins every log to the
+    // exact build and hardware it came from — the first thing to ask for
+    // when a join or a render misbehaves on someone else's machine.
+    logs::push(
+        "debug",
+        &format!(
+            "rustblox v{} ({} profile, git {}) — {} {}",
+            env!("CARGO_PKG_VERSION"),
+            if cfg!(debug_assertions) { "debug" } else { "release" },
+            env!("RUSTBLOX_BUILD_SHA"),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+        ),
+    );
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
+    logs::push("debug", &format!("cpu threads: {threads}"));
+    // Session type (x11/wayland/tty) explains clipboard/paste and window
+    // quirks on Linux; harmless to skip when the variable is unset.
+    for var in ["XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP", "LANG"] {
+        if let Ok(v) = std::env::var(var) {
+            logs::push("debug", &format!("env {var}={v}"));
+        }
+    }
     // Make a crash from the previous session visible in Settings → Logs.
     logs::load_previous_crash();
 

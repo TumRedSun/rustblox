@@ -131,24 +131,65 @@ fn game_thread(
     appearance_url: String,
     user_id: u64,
 ) {
-    netlog!(game, "connecting to {}", resp.ip);
+    // Roblox hands out private RCC addresses (10.x.x.x) that are unroutable
+    // from the open internet: real clients dial the datacenter's public
+    // UDMUX proxy on the SAME port instead. Resolve that proxy up front and
+    // log every decision so a failed join is diagnosable from the log alone.
+    let mut dial = resp.ip.clone();
+    match resp.ip.parse::<std::net::Ipv4Addr>() {
+        Ok(ip) if crate::roblox::udmux::is_private(ip) => {
+            match crate::roblox::udmux::proxy_for(ip) {
+                Some(proxy) => {
+                    netlog!(
+                        net,
+                        "rcc {} is private — dialing udmux proxy {}:{} (same port)",
+                        ip,
+                        proxy,
+                        resp.port
+                    );
+                    dial = proxy.to_string();
+                }
+                None => {
+                    netlog!(
+                        net,
+                        "rcc {} is private and no udmux proxy is known for the 10.{}.x.x prefix \
+                         — direct dial will not leave the LAN (set RUSTBLOX_UDMUX=10.{}=<proxy-ip>)",
+                        ip,
+                        ip.octets()[1],
+                        ip.octets()[1]
+                    );
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(_) => netlog!(net, "rcc address {:?} is not an IPv4 literal", resp.ip),
+    }
+    netlog!(game, "connecting to {} (rcc {}:{})", dial, resp.ip, resp.port);
     // RakNet handshake with several protocol version guesses (the Roblox
     // fork's exact protocol byte is not public knowledge).
     let protocols: [u8; 4] = [10, 11, 5, 1];
     let mut client = match RakClient::connect(
-        &resp.ip,
+        &dial,
         resp.port,
         &protocols,
         Duration::from_secs(6),
     ) {
         Ok(c) => c,
         Err(e) => {
+            netlog!(
+                game,
+                "raknet handshake to {}:{} failed after {} protocol attempt(s): {}",
+                dial,
+                resp.port,
+                protocols.len(),
+                e
+            );
             let mut st = lock_state(&state);
             st.phase = GamePhase::Failed(format!("Не удалось подключиться: {}", e));
             return;
         }
     };
-    netlog!(game, "raknet connected: {}", resp.ip);
+    netlog!(game, "raknet connected: {}:{} (rcc {})", dial, resp.port, resp.ip);
     lock_state(&state).phase = GamePhase::InGame;
 
     // Fetch our avatar appearance (best effort, no cookie needed for the

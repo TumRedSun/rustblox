@@ -6,3 +6,4 @@ pub mod join;
 pub mod replication;
 pub mod social;
 pub mod types;
+pub mod udmux;
