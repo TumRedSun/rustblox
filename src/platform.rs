@@ -33,8 +33,9 @@ pub struct PlatformHooks {
     pub app_data_dir: Option<fn() -> Option<std::path::PathBuf>>,
     /// Saves `data` as `name` into the platform's user-visible Downloads
     /// location (Android: MediaStore.Downloads via JNI — reachable from any
-    /// file manager without root). Returns false / no-op on desktop or if
-    /// storage refuses; callers must treat it as best-effort.
+    /// file manager without root). Not registered on desktop → the caller
+    /// falls back to writing `dirs::download_dir()` directly; treat the
+    /// result as best-effort either way.
     pub log_export: Option<fn(&str, &[u8]) -> bool>,
 }
 
@@ -94,11 +95,21 @@ pub fn app_data_dir() -> Option<std::path::PathBuf> {
     f()
 }
 
-/// Saves `data` as `name` into the user-visible Downloads location (false
-/// on desktop — the caller falls back to the plain log file).
+/// Saves `data` as `name` into the user-visible Downloads location. Mobile
+/// platforms go through the registered harness hook (Android: MediaStore).
+/// Desktop has no hook, so it falls back to writing the file directly:
+/// `dirs::download_dir()` (XDG config on Linux, the known Downloads folder
+/// on Windows/macOS), then `$HOME/Downloads`, then `$HOME` itself.
 pub fn export_log(name: &str, data: &[u8]) -> bool {
-    match hooks().log_export {
-        Some(f) => f(name, data),
-        None => false,
+    if let Some(f) = hooks().log_export {
+        return f(name, data);
     }
+    let dir = dirs::download_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))
+        .or_else(dirs::home_dir);
+    let Some(dir) = dir else { return false };
+    if !dir.exists() {
+        let _ = std::fs::create_dir_all(&dir);
+    }
+    std::fs::write(dir.join(name), data).is_ok()
 }

@@ -387,8 +387,10 @@ impl App {
         // on desktop.
         let text = crate::platform::clipboard_get();
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        let text = text
-            .or_else(|| self.clipboard.as_mut().and_then(|c| c.get_text().ok()));
+        let text = text.or_else(|| {
+            self.ensure_clipboard();
+            self.clipboard.as_mut().and_then(|c| c.get_text().ok())
+        });
         if let Some(text) = text.filter(|t| !t.is_empty()) {
             if let Some(f) = self.focused_field_mut() {
                 f.insert(&text);
@@ -409,10 +411,25 @@ impl App {
             return true;
         }
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        if let Some(c) = self.clipboard.as_mut() {
-            return c.set_text(text).is_ok();
+        {
+            self.ensure_clipboard();
+            if let Some(c) = self.clipboard.as_mut() {
+                return c.set_text(text).is_ok();
+            }
         }
         false
+    }
+
+    /// (Re)open the desktop clipboard on demand. `Clipboard::new()` can
+    /// legitimately fail at startup — e.g. under Wayland sessions where the
+    /// display connection is not usable yet — and a clipboard opened only
+    /// once in `new()` would stay dead for the whole session, so every
+    /// Copy press retried nothing. Retry lazily before giving up.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn ensure_clipboard(&mut self) {
+        if self.clipboard.is_none() {
+            self.clipboard = arboard::Clipboard::new().ok();
+        }
     }
 
     fn handle_touch(&mut self, touch: Touch) {

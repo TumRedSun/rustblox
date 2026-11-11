@@ -1503,27 +1503,33 @@ fn draw_logs(ctx: &mut UiCtx, fb: &mut FB, x: i32, y: &mut f32, w: f32, s: f32) 
 }
 
 /// Split a stored log line "[HH:MM:SS] [kind] message" into the dim header
+/// (timestamp + kind tag + the space that follows) and the message, which
+/// starts right after that space. Pure string logic so it is unit-testable
+/// without a font.
+fn split_log_line(line: &str) -> (String, &str) {
+    let Some(fb1) = line.find(']') else { return (String::new(), line) };
+    let rest = &line[fb1 + 1..];
+    match rest.find("] ") {
+        // `second` is the byte index of the space between the kind tag and
+        // the message; the header keeps that space, so the message starts
+        // at `second + 1`. An earlier `+ 2` here ate the first character
+        // of every message ("log file" rendered as "og file").
+        Some(off) => {
+            let second = fb1 + 1 + off + 1;
+            (line[..second + 1].to_string(), &line[second + 1..])
+        }
+        None => (String::new(), line),
+    }
+}
+
+/// Split a stored log line "[HH:MM:SS] [kind] message" into the dim header
 /// (timestamp + kind tag) and the message, then greedy-wrap the message to
 /// the pane width (long words are broken per character). The first visual
 /// line starts after the header, the rest span the full width. Used for
 /// BOTH measuring and drawing so the scroll height can never drift.
 fn log_layout(fonts: &Fonts, line: &str, max_w: f32, px: f32) -> (String, f32, Vec<String>) {
     let space_w = font::measure(fonts, " ", px, false);
-    // Header = up to the second "]" ("[21:53:21]" + "[net]").
-    let first_br = line.find(']');
-    let (head, msg) = match first_br {
-        Some(fb1) => {
-            let rest = &line[fb1 + 1..];
-            match rest.find("] ") {
-                Some(off) => {
-                    let second = fb1 + 1 + off + 1;
-                    (line[..second + 1].to_string(), &line[second + 2..])
-                }
-                None => (String::new(), line),
-            }
-        }
-        None => (String::new(), line),
-    };
+    let (head, msg) = split_log_line(line);
     let head_w = if head.is_empty() {
         0.0
     } else {
@@ -2042,7 +2048,30 @@ fn draw_avatar(ctx: &mut UiCtx, fb: &mut FB, id: u64, display_name: &str, x: i32
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_scroll, cycle_color, COLOR_PALETTE, format_count};
+    use super::{clamp_scroll, cycle_color, format_count, split_log_line, COLOR_PALETTE};
+
+    #[test]
+    fn log_line_split_keeps_the_first_character() {
+        // Regression: the message used to start one character too far in
+        // ("log file" rendered as "og file", "Join" as "oin").
+        let (head, msg) = super::split_log_line("[12:06:06] [app] log file: /tmp/client.log");
+        assert_eq!(head, "[12:06:06] [app] ");
+        assert_eq!(msg, "log file: /tmp/client.log");
+
+        let (head, msg) = super::split_log_line("[12:07:14] [net] Auth ticket received (576 chars)");
+        assert_eq!(head, "[12:07:14] [net] ");
+        assert_eq!(msg, "Auth ticket received (576 chars)");
+
+        // A "] " inside the message must not confuse the split.
+        let (head, msg) = super::split_log_line("[00:00:00] [gfx] wgpu error [bad] stuff");
+        assert_eq!(head, "[00:00:00] [gfx] ");
+        assert_eq!(msg, "wgpu error [bad] stuff");
+
+        // No stamp/kind header → the whole line is the message.
+        let (head, msg) = super::split_log_line("just a line");
+        assert!(head.is_empty());
+        assert_eq!(msg, "just a line");
+    }
 
     #[test]
     fn clamp_scroll_basics() {

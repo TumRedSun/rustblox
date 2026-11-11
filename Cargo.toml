@@ -28,9 +28,11 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 dirs = "5.0"
 flate2 = "1"
 
-# Desktop clipboard (arboard has no Android/iOS backend).
+# Desktop clipboard (arboard has no Android/iOS backend). wayland-data-control
+# adds a native Wayland clipboard backend so Copy works under Wayland too,
+# not only through XWayland.
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
-arboard = "3.7"
+arboard = { version = "3.7", features = ["wayland-data-control"] }
 
 [dev-dependencies]
 naga = { version = "29", features = ["wgsl-in"] }
