@@ -67,6 +67,14 @@ pub fn run_with(event_loop: winit::event_loop::EventLoop<UserEvent>, session: Op
     // Make a crash from the previous session visible in Settings → Logs.
     logs::load_previous_crash();
 
+    // Memory watchdog: report RSS every 5 minutes (and immediately on a big
+    // jump) into the diagnostic log, so "the client ate 3 GB" becomes a fact
+    // in the user's log instead of a guess. No-op where /proc is missing.
+    std::thread::Builder::new()
+        .name("rustblox-memwatch".into())
+        .spawn(mem_watch_loop)
+        .ok();
+
     let proxy = event_loop.create_proxy();
     let worker = net::spawn(proxy, session.clone());
     let mut app = app::App::new(worker.tx, session.is_some());
@@ -90,4 +98,44 @@ pub fn run_desktop() {
         .build()
         .expect("failed to build the winit event loop");
     run_with(event_loop, session);
+}
+
+/// Resident memory of this process in bytes (Linux/Android: from
+/// /proc/self/status `VmRSS`, which is exact regardless of page size).
+/// `None` on targets without /proc (iOS) — the watchdog then exits.
+fn rss_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(v) = line.strip_prefix("VmRSS:") {
+            let kb: u64 = v.trim_end_matches("kB").trim().parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
+}
+
+/// Periodic RSS sampler: logs every 5 minutes, or right away when RSS grew
+/// by more than 256 MB since the previous check (the signature of a leak).
+fn mem_watch_loop() {
+    const CHECK_SECS: u64 = 60;
+    const REPORT_EVERY: u32 = 5;
+    const JUMP_MB: u64 = 256;
+    let mut last_logged: u64 = 0;
+    let mut since_report: u32 = 0;
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(CHECK_SECS));
+        let Some(rss) = rss_bytes() else { return };
+        since_report += 1;
+        let mb = rss / (1024 * 1024);
+        let last_mb = last_logged / (1024 * 1024);
+        if rss > last_logged + JUMP_MB * 1024 * 1024 {
+            logs::push("mem", &format!("rss {mb} MB (+{} MB in under {REPORT_EVERY} min)", mb - last_mb));
+            since_report = 0;
+            last_logged = rss;
+        } else if since_report >= REPORT_EVERY {
+            logs::push("mem", &format!("rss {mb} MB"));
+            since_report = 0;
+            last_logged = rss;
+        }
+    }
 }

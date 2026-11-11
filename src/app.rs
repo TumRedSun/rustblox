@@ -211,7 +211,7 @@ impl App {
                 }
             }
             let prims = fb.take_prims();
-            let atlas = self.fonts.atlas.lock().unwrap();
+            let mut atlas = self.fonts.atlas.lock().unwrap();
             // The 3D scene comes from the live session (if connected).
             let scene = match &self.screen {
                 Screen::Game(GameView::Active { session, .. }) => {
@@ -222,7 +222,7 @@ impl App {
                 }
                 _ => None,
             };
-            let _ = gfx.render(&prims, &atlas, scene.as_ref());
+            let _ = gfx.render(&prims, &mut atlas, scene.as_ref());
         }
     }
 
@@ -463,6 +463,10 @@ impl App {
 
     /// Shared pointer-move logic for mouse (`CursorMoved`) and touch (`Moved`).
     fn pointer_moved(&mut self, x: f32, y: f32) {
+        // Hover-change detection: `hits` still reflects the previous frame,
+        // which is exactly the "what was under the pointer before" side of
+        // the comparison below.
+        let prev_hit = self.hits.at(self.cursor.0, self.cursor.1);
         self.cursor = (x, y);
         // Scrollbar drag (whichever list is active).
         if let (Some((start_y, start_scroll)), true) = (
@@ -543,7 +547,17 @@ impl App {
                 }
             }
         }
-        self.request_redraw();
+        // Raw pointer motion fires hundreds of events per second; a full
+        // redraw per event burned ~20% CPU while the cursor was moving and
+        // 0% the moment it stopped. Redraw only when the hover target actually
+        // changed (highlight in/out of a widget) or when a drag/gesture is in
+        // flight — those genuinely move content every event.
+        let dragging = self.drag_scroll.is_some()
+            || self.content_drag.is_some()
+            || self.strip_drag.is_some();
+        if dragging || self.hits.at(x, y) != prev_hit {
+            self.request_redraw();
+        }
     }
 
     /// Shared pointer-down logic for mouse (`Pressed`) and touch (`Started`).
@@ -1146,6 +1160,9 @@ impl ApplicationHandler<UserEvent> for App {
                         self.request_redraw();
                         return;
                     }
+                    // Same hover-change guard as `pointer_moved`: the hit map
+                    // still holds the previous frame's geometry.
+                    let prev_hit = self.hits.at(self.cursor.0, self.cursor.1);
                     self.cursor = new_pos;
                     // Scrollbar drag (whichever list is active).
                     if let (Some((start_y, start_scroll)), true) = (
@@ -1175,7 +1192,12 @@ impl ApplicationHandler<UserEvent> for App {
                             v.settings_sync_logs_follow();
                         }
                     }
-                    self.request_redraw();
+                    let dragging = self.drag_scroll.is_some()
+                        || self.content_drag.is_some()
+                        || self.strip_drag.is_some();
+                    if dragging || self.hits.at(new_pos.0, new_pos.1) != prev_hit {
+                        self.request_redraw();
+                    }
                 }
             }
             WindowEvent::CursorLeft { .. } => {

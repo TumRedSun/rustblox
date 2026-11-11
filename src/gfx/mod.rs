@@ -987,11 +987,17 @@ impl Gfx {
     pub fn render(
         &mut self,
         prims: &[(Prim, Clip)],
-        atlas: &crate::font::AtlasState,
+        atlas: &mut crate::font::AtlasState,
         scene: Option<&SceneView>,
     ) -> Result<bool, ()> {
         self.frame_no += 1;
         self.sync_atlas(atlas);
+        // The pending masks were just uploaded; drop them so the next frame
+        // only uploads glyphs rasterized since. Leaving the list intact made
+        // every frame re-upload the ENTIRE accumulated glyph set — per-frame
+        // upload cost (and driver staging pressure) grew with the session,
+        // which is the progressive-freeze / memory-bloat bug.
+        atlas.pending.clear();
 
         // UI uniforms.
         self.queue.write_buffer(

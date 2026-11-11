@@ -73,10 +73,15 @@ impl AtlasState {
         }
     }
 
-    /// Get (or create) the atlas slot for a glyph key.
-    fn place(&mut self, key: GlyphKey, mut mask: GlyphMask) -> GlyphSlot {
+    /// Get (or create) the atlas slot for a glyph key. Returns `None` when
+    /// the glyph does not fit anymore: the atlas is at [`Self::MAX_PAGE`] and
+    /// packed. Dropping the glyph is strictly better than the previous
+    /// behavior — re-growing a full max-size page re-placed the entire atlas
+    /// on EVERY subsequent miss, which looped forever (client freeze) and
+    /// piled up copies of every mask.
+    fn place(&mut self, key: GlyphKey, mut mask: GlyphMask) -> Option<GlyphSlot> {
         if let Some(slot) = self.slots.get(&key) {
-            return *slot;
+            return Some(*slot);
         }
         let (w, h) = (mask.w.max(1), mask.h.max(1));
         loop {
@@ -89,6 +94,11 @@ impl AtlasState {
             }
             if self.cursor_y + h + 1 <= self.page_size as u16 {
                 break;
+            }
+            if self.page_size >= Self::MAX_PAGE {
+                // Cap reached and still no room: skip this glyph. Everything
+                // already placed stays valid.
+                return None;
             }
             // Page is full: regrow (doubling) and re-place everything.
             self.page_size = (self.page_size * 2).min(Self::MAX_PAGE);
@@ -127,7 +137,7 @@ impl AtlasState {
             top: mask.top,
         });
         self.all.push(mask);
-        slot
+        Some(slot)
     }
 
     fn place_inner(&mut self, m: GlyphMask) {
@@ -265,8 +275,7 @@ pub fn draw(
                         Some(*slot)
                     } else if let Some(mut mask) = rasterize(font, px, ch) {
                         mask.key = key;
-                        let slot = atlas.place(key, mask);
-                        Some(slot)
+                        atlas.place(key, mask)
                     } else {
                         None
                     }
