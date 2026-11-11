@@ -243,13 +243,19 @@ impl App {
         match gv {
             GameView::Joining { place_id, status, .. } => {
                 let box_w = 460.0 * s;
-                let box_h = 150.0 * s;
+                // Wrap long pipeline/refusal messages to the box width and
+                // grow the box so nothing runs off the edge.
+                let status_lines =
+                    crate::font::wrap_text(fonts, status, box_w - 48.0 * s, 14.0 * s, false);
+                let box_h = (104.0 + status_lines.len() as f32 * 19.0 + 28.0).max(150.0) * s;
                 let (bx, by) = ((w as f32 - box_w) / 2.0, (h as f32 - box_h) / 2.0);
                 fb.rect_rounded(bx as i32, by as i32, box_w as i32, box_h as i32, 14, t.surface);
                 crate::font::draw(fonts, fb, bx + 24.0 * s, by + 44.0 * s,
                     &format!("Joining place {}", place_id), 20.0 * s, t.text, true, 0.0);
-                crate::font::draw(fonts, fb, bx + 24.0 * s, by + 76.0 * s,
-                    status, 14.0 * s, t.text_dim, false, 0.0);
+                for (i, line) in status_lines.iter().enumerate() {
+                    crate::font::draw(fonts, fb, bx + 24.0 * s,
+                        by + 76.0 * s + i as f32 * 19.0 * s, line, 14.0 * s, t.text_dim, false, 0.0);
+                }
                 // Spinner.
                 let ang = (now_ms % 900) as f32 / 900.0 * std::f32::consts::TAU;
                 let cx = (bx + box_w - 40.0 * s) as i32;
@@ -271,13 +277,27 @@ impl App {
                         fps, st.instances, st.packets, st.decoded, st.skipped), 13.0 * s),
                 ];
                 let box_w = 430.0 * s;
-                let box_h = 20.0 * s + lines.iter().map(|l| l.1 + 8.0 * s).sum::<f32>();
+                // Word-wrap every HUD line to the box; count the visual rows
+                // so the panel height follows the content.
+                let max_line_w = box_w - 24.0 * s;
+                let wrapped: Vec<Vec<String>> = lines
+                    .iter()
+                    .map(|(l, size)| crate::font::wrap_text(fonts, l, max_line_w, *size, false))
+                    .collect();
+                let box_h = 20.0 * s
+                    + wrapped
+                        .iter()
+                        .zip(lines.iter())
+                        .map(|(segs, (_, size))| segs.len() as f32 * (*size + 8.0 * s))
+                        .sum::<f32>();
                 fb.rect_rounded(pad as i32, pad as i32, box_w as i32, box_h as i32, 12, t.surface);
                 let mut y = pad + 26.0 * s;
-                for (i, (line, size)) in lines.iter().enumerate() {
+                for (i, (segs, (_, size))) in wrapped.iter().zip(lines.iter()).enumerate() {
                     let color = if i == 0 { t.text } else { t.text_dim };
-                    crate::font::draw(fonts, fb, pad + 12.0 * s, y, line, *size, color, i == 0, 0.0);
-                    y += size + 8.0 * s;
+                    for seg in segs {
+                        crate::font::draw(fonts, fb, pad + 12.0 * s, y, seg, *size, color, i == 0, 0.0);
+                        y += size + 8.0 * s;
+                    }
                 }
                 crate::font::draw(fonts, fb, pad + 12.0 * s, h as f32 - pad - 8.0 * s,
                     "Esc — leave   LMB — capture mouse   WASD — fly   Space/Shift — up/down",

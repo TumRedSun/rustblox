@@ -340,6 +340,78 @@ pub fn measure_prefix(fonts: &Fonts, text: &str, n_bytes: usize, px: f32, bold: 
     measure(fonts, &text[..n], px, bold)
 }
 
+/// Greedy word-wrap `text` to `max_w` pixels. A word wider than the whole
+/// line is hard-broken per character (so a long unbreakable token can never
+/// overflow). Returns the visual lines; a blank input yields one empty line.
+pub fn wrap_text(fonts: &Fonts, text: &str, max_w: f32, px: f32, bold: bool) -> Vec<String> {
+    if !max_w.is_finite() || max_w <= 0.0 {
+        return vec![text.to_string()];
+    }
+    let space_w = measure(fonts, " ", px, bold);
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0.0f32;
+    for word in text.split(' ') {
+        if word.is_empty() {
+            continue;
+        }
+        let ww = measure(fonts, word, px, bold);
+        if !cur.is_empty() && cur_w + space_w + ww > max_w {
+            lines.push(std::mem::take(&mut cur));
+            cur_w = 0.0;
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+            cur_w += space_w;
+        }
+        if ww > max_w {
+            // Hard-break a word wider than the whole line.
+            for ch in word.chars() {
+                let c = ch.to_string();
+                let cw = measure(fonts, &c, px, bold);
+                if cur_w + cw > max_w && !cur.is_empty() {
+                    lines.push(std::mem::take(&mut cur));
+                    cur_w = 0.0;
+                }
+                cur.push_str(&c);
+                cur_w += cw;
+            }
+        } else {
+            cur.push_str(word);
+            cur_w += ww;
+        }
+    }
+    if !cur.is_empty() || lines.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
+/// Draw `text` word-wrapped to `max_w` (see [`wrap_text`]). `y` is the
+/// baseline of the first line; every next line is advanced by `line_h`.
+/// Returns the total height actually used (`lines * line_h`).
+pub fn draw_wrapped(
+    fonts: &Fonts,
+    fb: &mut FB,
+    x: f32,
+    y: f32,
+    text: &str,
+    px: f32,
+    color: Rgba,
+    bold: bool,
+    max_w: f32,
+    line_h: f32,
+) -> f32 {
+    let lines = wrap_text(fonts, text, max_w, px, bold);
+    for (i, line) in lines.iter().enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        draw(fonts, fb, x, y + i as f32 * line_h, line, px, color, bold, 0.0);
+    }
+    lines.len() as f32 * line_h
+}
+
 /// Draw a password-style field content: one bullet per char.
 pub fn masked_str(fonts: &Fonts, text: &str) -> String {
     let ch = if fonts.bullet { '\u{2022}' } else { '*' };
@@ -347,42 +419,13 @@ pub fn masked_str(fonts: &Fonts, text: &str) -> String {
 }
 
 /// Split `text` into lines that each fit `max_w` px at the given size.
-/// Breaks at spaces; a single word wider than the whole line is
-/// hard-broken at the character that fits. Existing '\n' breaks are kept.
+/// Breaks at spaces; a single word wider than the whole line is hard-broken
+/// at the character that fits. Existing '\n' breaks are kept. (Mobile-era
+/// API — a '\n'-aware wrapper over [`wrap_text`].)
 pub fn wrap(fonts: &Fonts, text: &str, max_w: f32, px: f32, bold: bool) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     for para in text.split('\n') {
-        let mut cur = String::new();
-        for word in para.split(' ') {
-            if word.is_empty() {
-                continue;
-            }
-            let candidate = if cur.is_empty() {
-                word.to_string()
-            } else {
-                format!("{} {}", cur, word)
-            };
-            if measure(fonts, &candidate, px, bold) <= max_w {
-                cur = candidate;
-                continue;
-            }
-            if !cur.is_empty() {
-                lines.push(std::mem::take(&mut cur));
-            }
-            if measure(fonts, word, px, bold) <= max_w {
-                cur = word.to_string();
-            } else {
-                // Hard-break a word wider than the whole line.
-                for ch in word.chars() {
-                    let cand = format!("{}{}", cur, ch);
-                    if !cur.is_empty() && measure(fonts, &cand, px, bold) > max_w {
-                        lines.push(std::mem::take(&mut cur));
-                    }
-                    cur.push(ch);
-                }
-            }
-        }
-        lines.push(cur);
+        lines.extend(wrap_text(fonts, para, max_w, px, bold));
     }
     if lines.is_empty() {
         lines.push(String::new());
@@ -442,5 +485,55 @@ mod tests {
         for l in &hard {
             assert!(measure(&fonts, l, 14.0, false) <= 51.0, "hard line too wide: {:?}", l);
         }
+    }
+
+    #[test]
+    fn wrap_respects_width() {
+        let fonts = Fonts::load();
+        let px = 14.0;
+        let one = measure(&fonts, "one", px, false);
+        let two = measure(&fonts, "one two", px, false);
+        // Fits on a single line.
+        assert_eq!(wrap_text(&fonts, "one two", two + 1.0, px, false), vec!["one two"]);
+        // Two lines once the width forces a break.
+        assert_eq!(
+            wrap_text(&fonts, "one two", two - 1.0, px, false),
+            vec!["one", "two"]
+        );
+        // Width that only fits one word per line.
+        assert_eq!(
+            wrap_text(&fonts, "one two", one + 1.0, px, false),
+            vec!["one", "two"]
+        );
+    }
+
+    #[test]
+    fn wrap_hard_breaks_overlong_words() {
+        let fonts = Fonts::load();
+        let px = 14.0;
+        let c = measure(&fonts, "a", px, false);
+        // 10 'a's into a 4-char-wide box: hard-broken, never overflowing.
+        let lines = wrap_text(&fonts, "aaaaaaaaaa", c * 4.0 + 0.5, px, false);
+        assert!(lines.len() >= 3);
+        for l in &lines {
+            assert!(measure(&fonts, l, px, false) <= c * 4.0 + 0.6);
+        }
+        assert_eq!(lines.concat(), "aaaaaaaaaa");
+    }
+
+    #[test]
+    fn wrap_handles_unicode_and_blanks() {
+        let fonts = Fonts::load();
+        let px = 12.0;
+        // Multi-byte text must not be split mid-char; rejoining the lines
+        // with spaces must restore the original text.
+        let w_word = measure(&fonts, "привет", px, false);
+        let lines = wrap_text(&fonts, "привет мир привет мир", w_word + 2.0, px, false);
+        assert!(lines.len() >= 2);
+        assert_eq!(lines.join(" "), "привет мир привет мир");
+        // Blank input -> one empty line (so callers can advance y safely).
+        assert_eq!(wrap_text(&fonts, "", 100.0, px, false), vec![""]);
+        // Degenerate width: passthrough, no panic.
+        assert_eq!(wrap_text(&fonts, "abc", 0.0, px, false), vec!["abc"]);
     }
 }

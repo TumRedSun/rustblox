@@ -65,6 +65,9 @@ fn parse_login_response(c: &mut RobloxClient, raw: RawResponse) -> Result<AuthOu
     }
     if let Some(user) = lr.user {
         if let Some(security) = raw.header_cookies_find(".ROBLOSECURITY") {
+            // Keep the client's session field in sync with the cookie jar
+            // (join flow checks it to fail fast with a clear message).
+            c.set_security(&security);
             let profile = fetch_profile(c, user.id).unwrap_or_else(|_| profile_from(user.id, user.name.clone(), None));
             return Ok(AuthOutcome::Session { security, profile });
         }
@@ -103,6 +106,7 @@ pub fn verify_2fa(
         Some(security) => {
             // The verify response does not carry the user id; resolve it with
             // the fresh session.
+            c.set_security(&security);
             let profile = whoami(c)?;
             Ok(AuthOutcome::Session { security, profile })
         }
