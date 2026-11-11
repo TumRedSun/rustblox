@@ -2,7 +2,7 @@
 //! enter a running place instance on Roblox's game servers.
 //!
 //! Steps:
-//!  1. POST `apis.roblox.com/authentication-ticket/v1` — exchange the
+//!  1. POST `auth.roblox.com/v1/authentication-ticket` — exchange the
 //!     `.ROBLOSECURITY` session for a short-lived join ticket.
 //!  2. POST `gamejoin.roblox.com/v2/join-game` — request membership in a
 //!     running server; the response names the datacenter host (ip/port),
@@ -18,7 +18,10 @@ use crate::roblox::errors::ApiError;
 use serde::{Deserialize, Deserializer};
 
 pub const GAMEJOIN_BASE: &str = "https://gamejoin.roblox.com";
-pub const AUTH_TICKET_URL: &str = "https://apis.roblox.com/authentication-ticket/v1";
+/// The one-time join ticket lives on the auth service (NOT apis.roblox.com —
+/// that host answers 404 for this path, which silently broke the whole join
+/// chain: ticket 404 → anonymous v1 fallback → refusal status 12).
+pub const AUTH_TICKET_URL: &str = "https://auth.roblox.com/v1/authentication-ticket";
 
 /// serde: treat an explicit JSON null as the field default (Roblox returns
 /// "jobId": null when it refuses a join; plain `#[serde(default)]` only
@@ -82,11 +85,12 @@ fn snippet(text: &str, max: usize) -> String {
 
 /// Fetch the one-time authentication ticket used by v2 game join.
 pub fn fetch_auth_ticket(client: &mut RobloxClient, place_id: u64) -> Result<String, ApiError> {
-    // The endpoint returns {"ticket": "..."}.
-    let body = serde_json::json!({
-        "userUuid": uuid_v4_placeholder(),
-        "placeId": place_id,
-    });
+    // The endpoint returns {"ticket": "..."} and expects an empty JSON
+    // object (what the official client posts). The request must carry the
+    // .ROBLOSECURITY session cookie + the CSRF dance — RobloxClient::send
+    // does both.
+    let _ = place_id;
+    let body = serde_json::json!({});
     let raw = client.send(AUTH_TICKET_URL, Some(&body))?;
     if !(200..300).contains(&raw.status) {
         let err = raw.error();
@@ -114,50 +118,81 @@ pub fn fetch_auth_ticket(client: &mut RobloxClient, place_id: u64) -> Result<Str
     Ok(trimmed)
 }
 
-/// Join a running place server (v2 with ticket, falling back to v1).
+/// Join a running place server: authentication ticket, then the game-join
+/// service. The classic `/v1/join-game` is the primary (battle-tested with
+/// tickets); `/v1/join-game-instance` (newer unified API, response carries
+/// ip/port directly) is the fallback. NOTE: `/v2/join-game` does NOT exist
+/// on gamejoin.roblox.com (probed 2026-11: 404) — never use it.
 pub fn join_game(client: &mut RobloxClient, place_id: u64) -> Result<JoinResponse, ApiError> {
     crate::netlog!(info, "join: requesting server for place {}", place_id);
-    // The official client hits v2 with an authentication ticket.
     let ticket = match fetch_auth_ticket(client, place_id) {
         Ok(t) => t,
         Err(e) => {
-            crate::netlog!(info, "join: auth ticket unavailable ({}); falling back to v1", e);
+            // Without a session the ticket endpoint can never succeed and an
+            // anonymous join is always refused (status 12, "Unable to join
+            // Game ..."). Fail fast with an actionable message instead.
+            if !client.has_session() {
+                crate::netlog!(info, "join: no session cookie — cannot request an authentication ticket");
+                return Err(ApiError::JoinRefused(
+                    "not signed in: joining a server needs a session — sign in or add a .ROBLOSECURITY cookie first".into(),
+                ));
+            }
+            crate::netlog!(info, "join: auth ticket unavailable ({}); trying v1 with the session cookie", e);
             String::new()
         }
     };
-    if !ticket.is_empty() {
-        let body = serde_json::json!({
-            "placeId": place_id,
-            "isTeleport": false,
-            "teleportData": serde_json::Value::Null,
-            "authenticationTicket": ticket,
-            "gameInfo": "{}",
-        });
-        let referer = format!("https://www.roblox.com/games/{}/", place_id);
-        match join_request(client, "/v2/join-game", &body, &referer) {
-            Ok(resp) => return Ok(resp),
-            Err(e) => {
-                crate::netlog!(info, "join-game v2 failed ({}); trying v1", e);
-            }
-        }
-    }
-    // v1 legacy path: session cookie + referer.
-    let body = serde_json::json!({
+    let referer = format!("https://www.roblox.com/games/{}/", place_id);
+    // Classic endpoint: session cookie + ticket in the body.
+    let mut body = serde_json::json!({
         "placeId": place_id,
         "isTeleport": false,
         "gameInfo": "{}",
     });
-    let referer = format!("https://www.roblox.com/games/{}/", place_id);
-    join_request(client, "/v1/join-game", &body, &referer)
+    if !ticket.is_empty() {
+        body["authenticationTicket"] = serde_json::Value::String(ticket.clone());
+    }
+    match join_request(client, "/v1/join-game", &body, &referer) {
+        Ok(resp) => Ok(resp),
+        Err(classic_err) => {
+            crate::netlog!(info, "join-game v1 failed ({}); trying join-game-instance", classic_err);
+            // Newer unified endpoint; its success body carries ip/port.
+            let body2 = serde_json::json!({
+                "placeId": place_id,
+                "isTeleport": false,
+                "authenticationTicket": if ticket.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(ticket) },
+            });
+            join_request(client, "/v1/join-game-instance", &body2, &referer)
+                .map_err(|e| {
+                    crate::netlog!(info, "join-game-instance failed too: {}", e);
+                    if matches!(e, ApiError::JoinRefused(_)) { e } else { classic_err }
+                })
+        }
+    }
+}
+
+/// Best-effort hint for the numeric v1/v2 join status. Only codes that are
+/// actually attested (devforum reports + our own repro against the live
+/// endpoint) get a name; unknown ones stay numeric.
+fn join_status_hint(status: i64) -> Option<&'static str> {
+    match status {
+        // Repro: POST /v1/join-game without an authentication ticket answers
+        // {"status":12,"message":"Unable to join Game 211"}.
+        12 => Some("join refused — the request carried no valid authentication ticket"),
+        _ => None,
+    }
 }
 
 /// Human-readable reason from a refused join response. Roblox answers
-/// {"jobId":null,"status":N,"joinError":{"joinStatusCode":X,"errorCode":Y,
-/// "description":"..."}} — with the description optionally nested.
+/// {"jobId":null,"status":N,"message":"...","joinError":{"joinStatusCode":X,
+/// "errorCode":Y,"description":"..."}} — with the description optionally
+/// nested and the flat "message" only on v1.
 fn join_refusal_detail(v: &serde_json::Value) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(s) = v.get("status").and_then(|s| s.as_i64()) {
-        parts.push(format!("status {}", s));
+        parts.push(match join_status_hint(s) {
+            Some(hint) => format!("status {} ({})", s, hint),
+            None => format!("status {}", s),
+        });
     }
     let err = v.get("joinError");
     for key in ["joinStatusCode", "errorCode"] {
@@ -176,10 +211,15 @@ fn join_refusal_detail(v: &serde_json::Value) -> String {
     if !desc.is_empty() {
         parts.push(format!("\"{}\"", desc));
     }
+    // v1 refusals carry a flat top-level "message" ("Unable to join Game 211").
+    let top_msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("");
+    if !top_msg.is_empty() && top_msg != desc {
+        parts.push(format!("\"{}\"", top_msg));
+    }
     if parts.is_empty() {
-        "server refused the join (jobId is null)".into()
+        "no reason given (jobId is null)".into()
     } else {
-        format!("server refused the join: {}", parts.join(", "))
+        parts.join(", ")
     }
 }
 
@@ -214,8 +254,24 @@ fn join_request(
         .map_err(|e| ApiError::Parse(format!("{} (body: {})", e, snippet(&text, 200))))?;
     if resp.job_id.is_empty() {
         let detail = join_refusal_detail(&v);
-        crate::netlog!(info, "join: {}", detail);
-        return Err(ApiError::Parse(detail));
+        crate::netlog!(info, "join: server refused the join: {}", detail);
+        return Err(ApiError::JoinRefused(detail));
+    }
+    // Accepted. The classic endpoint often hides the server address inside
+    // the join-script blob instead of top-level ip/port — dig it out.
+    let mut resp = resp;
+    if resp.server_addr().is_none() {
+        if let Some((ip, port)) = extract_endpoint(&v) {
+            crate::netlog!(info, "join: endpoint recovered from join script: {}:{}", ip, port);
+            resp.ip = ip;
+            resp.port = port;
+        }
+    }
+    if resp.server_addr().is_none() {
+        return Err(ApiError::Parse(format!(
+            "server accepted the join but returned no server address (jobId {})",
+            resp.job_id
+        )));
     }
     crate::netlog!(
         info,
@@ -228,31 +284,100 @@ fn join_request(
     Ok(resp)
 }
 
-/// RFC-4122 v4-ish UUID from the OS RNG (used as a request correlation id).
-fn uuid_v4_placeholder() -> String {
-    let mut b = [0u8; 16];
-    if std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut b))
-        .is_err()
-    {
-        // Fallback: time-based entropy.
-        let t = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        b[..16].copy_from_slice(&t.to_le_bytes()[..16]);
+/// Pull the game-server endpoint out of a join response that doesn't carry
+/// top-level `ip`/`port`. The classic join flow embeds it in the join script
+/// (an XML-ish blob) as `<MachineAddress>x.x.x.x</MachineAddress>` /
+/// `<MachinePort>20005</MachinePort>`, or as flat JSON keys. Best-effort.
+fn extract_endpoint(v: &serde_json::Value) -> Option<(String, u16)> {
+    // Collect candidate strings: the inline joinScript plus the URL one.
+    let mut blobs: Vec<String> = Vec::new();
+    for key in ["joinScript", "joinScriptUrl", "joinTicket"] {
+        if let Some(s) = v.get(key).and_then(|s| s.as_str()) {
+            blobs.push(s.to_string());
+        }
     }
-    b[6] = (b[6] & 0x0f) | 0x40;
-    b[8] = (b[8] & 0x3f) | 0x80;
-    let h = b.iter().map(|x| format!("{:02x}", x)).collect::<String>();
-    format!(
-        "{}-{}-{}-{}-{}",
-        &h[0..8],
-        &h[8..12],
-        &h[12..16],
-        &h[16..20],
-        &h[20..32]
-    )
+    for blob in &blobs {
+        let Some(ip) = find_tag(blob, "MachineAddress")
+            .or_else(|| find_json_str(blob, "ip"))
+            .or_else(|| find_json_str(blob, "address"))
+        else {
+            continue;
+        };
+        let Some(port) = find_tag(blob, "MachinePort")
+            .and_then(|p| p.parse::<u16>().ok())
+            .or_else(|| find_json_num(blob, "port"))
+        else {
+            continue;
+        };
+        if !ip.is_empty() && port > 0 {
+            return Some((ip, port));
+        }
+    }
+    None
+}
+
+/// Value of `<Tag>value</Tag>` (lenient about the exact join-script dialect).
+fn find_tag(hay: &str, tag: &str) -> Option<String> {
+    let close = format!("</{}>", tag);
+    // Plain form: <Tag>value</Tag>
+    let open = format!("<{}>", tag);
+    if let Some(a) = hay.find(&open) {
+        let after = &hay[a + open.len()..];
+        let value = match after.find(&close) {
+            Some(b) => &after[..b],
+            None => after.split(['<', '"']).next().unwrap_or(""),
+        };
+        let value = value.trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    // Attribute form: <Tag attr="...">value</Tag>
+    let open2 = format!("<{} ", tag);
+    if let Some(a) = hay.find(&open2) {
+        let rest = &hay[a + open2.len()..];
+        let end = rest.find('>')?;
+        if !rest[..end].ends_with('/') {
+            let after = &rest[end + 1..];
+            let value = match after.find(&close) {
+                Some(b) => &after[..b],
+                None => after.split(['<', '"']).next().unwrap_or(""),
+            };
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Value of `"key":"value"` in a JSON-ish string.
+fn find_json_str(hay: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{}\"", key);
+    let a = hay.find(&pat)?;
+    let rest = &hay[a + pat.len()..];
+    let colon = rest.find(':')?;
+    let rest = rest[colon + 1..].trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    let value = rest[..end].trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+/// Numeric value of `"key":123` in a JSON-ish string.
+fn find_json_num(hay: &str, key: &str) -> Option<u16> {
+    let pat = format!("\"{}\"", key);
+    let a = hay.find(&pat)?;
+    let rest = &hay[a + pat.len()..];
+    let colon = rest.find(':')?;
+    let rest = rest[colon + 1..].trim_start();
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
 }
 
 /// Fetch the avatar description for our own character (body colors + asset
@@ -355,13 +480,6 @@ mod tests {
     }
 
     #[test]
-    fn uuid_format() {
-        let u = uuid_v4_placeholder();
-        assert_eq!(u.len(), 36);
-        assert_eq!(u.as_bytes()[14], b'4');
-    }
-
-    #[test]
     fn join_response_tolerates_nulls() {
         // Roblox answers {"jobId":null,...} when it refuses the join; the
         // typed struct must still parse (the refusal is reported separately).
@@ -371,16 +489,57 @@ mod tests {
         .unwrap();
         let resp: JoinResponse = serde_json::from_value(v.clone()).unwrap();
         assert!(resp.job_id.is_empty());
-        assert_eq!(join_refusal_detail(&v), "server refused the join: status 5, joinStatusCode=6, errorCode=6, \"You cannot join this experience\"");
+        assert_eq!(join_refusal_detail(&v), "status 5, joinStatusCode=6, errorCode=6, \"You cannot join this experience\"");
     }
 
     #[test]
     fn refusal_detail_v1_flat_code() {
         let v: serde_json::Value =
             serde_json::from_str(r#"{"jobId":null,"joinErrorCode":8}"#).unwrap();
-        assert_eq!(join_refusal_detail(&v), "server refused the join: joinErrorCode=8");
+        assert_eq!(join_refusal_detail(&v), "joinErrorCode=8");
         let empty: serde_json::Value = serde_json::json!({"jobId": null});
-        assert_eq!(join_refusal_detail(&empty), "server refused the join (jobId is null)");
+        assert_eq!(join_refusal_detail(&empty), "no reason given (jobId is null)");
+    }
+
+    #[test]
+    fn refusal_detail_unauthenticated_v1() {
+        // The exact body an anonymous /v1/join-game request gets (repro'd
+        // against the live endpoint): status 12 + flat message.
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"jobId":null,"status":12,"statusData":null,"joinScriptUrl":null,"authenticationUrl":null,"authenticationTicket":null,"message":"Unable to join Game 211","joinScript":null,"joinTicket":null,"queuePosition":0}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            join_refusal_detail(&v),
+            "status 12 (join refused — the request carried no valid authentication ticket), \"Unable to join Game 211\""
+        );
+    }
+
+    #[test]
+    fn endpoint_extracted_from_join_script_variants() {
+        // Classic XML-ish join script.
+        let xml = r#"{"jobId":"j1","status":0,"joinScript":"<JoinScript><MachineAddress>203.0.113.7</MachineAddress><MachinePort>20005</MachinePort></JoinScript>"}"#;
+        let v: serde_json::Value = serde_json::from_str(xml).unwrap();
+        assert_eq!(extract_endpoint(&v), Some(("203.0.113.7".into(), 20005)));
+        // JSON keys inside the blob.
+        let js = r#"{"jobId":"j2","status":0,"joinScript":"{\"ip\":\"198.51.100.3\",\"port\":20005}"}"#;
+        let v2: serde_json::Value = serde_json::from_str(js).unwrap();
+        assert_eq!(extract_endpoint(&v2), Some(("198.51.100.3".into(), 20005)));
+        // Top-level ip/port make the extractor unnecessary, but it must not
+        // misfire on blobs without any endpoint.
+        let none: serde_json::Value =
+            serde_json::from_str(r#"{"jobId":"j3","status":0,"joinScript":"<JoinScript><JobId>abc</JobId></JoinScript>"}"#).unwrap();
+        assert_eq!(extract_endpoint(&none), None);
+        let empty: serde_json::Value = serde_json::from_str(r#"{"jobId":"j4"}"#).unwrap();
+        assert_eq!(extract_endpoint(&empty), None);
+    }
+
+    #[test]
+    fn accepted_join_without_address_is_an_error() {
+        // A success body without any recoverable endpoint must produce the
+        // clear "no server address" error path (via server_addr being None).
+        let j: JoinResponse = serde_json::from_str(r#"{"jobId":"abc"}"#).unwrap();
+        assert_eq!(j.server_addr(), None);
     }
 
     #[test]

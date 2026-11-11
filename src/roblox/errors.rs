@@ -20,6 +20,9 @@ pub enum ApiError {
     BadTwoStepCode(String),
     /// Cookie login rejected (invalid or expired .ROBLOSECURITY).
     InvalidCookie(String),
+    /// The game-join service refused the join (HTTP 200 with jobId: null);
+    /// carries the human-readable reason.
+    JoinRefused(String),
     /// Response body failed to parse.
     Parse(String),
 }
@@ -48,6 +51,7 @@ impl fmt::Display for ApiError {
             }
             ApiError::BadTwoStepCode(m) => write!(f, "Verification failed: {}", m),
             ApiError::InvalidCookie(m) => write!(f, "Invalid session cookie: {}", m),
+            ApiError::JoinRefused(m) => write!(f, "Server refused the join: {}", m),
             ApiError::Parse(m) => write!(f, "Failed to parse API response: {}", m),
         }
     }

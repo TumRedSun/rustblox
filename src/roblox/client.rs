@@ -104,6 +104,12 @@ impl RobloxClient {
         self.jar.len()
     }
 
+    /// True when the client carries a Roblox session (explicit field or the
+    /// browser-style jar holding `.ROBLOSECURITY`).
+    pub fn has_session(&self) -> bool {
+        self.security.is_some() || self.jar.contains_key(".ROBLOSECURITY")
+    }
+
     /// Store every cookie the server sent us (browser-style jar). Empty
     /// values (cookie deletion) are ignored.
     fn apply_set_cookies(&mut self, raw: &RawResponse) {

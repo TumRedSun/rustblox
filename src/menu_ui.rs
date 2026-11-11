@@ -1238,11 +1238,22 @@ fn draw_search_pane(v: &mut MenuView, ctx: &mut UiCtx, fb: &mut FB, x: i32, w: i
         } else {
             ("Type at least 2 characters of a username and press Enter".into(), false)
         };
-        let mw = font::measure(ctx.fonts, &msg, 14.0 * s, false);
-        font::draw(
-            ctx.fonts, fb, x as f32 + w as f32 / 2.0 - mw / 2.0, list_top + list_h / 2.0,
-            &msg, 14.0 * s, t.text_faint, false, 0.0,
-        );
+        // Centered word-wrapped block (long errors must not run off the pane).
+        let msg_px = 14.0 * s;
+        let msg_lh = 19.0 * s;
+        let segs = font::wrap_text(ctx.fonts, &msg, w as f32 - 48.0 * s, msg_px, false);
+        let block_h = segs.len() as f32 * msg_lh;
+        let mid_y = list_top + list_h / 2.0 - block_h / 2.0 + msg_px * 0.85;
+        let mut mw = 0.0f32;
+        for (i, seg) in segs.iter().enumerate() {
+            let seg_w = font::measure(ctx.fonts, seg, msg_px, false);
+            mw = mw.max(seg_w);
+            font::draw(
+                ctx.fonts, fb, x as f32 + w as f32 / 2.0 - seg_w / 2.0,
+                mid_y + i as f32 * msg_lh,
+                seg, msg_px, t.text_faint, false, 0.0,
+            );
+        }
         if spin {
             ui::draw_spinner(
                 fb, x as f32 + w as f32 / 2.0 - mw / 2.0 - 18.0 * s, list_top + list_h / 2.0 - 5.0 * s,
@@ -1441,7 +1452,15 @@ fn measure_logs(fonts: &Fonts, inner_w: f32, s: f32) -> f32 {
     let mut h = 8.0 * s;
     let lines = crate::logs::lines();
     if lines.is_empty() {
-        h += line_h * 2.0;
+        // Keep in sync with draw_logs' empty state (the hint wraps too).
+        let segs = font::wrap_text(
+            fonts,
+            "Try joining a place — every request, response and error lands here.",
+            inner_w.max(32.0),
+            px,
+            false,
+        );
+        h += (segs.len() + 1) as f32 * line_h;
     } else {
         for l in &lines {
             h += log_layout(fonts, l, inner_w, px).2.len() as f32 * line_h;
@@ -1458,12 +1477,12 @@ fn draw_logs(ctx: &mut UiCtx, fb: &mut FB, x: i32, y: &mut f32, w: f32, s: f32) 
     let lines = crate::logs::lines();
     if lines.is_empty() {
         font::draw(ctx.fonts, fb, x as f32, *y + 14.0 * s, "No events yet.", px, t.text_faint, false, 0.0);
-        font::draw(
+        let hint_h = font::draw_wrapped(
             ctx.fonts, fb, x as f32, *y + 14.0 * s + line_h,
             "Try joining a place — every request, response and error lands here.",
-            px, t.text_faint, false, 0.0,
+            px, t.text_faint, false, w.max(32.0), line_h,
         );
-        *y += line_h * 2.0;
+        *y += line_h + hint_h;
         return;
     }
     for l in &lines {
@@ -1968,9 +1987,12 @@ fn draw_status_bar(v: &mut MenuView, ctx: &mut UiCtx, fb: &mut FB, x: i32, w: i3
         refresh_label(v)
     };
     let notice_color = if notice_active { t.green } else { t.text_faint };
-    font::draw(
+    // Long notices (e.g. join refusals) get ellipsized: the status bar is a
+    // single line; the full text lives in Settings → Logs, wrapped.
+    let notice_max_w = w as f32 - 2.0 * pad as f32 - 250.0 * s;
+    font::draw_ellipsis(
         ctx.fonts, fb, (x + pad) as f32, y as f32 + h / 2.0 + 12.0 * s * 0.35,
-        &left, 12.0 * s, notice_color, false, 0.0,
+        &left, 12.0 * s, notice_color, false, notice_max_w.max(80.0),
     );
     if v.refreshing && !notice_active {
         ui::draw_spinner(
