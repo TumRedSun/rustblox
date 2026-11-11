@@ -166,8 +166,11 @@ fn game_thread(
     }
     netlog!(game, "connecting to {} (rcc {}:{})", dial, resp.ip, resp.port);
     // RakNet handshake with several protocol version guesses (the Roblox
-    // fork's exact protocol byte is not public knowledge).
-    let protocols: [u8; 4] = [10, 11, 5, 1];
+    // fork's exact protocol byte is not public knowledge; vanilla RakNet 4
+    // defaults to 5, Minecraft Bedrock bumped to 10/11). Every guess now
+    // really gets sent — each variant gets its own retransmit window — and
+    // each attempt is logged, so the log shows which shapes were tried.
+    let protocols: [u8; 4] = [5, 10, 11, 1];
     let mut client = match RakClient::connect(
         &dial,
         resp.port,

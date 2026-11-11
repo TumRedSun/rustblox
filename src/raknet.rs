@@ -36,8 +36,16 @@ pub const ID_CONNECTION_LOST: u8 = 0x16;
 pub const ID_CONNECTION_BANNED: u8 = 0x17;
 
 /// RakNet offline message data id (16 bytes) shared by all offline packets.
+///
+/// This is the canonical OFFLINE_MESSAGE_DATA_ID from RakNet's
+/// MessageIdentifiers.h, and Roblox's fork keeps it byte-for-byte (confirmed
+/// against the roblox-dissector `OfflineMessageID`). An earlier build shipped
+/// a guessed tail (`fe` × 12) — servers silently drop handshake packets whose
+/// magic doesn't match, which was exactly the "timed out during offline
+/// handshake" failure.
 pub const OFFLINE_MAGIC: [u8; 16] = [
-    0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe,
+    0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe,
+    0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34, 0x56, 0x78,
 ];
 
 const DATAGRAM_VALID: u8 = 0x80;
@@ -340,9 +348,10 @@ impl RakClient {
         };
 
         // Phase 1: OPEN_CONNECTION_REQUEST_1 -> REPLY_1 (MTU probing).
-        let reply1 = c.offline_roundtrip(
+        let reply1 = match c.offline_roundtrip(
             protocol_versions,
             handshake_timeout,
+            "request-1",
             |protocol, out, mtu| {
                 out.push(ID_OPEN_CONNECTION_REQUEST_1);
                 out.extend_from_slice(&OFFLINE_MAGIC);
@@ -351,7 +360,20 @@ impl RakClient {
                 out.resize(mtu as usize, 0x00);
             },
             |c, payload| c.parse_reply1(payload),
-        )?;
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                // Classify the failure for the log: a pong proves the UDP
+                // path and the magic are fine (blame the handshake params);
+                // silence means proxy:port never answered anything at all.
+                if c.probe_reachability(Duration::from_secs(2)).is_some() {
+                    netlog!(net, "path probe: pong — proxy:port is reachable, the handshake packet shape is the problem");
+                } else {
+                    netlog!(net, "path probe: no reply to unconnected pings either — proxy:port unreachable (stale session port, firewall or proxy that ignores pings)");
+                }
+                return Err(e);
+            }
+        };
         let (server_guid, mtu, use_security) = reply1;
         netlog!(net, "REPLY_1: guid={} mtu={} security={}", server_guid, mtu, use_security);
         c.server_guid = server_guid;
@@ -362,6 +384,7 @@ impl RakClient {
         let reply2 = c.offline_roundtrip(
             &[()],
             handshake_timeout,
+            "request-2",
             move |_, out, _mtu| {
                 out.push(ID_OPEN_CONNECTION_REQUEST_2);
                 out.extend_from_slice(&OFFLINE_MAGIC);
@@ -395,8 +418,11 @@ impl RakClient {
                 .as_millis() as u64;
             out.extend_from_slice(&t.to_le_bytes());
             out.push(0); // useSecurity = false
-            let _ = c.socket.send_to(&out, c.server);
-            netlog!(net, "CONNECTION_REQUEST sent");
+            if let Err(e) = c.socket.send_to(&out, c.server) {
+                netlog!(net, "CONNECTION_REQUEST send failed: {}", e);
+            } else {
+                netlog!(net, "CONNECTION_REQUEST sent");
+            }
 
             if let Some(payload) = c.wait_readable(deadline) {
                 // A 0-byte UDP datagram is legal — payload.first() keeps the
@@ -422,11 +448,19 @@ impl RakClient {
         Ok(c)
     }
 
-    /// Generic offline request/reply round with per-attempt timeout.
+    /// Generic offline request/reply round.
+    ///
+    /// Every variant gets an equal slice of `timeout` (with mid-window
+    /// retransmits for packet loss) — an earlier build handed the WHOLE
+    /// budget to the first variant, so "4 protocol attempts" in the failure
+    /// message really sent only the first packet shape. Any datagram that
+    /// arrives is logged (first bytes) whether or not it parses, so a wrong
+    /// reply shape is visible in the client log alone.
     fn offline_roundtrip<P, R, F>(
         &mut self,
         variants: &[P],
         timeout: Duration,
+        label: &str,
         mut build: impl FnMut(&P, &mut Vec<u8>, u16),
         mut parse: F,
     ) -> Result<R, RakError>
@@ -434,28 +468,113 @@ impl RakClient {
         F: FnMut(&mut RakClient, &[u8]) -> Option<R>,
     {
         let deadline = Instant::now() + timeout;
-        for v in variants {
-            loop {
-                if Instant::now() >= deadline {
-                    return Err(RakError::TimedOut("offline handshake"));
-                }
-                let mut out = Vec::with_capacity(self.mtu as usize);
-                build(v, &mut out, self.mtu);
-                let _ = self.socket.send_to(&out, self.server);
-                if let Some(payload) = self.wait_readable(deadline) {
-                    if let Some(r) = parse(self, &payload) {
-                        return Ok(r);
+        let per_variant = {
+            let t = timeout / (variants.len().max(1) as u32);
+            t.clamp(Duration::from_millis(600), Duration::from_millis(2500))
+        };
+        for (i, v) in variants.iter().enumerate() {
+            let window_end = (Instant::now() + per_variant).min(deadline);
+            let mut next_send = Instant::now();
+            let mut sends = 0u32;
+            let mut out = Vec::with_capacity(self.mtu as usize);
+            while Instant::now() < window_end {
+                if Instant::now() >= next_send {
+                    out.clear();
+                    build(v, &mut out, self.mtu);
+                    sends += 1;
+                    if let Err(e) = self.socket.send_to(&out, self.server) {
+                        netlog!(net, "handshake {}: attempt {} send #{} failed: {}", label, i + 1, sends, e);
+                    } else if sends == 1 {
+                        netlog!(net, "handshake {}: attempt {} — {} bytes on the wire (retransmitting every 500 ms)", label, i + 1, out.len());
                     }
-                } else {
-                    break;
+                    next_send += Duration::from_millis(500);
                 }
-                std::thread::sleep(Duration::from_millis(80));
+                match self.socket.recv_from(&mut self.buf) {
+                    Ok((n, from)) => {
+                        let payload = self.buf[..n].to_vec();
+                        if from != self.server {
+                            netlog!(
+                                net,
+                                "handshake {}: datagram from unexpected addr {} ({} bytes, first byte 0x{:02x})",
+                                label,
+                                from,
+                                n,
+                                payload.first().copied().unwrap_or(0)
+                            );
+                            continue;
+                        }
+                        self.last_recv = Instant::now();
+                        if let Some(r) = parse(self, &payload) {
+                            netlog!(net, "handshake {}: attempt {} got a valid reply after {} send(s)", label, i + 1, sends);
+                            return Ok(r);
+                        }
+                        netlog!(
+                            net,
+                            "handshake {}: attempt {} — unparsed datagram ({} bytes: {})",
+                            label,
+                            i + 1,
+                            n,
+                            hex_head(&payload, 24)
+                        );
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(8));
+                    }
+                    Err(e) => {
+                        netlog!(net, "handshake {}: recv failed: {}", label, e);
+                        break;
+                    }
+                }
             }
         }
         Err(RakError::TimedOut("offline handshake"))
     }
 
+    /// Reachability probe: RakNet unconnected pings (0x01 / 0x02) with the
+    /// standard magic. Returns the reply length on any pong. This separates
+    /// "the network path is dead" from "the handshake packet shape is
+    /// rejected" — servers that answer pings but ignore our handshake point
+    /// at protocol-level mismatches, not at the proxy/port.
+    fn probe_reachability(&mut self, timeout: Duration) -> Option<usize> {
+        for pid in [0x01u8, 0x02u8] {
+            let mut pkt = Vec::with_capacity(1 + 16 + 8);
+            pkt.push(pid);
+            pkt.extend_from_slice(&OFFLINE_MAGIC);
+            pkt.extend_from_slice(&self.guid.to_le_bytes());
+            if let Err(e) = self.socket.send_to(&pkt, self.server) {
+                netlog!(net, "path probe: ping 0x{:02x} send failed: {}", pid, e);
+                continue;
+            }
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                match self.socket.recv_from(&mut self.buf) {
+                    Ok((n, from)) => {
+                        if from != self.server {
+                            continue;
+                        }
+                        self.last_recv = Instant::now();
+                        netlog!(
+                            net,
+                            "path probe: reply to 0x{:02x} ({} bytes: {})",
+                            pid,
+                            n,
+                            hex_head(&self.buf[..n], 24)
+                        );
+                        return Some(n);
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(8));
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        None
+    }
+
     /// Block until a datagram arrives (nonblocking socket + sleep polling).
+    /// Datagrams from other addresses are logged — a proxy answering from a
+    /// different source port used to be silently discarded here.
     fn wait_readable(&mut self, deadline: Instant) -> Option<Vec<u8>> {
         while Instant::now() < deadline {
             match self.socket.recv_from(&mut self.buf) {
@@ -463,7 +582,16 @@ impl RakClient {
                     self.last_recv = Instant::now();
                     return Some(self.buf[..n].to_vec());
                 }
-                Ok(_) => continue,
+                Ok((n, from)) => {
+                    netlog!(
+                        net,
+                        "datagram from unexpected addr {} while connected to {} ({} bytes, first byte 0x{:02x})",
+                        from,
+                        self.server,
+                        n,
+                        self.buf.first().copied().unwrap_or(0)
+                    );
+                }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(8));
                 }
@@ -977,28 +1105,42 @@ fn frame_encoded_len(f: &Frame) -> usize {
 fn read_address(r: &mut Reader) -> Option<SocketAddr> {
     let family = r.u8()?;
     if family == 4 {
+        // Ports ride in network byte order (they come straight out of
+        // sockaddr_in on both ends of vanilla RakNet and its forks).
         let port = r.u16()?;
         let ip = r.bytes(4)?;
         Some(SocketAddr::new(
             std::net::IpAddr::V4(std::net::Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3])),
-            port,
+            u16::from_be(port),
         ))
     } else {
         let port = r.u16()?;
         let ip = r.bytes(16)?;
         let mut o = [0u8; 16];
         o.copy_from_slice(ip);
-        Some(SocketAddr::new(std::net::IpAddr::V6(o.into()), port))
+        Some(SocketAddr::new(
+            std::net::IpAddr::V6(o.into()),
+            u16::from_be(port),
+        ))
     }
 }
 
 fn write_address(out: &mut Vec<u8>, addr: SocketAddr) {
     out.push(4);
-    out.extend_from_slice(&addr.port().to_le_bytes());
+    out.extend_from_slice(&addr.port().to_be_bytes());
     match addr.ip() {
         std::net::IpAddr::V4(v4) => out.extend_from_slice(&v4.octets()),
         std::net::IpAddr::V6(v6) => out.extend_from_slice(&v6.octets()),
     }
+}
+
+/// Compact hex dump for log lines.
+fn hex_head(buf: &[u8], n: usize) -> String {
+    buf.iter()
+        .take(n)
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 // ---------------------------------------------------------------------------
@@ -1008,6 +1150,20 @@ fn write_address(out: &mut Vec<u8>, addr: SocketAddr) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offline_magic_is_the_canonical_raknet_bytes() {
+        // Guards against re-guessing the magic: Roblox keeps the vanilla
+        // OFFLINE_MESSAGE_DATA_ID (see the const docs). A wrong byte here
+        // made every server silently drop our handshake.
+        assert_eq!(
+            OFFLINE_MAGIC,
+            [
+                0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe,
+                0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34, 0x56, 0x78,
+            ]
+        );
+    }
 
     #[test]
     fn frame_roundtrip_reliable() {

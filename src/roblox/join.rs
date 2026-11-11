@@ -372,6 +372,10 @@ fn join_request(
     // joinError details we want to surface.
     let v: serde_json::Value = serde_json::from_str(text.trim())
         .map_err(|e| ApiError::Parse(format!("{} (body: {})", e, snippet(&text, 200))))?;
+    // Shape dump BEFORE the typed parse: names only (the values carry auth
+    // tickets), so the next failing join shows exactly which fields Roblox
+    // sent — new endpoint/udmux fields are visible without another round trip.
+    dump_join_shape(&v);
     let resp: JoinResponse = serde_json::from_value(v.clone())
         .map_err(|e| ApiError::Parse(format!("{} (body: {})", e, snippet(&text, 200))))?;
     if resp.job_id.is_empty() {
@@ -404,6 +408,73 @@ fn join_request(
         resp.data_center_id
     );
     Ok(resp)
+}
+
+/// Log the SHAPE of a join response — top-level keys plus the join script's
+/// field names (XML tags or JSON keys). Names only, never values: the script
+/// carries authentication tickets. This makes a failed join diagnosable from
+/// the log alone — if Roblox starts handing out a udmux proxy address (or any
+/// other endpoint dialect) the next log shows the exact field name to parse.
+fn dump_join_shape(v: &serde_json::Value) {
+    let mut top: Vec<&str> = v
+        .as_object()
+        .map(|o| o.keys().map(|k| k.as_str()).collect())
+        .unwrap_or_default();
+    top.sort_unstable();
+    crate::netlog!(info, "join response fields: {}", top.join(", "));
+
+    let Some(js) = v.get("joinScript") else { return };
+    if let Some(s) = js.as_str() {
+        let trimmed = s.trim_start();
+        if trimmed.starts_with('{') {
+            if let Ok(jv) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                let mut keys: Vec<String> = jv
+                    .as_object()
+                    .map(|o| o.keys().cloned().collect())
+                    .unwrap_or_default();
+                keys.sort();
+                crate::netlog!(info, "join script (json, {} bytes) keys: {}", s.len(), keys.join(", "));
+                return;
+            }
+        }
+        let tags = xml_tag_names(s);
+        if !tags.is_empty() {
+            crate::netlog!(info, "join script (xml, {} bytes) tags: {}", s.len(), tags.join(", "));
+        } else {
+            crate::netlog!(info, "join script: {} bytes, no recognizable tags/keys", s.len());
+        }
+    } else if let Some(obj) = js.as_object() {
+        let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+        keys.sort_unstable();
+        crate::netlog!(info, "join script (object) keys: {}", keys.join(", "));
+    }
+}
+
+/// Distinct tag names of an XML-ish blob, in order of first appearance
+/// (capped so a pathological script can't flood the log).
+fn xml_tag_names(blob: &str) -> Vec<String> {
+    let bytes = blob.as_bytes();
+    let mut tags: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() && tags.len() < 60 {
+        if bytes[i] == b'<' {
+            let start = i + 1;
+            let mut j = start;
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            if j > start && j < bytes.len() && (bytes[j] == b'>' || bytes[j] == b' ' || bytes[j] == b'/') {
+                let name = blob[start..j].to_string();
+                if !tags.iter().any(|t| t == &name) {
+                    tags.push(name);
+                }
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    tags
 }
 
 /// Pull the game-server endpoint out of a join response that doesn't carry
