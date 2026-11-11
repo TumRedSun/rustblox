@@ -399,16 +399,19 @@ impl RakClient {
             netlog!(net, "CONNECTION_REQUEST sent");
 
             if let Some(payload) = c.wait_readable(deadline) {
-                if payload[0] == ID_CONNECTION_REQUEST_ACCEPTED {
-                    c.handle_accepted(&payload)?;
-                    break;
-                }
-                match payload[0] {
-                    ID_CONNECTION_ATTEMPT_FAILED => return Err(RakError::Rejected("attempt failed")),
-                    ID_NO_FREE_INCOMING_CONNECTIONS => return Err(RakError::Rejected("server full")),
-                    ID_CONNECTION_BANNED => return Err(RakError::Banned),
-                    ID_ALREADY_CONNECTED => return Err(RakError::AlreadyConnected),
-                    _ => netlog!(net, "got id 0x{:02x} while connecting", payload[0]),
+                // A 0-byte UDP datagram is legal — payload.first() keeps the
+                // match panic-free (payload[0] here took the process down).
+                match payload.split_first() {
+                    Some((&ID_CONNECTION_REQUEST_ACCEPTED, _)) => {
+                        c.handle_accepted(&payload)?;
+                        break;
+                    }
+                    Some((&ID_CONNECTION_ATTEMPT_FAILED, _)) => return Err(RakError::Rejected("attempt failed")),
+                    Some((&ID_NO_FREE_INCOMING_CONNECTIONS, _)) => return Err(RakError::Rejected("server full")),
+                    Some((&ID_CONNECTION_BANNED, _)) => return Err(RakError::Banned),
+                    Some((&ID_ALREADY_CONNECTED, _)) => return Err(RakError::AlreadyConnected),
+                    Some((&other, _)) => netlog!(net, "got id 0x{:02x} while connecting", other),
+                    None => netlog!(net, "ignoring empty datagram during handshake"),
                 }
             }
             std::thread::sleep(Duration::from_millis(120));

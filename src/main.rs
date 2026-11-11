@@ -9,6 +9,11 @@ use rustblox::config;
 use rustblox::net::{self, UserEvent};
 
 fn main() {
+    // Diagnostics first: persistent log file + panic hook, so a crash
+    // leaves a report on disk instead of dying silently with the
+    // in-memory log ring.
+    rustblox::logs::init_file();
+    rustblox::logs::install_panic_hook();
     let session = config::load_session();
     let event_loop = winit::event_loop::EventLoop::<UserEvent>::with_user_event()
         .build()

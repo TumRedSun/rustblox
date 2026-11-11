@@ -195,7 +195,9 @@ impl App {
             // The 3D scene comes from the live session (if connected).
             let scene = match &self.screen {
                 Screen::Game(GameView::Active { session, .. }) => {
-                    let st = session.state.lock().unwrap();
+                    // Poison-tolerant: a game-thread panic must never take
+                    // the UI down through a poisoned mutex unwrap.
+                    let st = session.state.lock().unwrap_or_else(|p| p.into_inner());
                     Some(st.scene.clone())
                 }
                 _ => None,
@@ -246,7 +248,7 @@ impl App {
                     "Esc — cancel", 12.0 * s, t.text_dim, false, 0.0);
             }
             GameView::Active { session, place_name, fps, .. } => {
-                let st = session.state.lock().unwrap();
+                let st = session.state.lock().unwrap_or_else(|p| p.into_inner());
                 let pad = 14.0 * s;
                 let lines: Vec<(String, f32)> = vec![
                     (place_name.clone(), 17.0 * s),
@@ -1057,7 +1059,7 @@ impl ApplicationHandler<UserEvent> for App {
             *last_frame = now;
             *fps = *fps * 0.9 + (1.0 / dt.max(1.0 / 240.0)) * 0.1;
             ctrl.step(dt);
-            let st = session.state.lock().unwrap();
+            let st = session.state.lock().unwrap_or_else(|p| p.into_inner());
             let phase = st.phase.clone();
             drop(st);
             if matches!(phase, GamePhase::Failed(_) | GamePhase::Left) {

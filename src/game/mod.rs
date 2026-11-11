@@ -73,11 +73,29 @@ impl GameSession {
         let sp = Arc::clone(&stop);
         let appearance = resp.character_appearance_url.clone();
         let user_id = user_id;
+        let sp_catch = Arc::clone(&stop);
+        let st_after = Arc::clone(&state);
 
         std::thread::Builder::new()
             .name("rustblox-game".into())
             .spawn(move || {
-                game_thread(st, sp, resp, appearance, user_id);
+                // A panic in this thread must never take the whole client
+                // down: the UI locks `state` every frame, so a poisoned
+                // mutex would cascade the panic there (the reported "client
+                // just crashed"). Catch, report, surface as a Failed phase.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    game_thread(st, sp, resp, appearance, user_id);
+                }));
+                drop(sp_catch);
+                if let Err(panic) = result {
+                    let msg = panic_message(&panic);
+                    netlog!(game, "game thread panicked: {}", msg);
+                    let mut g = st_after.lock().unwrap_or_else(|p| p.into_inner());
+                    g.phase = GamePhase::Failed(format!(
+                        "Внутренняя ошибка игрового потока: {} — пришлите лог из Настройки → Логи",
+                        msg
+                    ));
+                }
             })
             .expect("spawn game thread");
 
@@ -87,6 +105,23 @@ impl GameSession {
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
     }
+}
+
+fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+/// Poison-tolerant state lock: after any (caught) panic the mutex stays
+/// poisoned; the UI and the game thread must keep working off the surviving
+/// data instead of dying on the next `.unwrap()`.
+fn lock_state(state: &std::sync::Mutex<GameState>) -> std::sync::MutexGuard<'_, GameState> {
+    state.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 fn game_thread(
@@ -108,13 +143,13 @@ fn game_thread(
     ) {
         Ok(c) => c,
         Err(e) => {
-            let mut st = state.lock().unwrap();
+            let mut st = lock_state(&state);
             st.phase = GamePhase::Failed(format!("Не удалось подключиться: {}", e));
             return;
         }
     };
     netlog!(game, "raknet connected: {}", resp.ip);
-    state.lock().unwrap().phase = GamePhase::InGame;
+    lock_state(&state).phase = GamePhase::InGame;
 
     // Fetch our avatar appearance (best effort, no cookie needed for the
     // standard endpoint).
@@ -133,7 +168,7 @@ fn game_thread(
         while let Some(payload) = client.poll() {
             got_any = true;
             let events = {
-                let mut st = state.lock().unwrap();
+                let mut st = lock_state(&state);
                 let events = parser().feed(&payload, &mut st.world);
                 st.packets += 1;
                 st.decoded += events
@@ -153,12 +188,12 @@ fn game_thread(
 
         let ping = client.ping_ms;
         {
-            let mut st = state.lock().unwrap();
+            let mut st = lock_state(&state);
             st.ping_ms = ping;
             st.skipped = parser().skipped;
         }
         if client.state == RakState::Disconnected {
-            let mut st = state.lock().unwrap();
+            let mut st = lock_state(&state);
             if st.phase == GamePhase::InGame {
                 st.phase = GamePhase::Failed("Соединение с сервером потеряно".into());
             }
@@ -168,7 +203,7 @@ fn game_thread(
         // Rebuild the renderable scene a few times per second.
         if last_scene.elapsed() >= Duration::from_millis(180) {
             last_scene = Instant::now();
-            let mut st = state.lock().unwrap();
+            let mut st = lock_state(&state);
             st.scene.clear();
             st.instances = st.world.len();
             let world = std::mem::take(&mut st.world);
@@ -193,7 +228,7 @@ fn game_thread(
         std::thread::sleep(Duration::from_millis(2));
     }
     client.close();
-    let mut st = state.lock().unwrap();
+    let mut st = lock_state(&state);
     if st.phase == GamePhase::InGame {
         st.phase = GamePhase::Left;
     }
@@ -207,7 +242,9 @@ fn parser() -> std::sync::MutexGuard<'static, crate::roblox::replication::Replic
     PARSER
         .get_or_init(|| std::sync::Mutex::new(crate::roblox::replication::ReplicationParser::new()))
         .lock()
-        .unwrap()
+        // Poison-tolerant: a panicked feed() must not brick every later
+        // packet with a lock unwrap.
+        .unwrap_or_else(|p| p.into_inner())
 }
 
 /// First SpawnLocation/SpawnPart position in the world.
