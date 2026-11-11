@@ -11,6 +11,7 @@
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 /// Maximum number of stored lines.
@@ -20,6 +21,10 @@ pub const CAP: usize = 400;
 pub const MAX_LINE_CHARS: usize = 240;
 
 static LOGS: Mutex<Option<VecDeque<String>>> = Mutex::new(None);
+/// Persistent log file (opened append-mode by [`init_file`]). Every entry is
+/// mirrored here so a crash cannot take the diagnostics with it — the
+/// in-memory ring dies with the process, the file does not.
+static LOG_FILE: Mutex<Option<std::fs::File>> = Mutex::new(None);
 
 /// UTC time-of-day as `[HH:MM:SS]` (no chrono dependency; the date is not
 /// needed for live diagnostics and keeps lines short).
@@ -63,7 +68,108 @@ fn push_into(buf: &mut VecDeque<String>, stamp: &str, kind: &str, line: &str) {
 pub fn push(kind: &str, line: &str) {
     let Ok(mut guard) = LOGS.lock() else { return };
     let buf = guard.get_or_insert_with(|| VecDeque::with_capacity(CAP));
-    push_into(buf, &stamp(), kind, line);
+    let stamped = stamp();
+    push_into(buf, &stamped, kind, line);
+    // Mirror to the file (best effort — never panics, never blocks the UI
+    // for long: the file handle is buffered-free and flushed per line).
+    for part in line.lines() {
+        let part = part.trim_end();
+        if part.is_empty() {
+            continue;
+        }
+        file_write(&format!("{} [{}] {}\n", stamped, kind, clamp_line(part)));
+    }
+}
+
+/// Path of the persistent log file (not created yet is fine).
+pub fn log_file_path() -> Option<PathBuf> {
+    crate::config::app_dir().map(|d| d.join("logs").join("client.log"))
+}
+
+/// Open the persistent log file. Rotates `client.log` to `client.prev.log`
+/// when the current file grew past 1 MiB, so one buggy session cannot grow
+/// it forever. Called once at startup; safe to call again (no-op while the
+/// file is already open).
+pub fn init_file() {
+    let Ok(mut guard) = LOG_FILE.lock() else { return };
+    if guard.is_some() {
+        return;
+    }
+    let Some(path) = log_file_path() else { return };
+    let dir = match path.parent() {
+        Some(d) => d,
+        None => return,
+    };
+    let _ = std::fs::create_dir_all(dir);
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > 1024 * 1024 {
+            let _ = std::fs::rename(&path, dir.join("client.prev.log"));
+        }
+    }
+    let file = std::fs::OpenOptions::new().create(true).append(true).open(&path);
+    match file {
+        Ok(f) => {
+            *guard = Some(f);
+            let started = format!(
+                "{} [app] --- rustblox session started (pid {}) ---\n",
+                stamp(),
+                std::process::id()
+            );
+            file_write(&started);
+        }
+        Err(e) => {
+            eprintln!("[rustblox] log file unavailable ({}): {}", path.display(), e);
+        }
+    }
+}
+
+/// Append raw text to the log file. Poison-tolerant and panic-free on
+/// purpose: this runs inside the panic hook.
+fn file_write(text: &str) {
+    use std::io::Write;
+    if let Ok(mut guard) = LOG_FILE.lock() {
+        if let Some(f) = guard.as_mut() {
+            let _ = f.write_all(text.as_bytes());
+            let _ = f.flush();
+        }
+    }
+}
+
+/// Install the panic hook: every panic is stamped with thread, message and
+/// location into the persistent log file (plus the last buffered lines for
+/// context) BEFORE the default hook prints to stderr. Without this a crash
+/// took the whole diagnostic ring buffer with it — exactly the un-reportable
+/// "client just crashed" case.
+pub fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("<unnamed>").to_string();
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string panic payload>".to_string()
+        };
+        file_write(&format!(
+            "{} [panic] thread '{}' panicked at {}: {}\n",
+            stamp(),
+            name,
+            loc,
+            msg
+        ));
+        // Context: the last lines we buffered (direct file write — the LOGS
+        // mutex could be the one the panicking thread held).
+        for line in lines().iter().rev().take(40).rev() {
+            file_write(&format!("{}\n", line));
+        }
+        default(info);
+    }));
 }
 
 /// Snapshot of the buffer (oldest first).
