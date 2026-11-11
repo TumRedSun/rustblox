@@ -85,6 +85,10 @@ pub enum Hit {
     ResetAppearance,
     /// Settings → Logs: copy the whole diagnostic log buffer to the clipboard.
     CopyLogs,
+    /// Settings → Logs: save the persistent log file into the user-visible
+    /// Downloads location (Android MediaStore) — the no-root way to send a
+    /// full crash report.
+    SaveLogs,
     /// Settings → Logs: wipe the diagnostic log buffer.
     ClearLogs,
 }

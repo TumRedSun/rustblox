@@ -219,6 +219,33 @@ impl Gfx {
             ..Default::default()
         }))
         .expect("request wgpu device");
+        // Replace wgpu's default uncaptured-error handler (which PANICS —
+        // the reported "client just crashes when joining") with a logging
+        // one: the full validation message lands in the persistent log
+        // file unclamped, the offending frame is skipped and the client
+        // keeps running. The full text is what pins down the actual
+        // invalid resource/pipeline on device-specific drivers. Repeats
+        // are collapsed (a bad draw fires once per frame — 60 identical
+        // KB-sized lines per second would drown the log and rotate it
+        // out within seconds).
+        device.on_uncaptured_error(Arc::new(|err| {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static LAST_KEY: AtomicU64 = AtomicU64::new(0);
+            static ERR_NO: AtomicU64 = AtomicU64::new(0);
+            // FNV-1a over the first 512 chars identifies the error kind.
+            let text = format!("{err}");
+            let mut hash: u64 = 0xcbf29ce484222325;
+            for b in text.as_bytes().iter().take(512) {
+                hash ^= *b as u64;
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+            let n = ERR_NO.fetch_add(1, Ordering::Relaxed) + 1;
+            if LAST_KEY.swap(hash, Ordering::Relaxed) == hash && n > 1 {
+                return; // same error as before — already logged
+            }
+            let tag = if n > 1 { format!(" (wgpu error #{n})") } else { String::new() };
+            crate::logs::push_unclamped("gfx", &format!("wgpu error: {text}{tag}"));
+        }));
 
         let size = window.inner_size();
         let caps = surface.get_capabilities(&adapter);
@@ -453,6 +480,18 @@ impl Gfx {
             bind_group_layouts: &[Some(&scene_bgl0), Some(&scene_bgl1)],
             immediate_size: 0,
         });
+        // The shadow and sky entry points never touch the shadow map
+        // (group 1) — the shadow pass WRITES the map it would read, which
+        // would even be a usage conflict. Their pipelines therefore carry a
+        // group-0-only layout: with the shared two-group layout every
+        // shadow/sky draw was missing bind group 1 — a lazy validation
+        // error surfacing only at encoder finish(), killing the client on
+        // the first scene frame (the reported join crash).
+        let scene_light_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("scene-light-pl"),
+            bind_group_layouts: &[Some(&scene_bgl0)],
+            immediate_size: 0,
+        });
         let scene_vertex_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<SceneInstance>() as u64,
             step_mode: wgpu::VertexStepMode::Instance,
@@ -504,7 +543,7 @@ impl Gfx {
         });
         let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("shadow-pipeline"),
-            layout: Some(&scene_pipeline_layout),
+            layout: Some(&scene_light_layout),
             vertex: wgpu::VertexState {
                 module: &scene_module,
                 entry_point: Some("vs_shadow"),
@@ -535,7 +574,7 @@ impl Gfx {
         });
         let sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("sky-pipeline"),
-            layout: Some(&scene_pipeline_layout),
+            layout: Some(&scene_light_layout),
             vertex: wgpu::VertexState {
                 module: &scene_module,
                 entry_point: Some("vs_sky"),
@@ -1094,8 +1133,14 @@ impl Gfx {
             // Start the next batch (bind the right texture group).
             match img {
                 Some(h) => {
-                    if let Some(group) = self.images.get(&h) {
-                        pass.set_bind_group(0, &group.group, &[]);
+                    match self.images.get(&h) {
+                        Some(group) => pass.set_bind_group(0, &group.group, &[]),
+                        // The image failed to upload (bad data, size guard)
+                        // — draw the quad against the atlas instead of
+                        // leaving slot 0 unbound: a draw with a missing
+                        // required bind group is recorded as a lazy
+                        // validation error that surfaces at finish().
+                        None => pass.set_bind_group(0, &self.ui_bind_atlas, &[]),
                     }
                 }
                 None => {

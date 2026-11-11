@@ -1231,7 +1231,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 | Hit::RadiusUp | Hit::RadiusDown | Hit::ColorPrev(_)
                                 | Hit::ColorNext(_) | Hit::ResetAppearance | Hit::CancelAdd
                                 | Hit::ClearField(_)
-                                | Hit::CopyLogs | Hit::ClearLogs
+                                | Hit::CopyLogs | Hit::SaveLogs | Hit::ClearLogs
                                 | Hit::StripLeft | Hit::StripRight | Hit::JoinPlace(_) => {
                                     self.handle_button(released_hit);
                                 }
@@ -1636,6 +1636,19 @@ impl App {
                             format!("Logs copied to the clipboard ({} lines)", n)
                         } else {
                             "Could not access the clipboard".into()
+                        },
+                        Instant::now() + Duration::from_secs(4),
+                    ));
+                }
+                self.needs_redraw = true;
+            }
+            Hit::SaveLogs => {
+                let saved = crate::logs::export_logs();
+                if let Screen::Menu(v) = &mut self.screen {
+                    v.notice = Some((
+                        match &saved {
+                            Some(name) => format!("Log saved to Downloads as {name}"),
+                            None => "Could not save the log (no Downloads backend)".into(),
                         },
                         Instant::now() + Duration::from_secs(4),
                     ));

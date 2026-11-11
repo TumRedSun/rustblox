@@ -31,6 +31,11 @@ pub struct PlatformHooks {
     /// accounts and settings — `dirs::config_dir()` is unusable on Android
     /// (no `$HOME`). None on desktop → the caller falls back to `dirs`.
     pub app_data_dir: Option<fn() -> Option<std::path::PathBuf>>,
+    /// Saves `data` as `name` into the platform's user-visible Downloads
+    /// location (Android: MediaStore.Downloads via JNI — reachable from any
+    /// file manager without root). Returns false / no-op on desktop or if
+    /// storage refuses; callers must treat it as best-effort.
+    pub log_export: Option<fn(&str, &[u8]) -> bool>,
 }
 
 static HOOKS: OnceLock<RwLock<PlatformHooks>> = OnceLock::new();
@@ -87,4 +92,13 @@ pub fn window_ready() {
 pub fn app_data_dir() -> Option<std::path::PathBuf> {
     let f = hooks().app_data_dir?;
     f()
+}
+
+/// Saves `data` as `name` into the user-visible Downloads location (false
+/// on desktop — the caller falls back to the plain log file).
+pub fn export_log(name: &str, data: &[u8]) -> bool {
+    match hooks().log_export {
+        Some(f) => f(name, data),
+        None => false,
+    }
 }
