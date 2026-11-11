@@ -88,7 +88,9 @@ goes to three places at once:
 
 1. **In-memory ring buffer** — visible live in *Settings → Logs*; the
    *Copy logs* button hands the whole buffer to the system clipboard (the
-   way to report a problem without any file access at all).
+   way to report a problem without any file access at all). The *Save*
+   button drops the full log into the public Downloads collection as
+   `rustblox-client-<unix>.log`, visible to any file manager.
 2. **Persistent log file** — survives crashes and restarts, flushed per
    line. Location:
    - Android (app-private, root/adb only):
@@ -107,6 +109,14 @@ keeps its diagnostics. On the next launch the client rescans the log file
 and shows `previous session crashed! …` with the recovered panic lines at
 the top of *Settings → Logs* — that is how a crash on a phone with no PC
 and no root gets reported: reproduce it, relaunch, *Copy logs*, paste.
+
+On the next launch after a crash the client also exports the report to
+Downloads automatically (`rustblox-crash-<unix>.log`, one-shot per panic)
+and shows the recovered panic at the top of *Settings → Logs*.
+
+wgpu GPU validation errors are captured by a custom uncaptured-error
+handler: the full multi-line message (the part that names the invalid
+resource) goes to the log file unclamped and the client keeps running.
 
 Files rotate at 1 MiB (`client.log` → `client.prev.log`). Note that a hard
 native abort (SIGSEGV in driver/JNI code, OOM kill) cannot run Rust code;

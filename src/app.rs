@@ -624,7 +624,7 @@ impl App {
                     | Hit::RadiusUp | Hit::RadiusDown | Hit::ColorPrev(_)
                     | Hit::ColorNext(_) | Hit::ResetAppearance | Hit::CancelAdd
                     | Hit::ClearField(_)
-                    | Hit::CopyLogs | Hit::ClearLogs
+                    | Hit::CopyLogs | Hit::SaveLogs | Hit::ClearLogs
                     | Hit::StripLeft | Hit::StripRight | Hit::JoinPlace(_) => {
                         self.handle_button(released_hit);
                     }

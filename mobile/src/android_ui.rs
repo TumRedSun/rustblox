@@ -194,3 +194,179 @@ pub fn register_log_mirror() {
     };
     rustblox::logs::add_mirror_file(&path.join("rustblox").join("logs").join("client.log"));
 }
+
+/// Saves `data` as `name` into the public Downloads collection via
+/// MediaStore (API 29+, no permissions needed for the app's own files).
+///
+/// This is the user-facing export path: files land in `Download/` where
+/// ANY file manager (and any chat app's attachment picker) can see them,
+/// unlike the app-private or external-files locations. On API 26–28,
+/// where MediaStore.Downloads does not exist, falls back to a direct
+/// write into `Environment.getExternalStoragePublicDirectory(Download)`
+/// (needs WRITE_EXTERNAL_STORAGE granted; otherwise fails silently).
+///
+/// Runs on the app thread (Settings button / startup recovery), never
+/// inside the panic hook — JNI from a panicking thread is too fragile.
+pub fn export_to_downloads(name: &str, data: &[u8]) -> bool {
+    let Some(app) = crate::APP.get() else { return false };
+    unsafe {
+        let Ok(vm) = jni::JavaVM::from_raw(app.vm_as_ptr() as *mut jni::sys::JavaVM) else {
+            return false;
+        };
+        let Ok(mut guard) = vm.attach_current_thread() else { return false };
+        let env: &mut jni::JNIEnv = &mut guard;
+        let activity =
+            jni::objects::JObject::from_raw(app.activity_as_ptr() as *mut jni::sys::_jobject);
+
+        if export_via_mediastore(env, &activity, name, data) {
+            return true;
+        }
+        let _ = clear(env);
+        export_via_legacy_download_dir(env, &activity, name, data)
+    }
+}
+
+/// API 29+: insert into MediaStore.Downloads, then write through the
+/// ContentResolver's OutputStream.
+fn export_via_mediastore(
+    env: &mut jni::JNIEnv,
+    activity: &jni::objects::JObject<'static>,
+    name: &str,
+    data: &[u8],
+) -> bool {
+    use jni::objects::JValue;
+
+    // MediaStore.Downloads.EXTERNAL_CONTENT_URI (static field, API 29+).
+    let Ok(uri) = env
+        .get_static_field(
+            "android/provider/MediaStore$Downloads",
+            "EXTERNAL_CONTENT_URI",
+            "Landroid/net/Uri;",
+        )
+        .and_then(|v| v.l())
+    else {
+        return false;
+    };
+    let Ok(values) = env.new_object("android/content/ContentValues", "()V", &[]) else {
+        return false;
+    };
+    let Ok(jname) = env.new_string(name) else { return false };
+    let Ok(mime) = env.new_string("text/plain") else { return false };
+    for (k, v) in [("_display_name", &jname), ("mime_type", &mime)] {
+        let Ok(jkey) = env.new_string(k) else { return false };
+        if env
+            .call_method(
+                &values,
+                "put",
+                "(Ljava/lang/String;Ljava/lang/String;)V",
+                &[JValue::Object(&jkey), JValue::Object(v)],
+            )
+            .is_err()
+        {
+            return false;
+        }
+    }
+    let Ok(resolver) = env
+        .call_method(activity, "getContentResolver", "()Landroid/content/ContentResolver;", &[])
+        .and_then(|v| v.l())
+    else {
+        return false;
+    };
+    let Ok(new_uri) = env
+        .call_method(
+            &resolver,
+            "insert",
+            "(Landroid/net/Uri;Landroid/content/ContentValues;)Landroid/net/Uri;",
+            &[JValue::Object(&uri), JValue::Object(&values)],
+        )
+        .and_then(|v| v.l())
+    else {
+        return false;
+    };
+    if new_uri.is_null() {
+        return false;
+    }
+    let Ok(out) = env
+        .call_method(
+            &resolver,
+            "openOutputStream",
+            "(Landroid/net/Uri;)Ljava/io/OutputStream;",
+            &[JValue::Object(&new_uri)],
+        )
+        .and_then(|v| v.l())
+    else {
+        return false;
+    };
+    if out.is_null() {
+        return false;
+    }
+    let Ok(arr) = env.byte_array_from_slice(data) else { return false };
+    let Ok(()) = env.call_method(
+        &out,
+        "write",
+        "([B)V",
+        &[JValue::Object(&arr)],
+    ) else {
+        return false;
+    };
+    // close() must run even if the write path already failed above. Local
+    // JNI references are freed when the attach guard pops at return.
+    let _ = env.call_method(&out, "close", "()V", &[]);
+    true
+}
+
+/// API 26–28 fallback: direct write into the public Download directory.
+/// Best effort — needs WRITE_EXTERNAL_STORAGE on those versions; silently
+/// returns false when the sandbox denies it.
+fn export_via_legacy_download_dir(
+    env: &mut jni::JNIEnv,
+    _activity: &jni::objects::JObject<'static>,
+    name: &str,
+    data: &[u8],
+) -> bool {
+    use jni::objects::JValue;
+
+    let Ok(dir_name) = env
+        .get_static_field("android/os/Environment", "DIRECTORY_DOWNLOADS", "Ljava/lang/String;")
+        .and_then(|v| v.l())
+    else {
+        return false;
+    };
+    let Ok(dir) = env
+        .call_static_method(
+            "android/os/Environment",
+            "getExternalStoragePublicDirectory",
+            "(Ljava/lang/String;)Ljava/io/File;",
+            &[JValue::Object(&dir_name)],
+        )
+        .and_then(|v| v.l())
+    else {
+        return false;
+    };
+    if dir.is_null() {
+        return false;
+    }
+    let Ok(jname) = env.new_string(name) else { return false };
+    // new File(dir, name)
+    let Ok(file) = env.new_object(
+        "java/io/File",
+        "(Ljava/io/File;Ljava/lang/String;)V",
+        &[JValue::Object(&dir), JValue::Object(&jname)],
+    ) else {
+        return false;
+    };
+    let Ok(fos) = env
+        .new_object("java/io/FileOutputStream", "(Ljava/io/File;)V", &[JValue::Object(&file)])
+    else {
+        return false;
+    };
+    let Ok(arr) = env.byte_array_from_slice(data) else { return false };
+    if env
+        .call_method(&fos, "write", "([B)V", &[JValue::Object(&arr)])
+        .is_err()
+    {
+        return false;
+    }
+    let _ = env.call_method(&fos, "close", "()V", &[]);
+    true
+}

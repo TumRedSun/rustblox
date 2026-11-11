@@ -71,6 +71,10 @@ fn android_main(app: android_activity::AndroidApp) {
         window_ready: Some(android_ui::enter_immersive_mode),
         // App-private storage dir — sessions/settings survive restarts.
         app_data_dir: Some(android_ui::app_data_dir),
+        // Settings → Logs → Save log / startup crash recovery: drops
+        // rustblox-*.log into the public Downloads collection via
+        // MediaStore, visible to any file manager without root.
+        log_export: Some(android_ui::export_to_downloads),
     });
     // Crash-proofing before the event loop is built (its `.expect` can
     // panic on exotic devices): panic hook + persistent log file. run_with
