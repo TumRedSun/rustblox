@@ -3,19 +3,25 @@
 //!
 //! Steps:
 //!  1. POST `auth.roblox.com/v1/authentication-ticket` — exchange the
-//!     `.ROBLOSECURITY` session for a short-lived join ticket.
-//!  2. POST `gamejoin.roblox.com/v2/join-game` — request membership in a
-//!     running server; the response names the datacenter host (ip/port),
-//!     the job id and the avatar endpoint for our character.
-//!  3. (fallback) POST `gamejoin.roblox.com/v1/join-game` — legacy endpoint
-//!     that authenticates with the session cookie + referer directly.
+//!     `.ROBLOSECURITY` session for a short-lived join ticket. The request
+//!     needs the session cookie + CSRF dance + a roblox.com `Referer`; the
+//!     answer is HTTP 200 with an EMPTY body and the ticket inside the
+//!     `rbx-authentication-ticket` RESPONSE HEADER.
+//!  2. POST `gamejoin.roblox.com/v1/join-game` — request membership in a
+//!     running server, authenticating with the session cookie + CSRF under a
+//!     client User-Agent ("Roblox/WinInet"). Success answers
+//!     `{"jobId": "…", "status": 2, "joinScript": {…}}` with the game-server
+//!     endpoint inside the joinScript object.
+//!  3. (fallbacks) the same join without the ticket, then
+//!     `gamejoin.roblox.com/v1/join-game-instance`.
 //!
 //! The UDP handshake with the returned server then happens in
 //! `crate::raknet` + `crate::game`.
 
-use crate::roblox::client::RobloxClient;
+use crate::roblox::client::{CLIENT_UA, RobloxClient};
 use crate::roblox::errors::ApiError;
 use serde::{Deserialize, Deserializer};
+use std::borrow::Cow;
 
 pub const GAMEJOIN_BASE: &str = "https://gamejoin.roblox.com";
 /// The one-time join ticket lives on the auth service (NOT apis.roblox.com —
@@ -50,6 +56,12 @@ pub struct JoinResponse {
     /// Where to fetch our avatar description (body colors, assets).
     #[serde(default, deserialize_with = "null_to_default", alias = "character_appearance_url")]
     pub character_appearance_url: String,
+    /// Where to exchange the join ticket for a client ticket (modern flow).
+    #[serde(default, deserialize_with = "null_to_default", alias = "authentication_url")]
+    pub authentication_url: String,
+    /// One-time ticket handed back for the client-auth exchange.
+    #[serde(default, deserialize_with = "null_to_default", alias = "authentication_ticket")]
+    pub authentication_ticket: String,
     #[serde(default, deserialize_with = "null_to_default", alias = "data_center_id")]
     pub data_center_id: u64,
     #[serde(default, deserialize_with = "null_to_default", alias = "membership_type")]
@@ -83,15 +95,45 @@ fn snippet(text: &str, max: usize) -> String {
     }
 }
 
+/// Locate the authentication ticket in a successful /v1/authentication-ticket
+/// response. Priority: the `rbx-authentication-ticket` header (the only place
+/// the live endpoint puts it today), then a JSON body ticket field, then a
+/// legacy plain-text body. A JSON body WITHOUT a ticket field (the documented
+/// `{}` 200 body) is None — returning the body itself as the ticket is exactly
+/// the bug that shipped "{}" to gamejoin and drew refusal status 12.
+fn ticket_from_parts<'a>(header: Option<&'a str>, body: &'a str) -> Option<Cow<'a, str>> {
+    if let Some(t) = header.map(str::trim).filter(|t| !t.is_empty()) {
+        return Some(Cow::Borrowed(t));
+    }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body.trim()) {
+        for key in ["ticket", "authenticationTicket", "token"] {
+            if let Some(t) = v.get(key).and_then(|t| t.as_str()) {
+                let t = t.trim();
+                if !t.is_empty() {
+                    return Some(Cow::Owned(t.to_string()));
+                }
+            }
+        }
+        return None;
+    }
+    // Plain-text body (older dialects returned the bare ticket).
+    let t = body.trim();
+    if !t.is_empty() && !t.starts_with('<') {
+        Some(Cow::Borrowed(t))
+    } else {
+        None
+    }
+}
+
 /// Fetch the one-time authentication ticket used by game join.
 pub fn fetch_auth_ticket(client: &mut RobloxClient, place_id: u64) -> Result<String, ApiError> {
-    // The endpoint returns {"ticket": "..."} and expects an empty JSON
-    // object (what the official client posts). Two things are mandatory on
-    // top of the .ROBLOSECURITY session cookie + CSRF dance:
-    //  * a roblox.com `Referer` — without it the server answers
-    //    403 "The UrlReferrer was invalid or came from outside Roblox."
-    //    (repro'd live 2026-11); post_with_headers also runs the CSRF dance;
-    //  * nothing else — the body stays `{}`.
+    // The endpoint answers 200 with an EMPTY JSON body ({}) and delivers the
+    // ticket in the `rbx-authentication-ticket` response header (verified
+    // live 2026-11; matches every public client implementation). Mandatory
+    // request pieces on top of the .ROBLOSECURITY cookie: the CSRF dance
+    // (post_with_headers runs it) and a roblox.com `Referer` — without that
+    // the server answers 403 "The UrlReferrer was invalid or came from
+    // outside Roblox.".
     let body = serde_json::json!({});
     let referer = format!("https://www.roblox.com/games/{}/", place_id);
     let raw = client.post_with_headers(
@@ -107,36 +149,83 @@ pub fn fetch_auth_ticket(client: &mut RobloxClient, place_id: u64) -> Result<Str
         crate::netlog!(info, "auth ticket HTTP {}: {}", raw.status, err);
         return Err(err);
     }
+    crate::netlog!(
+        info,
+        "auth ticket {} -> HTTP {} ({} bytes body)",
+        AUTH_TICKET_URL,
+        raw.status,
+        raw.body.len()
+    );
     let text = String::from_utf8_lossy(&raw.body).to_string();
-    crate::netlog!(info, "auth ticket {} -> {} bytes: {}", AUTH_TICKET_URL, raw.body.len(), snippet(&text, 200));
-    let trimmed = text.trim().trim_matches('"').to_string();
-    // Either plain text or JSON {"ticket": "..."}.
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-        if let Some(t) = v.get("ticket").and_then(|t| t.as_str()) {
-            return Ok(t.to_string());
+    let header_ticket = raw
+        .header("rbx-authentication-ticket")
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    match ticket_from_parts(header_ticket.as_deref(), &text) {
+        Some(t) => {
+            // Log the length only — the ticket is a bearer credential.
+            crate::netlog!(info, "auth ticket received ({} chars)", t.len());
+            Ok(t.into_owned())
         }
-        if v.get("ticket").is_some() {
-            crate::netlog!(info, "auth ticket body has null/empty ticket field");
+        None => {
+            let names: Vec<&str> = raw.headers.iter().map(|(k, _)| k.as_str()).collect();
+            crate::netlog!(
+                info,
+                "auth ticket: no ticket in the response (headers present: {})",
+                names.join(", ")
+            );
+            Err(ApiError::Parse(format!(
+                "authentication-ticket response carried no ticket (rbx-authentication-ticket header missing; body: {})",
+                snippet(&text, 80)
+            )))
         }
     }
-    if trimmed.is_empty() || trimmed.starts_with('<') {
-        return Err(ApiError::Parse(format!(
-            "authentication-ticket returned unusable body ({} bytes)",
-            text.len()
-        )));
+}
+
+/// A fresh `gameJoinAttemptId` (UUID-v4-shaped). The official client tags
+/// every join attempt with one; the value is informational but matching the
+/// client shape costs nothing. std-only xorshift — no uuid dependency.
+fn join_attempt_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    fn next(x: &mut u64) -> u64 {
+        *x ^= *x << 13;
+        *x ^= *x >> 7;
+        *x ^= *x << 17;
+        *x
     }
-    Ok(trimmed)
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15)
+        ^ ((std::process::id() as u64) << 32);
+    let mut x = seed | 1;
+    let a = next(&mut x);
+    let b = next(&mut x);
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&a.to_be_bytes());
+    bytes[8..].copy_from_slice(&b.to_be_bytes());
+    // RFC 4122 version 4 + variant bits.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let h: Vec<String> = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        h[0..4].join(""),
+        h[4..6].join(""),
+        h[6..8].join(""),
+        h[8..10].join(""),
+        h[10..16].join("")
+    )
 }
 
 /// Join a running place server: authentication ticket, then the game-join
-/// service. The classic `/v1/join-game` is the primary (battle-tested with
-/// tickets); `/v1/join-game-instance` (newer unified API, response carries
-/// ip/port directly) is the fallback. NOTE: `/v2/join-game` does NOT exist
-/// on gamejoin.roblox.com (probed 2026-11: 404) — never use it.
+/// service. The classic `/v1/join-game` is the primary; `/v1/join-game-instance`
+/// (newer unified API) is the final fallback. NOTE: `/v2/join-game` does NOT
+/// exist on gamejoin.roblox.com (probed 2026-11: 404) — never use it.
 pub fn join_game(client: &mut RobloxClient, place_id: u64) -> Result<JoinResponse, ApiError> {
     crate::netlog!(info, "join: requesting server for place {}", place_id);
     let ticket = match fetch_auth_ticket(client, place_id) {
-        Ok(t) => t,
+        Ok(t) => Some(t),
         Err(e) => {
             // Without a session the ticket endpoint can never succeed and an
             // anonymous join is always refused (status 12, "Unable to join
@@ -147,47 +236,67 @@ pub fn join_game(client: &mut RobloxClient, place_id: u64) -> Result<JoinRespons
                     "not signed in: joining a server needs a session — sign in or add a .ROBLOSECURITY cookie first".into(),
                 ));
             }
-            crate::netlog!(info, "join: auth ticket unavailable ({}); trying v1 with the session cookie", e);
-            String::new()
+            crate::netlog!(info, "join: auth ticket unavailable ({}); trying cookie-only join", e);
+            None
         }
     };
     let referer = format!("https://www.roblox.com/games/{}/", place_id);
-    // Classic endpoint: session cookie + ticket in the body.
-    let mut body = serde_json::json!({
+    // Modern client shape (RoZod gamejoinv1 schema + live client traffic):
+    // the join is authenticated by the session cookie + CSRF under a client
+    // User-Agent. The authenticationTicket rides along when we have one —
+    // what the official client passes in via the roblox-player URI.
+    let base = serde_json::json!({
         "placeId": place_id,
         "isTeleport": false,
-        "gameInfo": "{}",
+        "isImmersiveAdsTeleport": false,
+        "gameJoinAttemptId": join_attempt_id(),
     });
-    if !ticket.is_empty() {
-        body["authenticationTicket"] = serde_json::Value::String(ticket.clone());
-    }
-    match join_request(client, "/v1/join-game", &body, &referer) {
-        Ok(resp) => Ok(resp),
-        Err(classic_err) => {
-            crate::netlog!(info, "join-game v1 failed ({}); trying join-game-instance", classic_err);
-            // Newer unified endpoint; its success body carries ip/port.
-            let body2 = serde_json::json!({
-                "placeId": place_id,
-                "isTeleport": false,
-                "authenticationTicket": if ticket.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(ticket) },
-            });
-            join_request(client, "/v1/join-game-instance", &body2, &referer)
-                .map_err(|e| {
-                    crate::netlog!(info, "join-game-instance failed too: {}", e);
-                    if matches!(e, ApiError::JoinRefused(_)) { e } else { classic_err }
-                })
+    let with_ticket = if let Some(t) = &ticket {
+        let mut b = base.clone();
+        b["authenticationTicket"] = serde_json::Value::String(t.clone());
+        b
+    } else {
+        base.clone()
+    };
+    let first_err = match join_request(client, "/v1/join-game", &with_ticket, &referer) {
+        Ok(resp) => return Ok(resp),
+        Err(e) => e,
+    };
+    crate::netlog!(info, "join-game v1 failed ({}); trying fallbacks", first_err);
+    // Fallback 1: drop the ticket — public client implementations join with
+    // cookie-only auth, so retry that way in case the server disliked ours.
+    if ticket.is_some() {
+        let mut cookie_only = base.clone();
+        cookie_only["authenticationTicket"] = serde_json::Value::Null;
+        match join_request(client, "/v1/join-game", &cookie_only, &referer) {
+            Ok(resp) => return Ok(resp),
+            Err(e) => crate::netlog!(info, "join-game without ticket failed ({}); trying join-game-instance", e),
         }
     }
+    // Fallback 2: the newer unified endpoint.
+    let mut body2 = base;
+    body2["authenticationTicket"] = ticket
+        .clone()
+        .map(serde_json::Value::String)
+        .unwrap_or(serde_json::Value::Null);
+    join_request(client, "/v1/join-game-instance", &body2, &referer).map_err(|e| {
+        crate::netlog!(info, "join-game-instance failed too: {}", e);
+        if matches!(e, ApiError::JoinRefused(_)) { e } else { first_err }
+    })
 }
 
 /// Best-effort hint for the numeric v1/v2 join status. Only codes that are
-/// actually attested (devforum reports + our own repro against the live
-/// endpoint) get a name; unknown ones stay numeric.
+/// actually attested (devforum reports + client-emulation sources we could
+/// inspect, which mirror the legacy PlaceLauncher codes) get a name; unknown
+/// ones stay numeric.
 fn join_status_hint(status: i64) -> Option<&'static str> {
     match status {
         // Repro: POST /v1/join-game without an authentication ticket answers
         // {"status":12,"message":"Unable to join Game 211"}.
         12 => Some("join refused — the request carried no valid authentication ticket"),
+        1 => Some("queued — no server available yet"),
+        6 => Some("the server is full"),
+        14 => Some("invalid, private or unavailable place"),
         _ => None,
     }
 }
@@ -240,12 +349,15 @@ fn join_request(
     referer: &str,
 ) -> Result<JoinResponse, ApiError> {
     // RobloxClient.send() does not support custom headers, so do the POST
-    // manually through the same agent/cookie machinery.
+    // manually through the same agent/cookie machinery. The join service
+    // only accepts client-shaped traffic: under a browser User-Agent it
+    // refuses with status 12 even when the session is valid.
     let url = format!("{}{}", GAMEJOIN_BASE, path);
     let raw = client.post_with_headers(
         &url,
         body,
         &[
+            ("User-Agent", CLIENT_UA),
             ("Referer", referer),
             ("Origin", "https://www.roblox.com"),
         ],
@@ -295,11 +407,32 @@ fn join_request(
 }
 
 /// Pull the game-server endpoint out of a join response that doesn't carry
-/// top-level `ip`/`port`. The classic join flow embeds it in the join script
-/// (an XML-ish blob) as `<MachineAddress>x.x.x.x</MachineAddress>` /
-/// `<MachinePort>20005</MachinePort>`, or as flat JSON keys. Best-effort.
+/// top-level `ip`/`port`. Two dialects exist:
+///  * modern: `joinScript` is a JSON OBJECT with `ServerConnections` /
+///    `UdmuxEndpoints` arrays and flat `MachineAddress` + `ServerPort`;
+///  * classic: `joinScript` (or `joinTicket`) is a STRING holding an XML-ish
+///    blob (`<MachineAddress>…</MachineAddress>`) or flat JSON keys.
 fn extract_endpoint(v: &serde_json::Value) -> Option<(String, u16)> {
-    // Collect candidate strings: the inline joinScript plus the URL one.
+    if let Some(js) = v.get("joinScript") {
+        if js.is_object() {
+            for key in ["ServerConnections", "UdmuxEndpoints"] {
+                if let Some(ep) = first_endpoint_list(js.get(key)) {
+                    return Some(ep);
+                }
+            }
+            if let Some(ip) = js.get("MachineAddress").and_then(|s| s.as_str()) {
+                for pk in ["ServerPort", "MachinePort", "ClientPort"] {
+                    if let Some(port) = js.get(pk).and_then(|p| p.as_u64()) {
+                        if !ip.is_empty() && port > 0 && port <= u64::from(u16::MAX) {
+                            return Some((ip.to_string(), port as u16));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Classic dialect: collect candidate strings — the inline joinScript plus
+    // the URL one.
     let mut blobs: Vec<String> = Vec::new();
     for key in ["joinScript", "joinScriptUrl", "joinTicket"] {
         if let Some(s) = v.get(key).and_then(|s| s.as_str()) {
@@ -321,6 +454,19 @@ fn extract_endpoint(v: &serde_json::Value) -> Option<(String, u16)> {
         };
         if !ip.is_empty() && port > 0 {
             return Some((ip, port));
+        }
+    }
+    None
+}
+
+/// First usable (Address, Port) pair of a joinScript endpoint array.
+fn first_endpoint_list(v: Option<&serde_json::Value>) -> Option<(String, u16)> {
+    let arr = v?.as_array()?;
+    for item in arr {
+        let ip = item.get("Address").and_then(|s| s.as_str()).unwrap_or("");
+        let port = item.get("Port").and_then(|p| p.as_u64()).unwrap_or(0);
+        if !ip.is_empty() && port > 0 && port <= u64::from(u16::MAX) {
+            return Some((ip.to_string(), port as u16));
         }
     }
     None
@@ -561,5 +707,90 @@ mod tests {
         assert_eq!(j.job_id, "j");
         assert!(j.ip.is_empty());
         assert_eq!(j.port, 0);
+    }
+
+    #[test]
+    fn ticket_from_header_wins() {
+        // The live endpoint: empty {} body, ticket in the response header.
+        assert_eq!(ticket_from_parts(Some(" T-HEADER "), "{}"), Some("T-HEADER".into()));
+    }
+
+    #[test]
+    fn ticket_from_body_field_fallback() {
+        assert_eq!(ticket_from_parts(None, r#"{"ticket":"T-BODY"}"#), Some("T-BODY".into()));
+        assert_eq!(
+            ticket_from_parts(None, r#"{"authenticationTicket":"T-ALT"}"#),
+            Some("T-ALT".into())
+        );
+    }
+
+    #[test]
+    fn ticket_empty_json_body_is_not_a_ticket() {
+        // REGRESSION: the 200 body IS an empty object — returning it as the
+        // ticket produced authenticationTicket: "{}" and join status 12.
+        assert_eq!(ticket_from_parts(None, "{}"), None);
+        assert_eq!(ticket_from_parts(Some("   "), "{}"), None);
+        assert_eq!(ticket_from_parts(None, r#"{"ticket": null}"#), None);
+        assert_eq!(ticket_from_parts(None, r#"{"ticket": ""}"#), None);
+        assert_eq!(ticket_from_parts(None, ""), None);
+        assert_eq!(ticket_from_parts(None, "<html>error</html>"), None);
+        // Legacy dialect: bare plain-text ticket.
+        assert_eq!(ticket_from_parts(None, "PLAINTICKET123"), Some("PLAINTICKET123".into()));
+    }
+
+    #[test]
+    fn extract_endpoint_from_join_script_object() {
+        // Modern dialect: joinScript is a JSON object (RoZod gamejoinv1
+        // schema). ServerConnections first.
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"jobId":"j1","status":2,"joinScript":{"MachineAddress":"203.0.113.9","ServerPort":20005,
+                "ServerConnections":[{"Address":"203.0.113.9","Port":20005}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(extract_endpoint(&v), Some(("203.0.113.9".into(), 20005)));
+        // Udmux layer only.
+        let v2: serde_json::Value = serde_json::from_str(
+            r#"{"jobId":"j2","status":2,"joinScript":{"UdmuxEndpoints":[{"Address":"198.51.100.4","Port":20019}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(extract_endpoint(&v2), Some(("198.51.100.4".into(), 20019)));
+        // Flat legacy keys inside the object.
+        let v3: serde_json::Value = serde_json::from_str(
+            r#"{"jobId":"j3","status":2,"joinScript":{"MachineAddress":"10.1.2.3","ServerPort":20005}}"#,
+        )
+        .unwrap();
+        assert_eq!(extract_endpoint(&v3), Some(("10.1.2.3".into(), 20005)));
+        // Object without any endpoint information.
+        let v4: serde_json::Value = serde_json::from_str(
+            r#"{"jobId":"j4","status":2,"joinScript":{"UserId":1,"BaseUrl":"https://www.roblox.com"}}"#,
+        )
+        .unwrap();
+        assert_eq!(extract_endpoint(&v4), None);
+    }
+
+    #[test]
+    fn refusal_status_hints() {
+        let mk = |status: i64| {
+            let v = serde_json::json!({"jobId": null, "status": status});
+            join_refusal_detail(&v)
+        };
+        assert!(mk(12).starts_with("status 12 (join refused"));
+        assert!(mk(1).starts_with("status 1 (queued"));
+        assert!(mk(6).starts_with("status 6 (the server is full"));
+        assert!(mk(14).starts_with("status 14 (invalid, private"));
+        assert_eq!(mk(99), "status 99");
+    }
+
+    #[test]
+    fn join_attempt_id_is_uuid_shaped() {
+        let id = join_attempt_id();
+        assert_eq!(id.len(), 36);
+        assert_eq!(id.matches('-').count(), 4);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
+        // Version 4 nibble and variant bits.
+        assert_eq!(id.as_bytes()[14], b'4');
+        assert!(matches!(id.as_bytes()[19], b'8' | b'9' | b'a' | b'b'));
+        // Two calls in a row must not collide.
+        assert_ne!(join_attempt_id(), join_attempt_id());
     }
 }
