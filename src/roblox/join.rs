@@ -83,15 +83,25 @@ fn snippet(text: &str, max: usize) -> String {
     }
 }
 
-/// Fetch the one-time authentication ticket used by v2 game join.
+/// Fetch the one-time authentication ticket used by game join.
 pub fn fetch_auth_ticket(client: &mut RobloxClient, place_id: u64) -> Result<String, ApiError> {
     // The endpoint returns {"ticket": "..."} and expects an empty JSON
-    // object (what the official client posts). The request must carry the
-    // .ROBLOSECURITY session cookie + the CSRF dance — RobloxClient::send
-    // does both.
-    let _ = place_id;
+    // object (what the official client posts). Two things are mandatory on
+    // top of the .ROBLOSECURITY session cookie + CSRF dance:
+    //  * a roblox.com `Referer` — without it the server answers
+    //    403 "The UrlReferrer was invalid or came from outside Roblox."
+    //    (repro'd live 2026-11); post_with_headers also runs the CSRF dance;
+    //  * nothing else — the body stays `{}`.
     let body = serde_json::json!({});
-    let raw = client.send(AUTH_TICKET_URL, Some(&body))?;
+    let referer = format!("https://www.roblox.com/games/{}/", place_id);
+    let raw = client.post_with_headers(
+        AUTH_TICKET_URL,
+        &body,
+        &[
+            ("Referer", referer.as_str()),
+            ("Origin", "https://www.roblox.com"),
+        ],
+    )?;
     if !(200..300).contains(&raw.status) {
         let err = raw.error();
         crate::netlog!(info, "auth ticket HTTP {}: {}", raw.status, err);
