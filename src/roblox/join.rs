@@ -419,10 +419,23 @@ fn join_request(
             }
         }
         if let Some(t) = &token {
-            crate::netlog!(info, "join: udmux token present ({} chars)", t.len());
+            // Shape diagnostics for the routing token: 24 base64 chars are
+            // 18 raw bytes unpadded but 16 with "==" — and 16 is exactly the
+            // RUPP epoch-tag width the proxy routes on.
+            let dec = crate::roblox::udmux::b64_decode(t);
+            crate::netlog!(
+                info,
+                "join: udmux token present ({} chars, b64 -> {} bytes, padded={})",
+                t.len(),
+                dec.len(),
+                t.ends_with('=')
+            );
             if resp.udmux_token.is_empty() {
                 resp.udmux_token = t.clone();
             }
+        }
+        if let Some(a) = js.get("TokenGenAlgorithm").and_then(|v| v.as_u64()) {
+            crate::netlog!(info, "join: udmux token-gen algorithm {}", a);
         }
         if let Some(p) = pepper {
             crate::netlog!(info, "join: udmux pepper {}", p);

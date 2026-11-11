@@ -72,47 +72,144 @@ pub fn b64_decode(s: &str) -> Vec<u8> {
     out
 }
 
-/// Candidate per-datagram prefixes the UDMUX proxy may require before it
-/// forwards a packet to the RCC backend. The join script hands out a session
-/// token (`TokenValue`, 24 chars) and a pepper (`PepperId`); the official
-/// client applies both somewhere in its send path, but the exact wire shape
-/// is not public (see the headless-join write-ups: the token generator is
-/// still marked TODO even in the deepest public reversals). Until one shape
-/// is confirmed empirically, the handshake tries them in order and keeps
-/// the first one that gets a reply:
+/// The outer datagram framing every real client uses on the wire (measured
+/// by the `rbxraknet` decoder across a 16k-payload live capture — see the
+/// research notes in `docs/` of the upstream project):
 ///
-/// 1. `bare`        — no prefix (the proxy may route by port alone); if the
-///                    proxy is content with a bare packet, a token prefix
-///                    would only make things worse, so it goes first;
-/// 2. `b64`         — TokenValue base64-decoded (24 chars -> 18 bytes);
-/// 3. `pe-le+b64`   — PepperId as u32 LE + the decoded token;
-/// 4. `pe-be+b64`   — PepperId as u32 BE + the decoded token;
-/// 5. `ascii`       — the raw 24-char token string;
-/// 6. `pe-le+ascii` — PepperId u32 LE + the raw token string.
-pub fn wrap_candidates(token: &str, pepper: u64) -> Vec<(&'static str, Vec<u8>)> {
-    let mut out: Vec<(&'static str, Vec<u8>)> = vec![("bare", Vec::new())];
+/// ```text
+/// byte[0]      0x01        UDMUX/RUPP flag — NOT a RakNet message id
+/// byte[1:3]    00 00       header length high bytes (always 0)
+/// byte[3]      0x17|0x1f   header length, doubles as the direction id
+/// byte[4:7]    01 11 02    constant sub-flags
+/// byte[7:23]   epoch_tag   16 bytes, rotates on re-key epochs
+/// byte[23:31]  mux_extra   only on direction 0x1f (header len 31)
+/// body                     RakNet datagram (AEAD-encrypted once the
+///                          session keys are active; plaintext handshake
+///                          bytes while it is not)
+/// ```
+///
+/// A proxy sees only the CLEAR part of that header, so the per-session
+/// routing token (`TokenValue` from the join script) almost certainly rides
+/// in the 16-byte `epoch_tag` — 24 base64 chars decode to exactly 16 bytes
+/// when the token carries `==` padding. Every candidate below therefore
+/// frames the handshake inside this envelope and lets the proxy pick the
+/// shape it answers.
+
+pub const RUPP_FLAG: u8 = 0x01;
+pub const RUPP_SUBFLAGS: [u8; 3] = [0x01, 0x11, 0x02];
+
+/// A datagram wrapper candidate: either the raw legacy shape
+/// (`direction == 0`, nothing prepended) or a RUPP envelope header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Envelope {
+    pub label: &'static str,
+    /// 0 = send raw (no envelope); otherwise 0x17 or 0x1f.
+    pub direction: u8,
+    pub epoch: [u8; 16],
+    pub mux: [u8; 8],
+}
+
+/// No-envelope variant (direct dial, or a proxy that routes by 5-tuple).
+pub const BARE: Envelope = Envelope {
+    label: "bare",
+    direction: 0,
+    epoch: [0u8; 16],
+    mux: [0u8; 8],
+};
+
+/// Wrap `body` in the RUPP envelope described by `env`.
+pub fn rupp_frame(env: &Envelope, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(env.direction as usize + body.len());
+    out.push(RUPP_FLAG);
+    out.push(0);
+    out.push(0);
+    out.push(env.direction);
+    out.extend_from_slice(&RUPP_SUBFLAGS);
+    out.extend_from_slice(&env.epoch);
+    if env.direction == 0x1f {
+        out.extend_from_slice(&env.mux);
+    }
+    out.extend_from_slice(body);
+    out
+}
+
+/// Recognize a RUPP-framed datagram. Returns
+/// `(direction, epoch_tag, mux_extra, header_len)`; `mux_extra` is all-zero
+/// for direction 0x17 (it has no mux field). `None` when the payload is not
+/// a RUPP datagram (e.g. a legacy raw RakNet reply).
+pub fn rupp_parse(p: &[u8]) -> Option<(u8, [u8; 16], [u8; 8], usize)> {
+    if p.len() < 7 || p[0] != RUPP_FLAG || p[1] != 0 || p[2] != 0 {
+        return None;
+    }
+    let dir = p[3];
+    if dir != 0x17 && dir != 0x1f {
+        return None;
+    }
+    if p[4..7] != RUPP_SUBFLAGS {
+        return None;
+    }
+    if p.len() < dir as usize {
+        return None;
+    }
+    let mut epoch = [0u8; 16];
+    epoch.copy_from_slice(&p[7..23]);
+    let mut mux = [0u8; 8];
+    if dir == 0x1f {
+        mux.copy_from_slice(&p[23..31]);
+    }
+    Some((dir, epoch, mux, dir as usize))
+}
+
+/// Envelope candidates for a session that carries join-script routing
+/// material (`TokenValue`, `PepperId`). Ordered by likelihood; "bare" first
+/// so a proxy that routes by 5-tuple alone is not confused by a token. The
+/// winner is pinned and applied to every datagram of the session.
+pub fn envelope_candidates(token: &str, pepper: u64) -> Vec<Envelope> {
+    let mut out = vec![BARE];
     if token.is_empty() {
         return out;
     }
-    let pe = pepper as u32;
-    let raw = b64_decode(token);
-    if raw.len() >= 8 {
-        out.push(("b64", raw.clone()));
-        out.push((
-            "pe-le+b64",
-            pe.to_le_bytes().into_iter().chain(raw.iter().copied()).collect(),
-        ));
-        out.push((
-            "pe-be+b64",
-            pe.to_be_bytes().into_iter().chain(raw.iter().copied()).collect(),
-        ));
+    let dec = b64_decode(token);
+    let pe = (pepper as u32).to_le_bytes();
+    let mut push = |label: &'static str, direction: u8, epoch: [u8; 16], mux: [u8; 8]| {
+        out.push(Envelope { label, direction, epoch, mux });
+    };
+
+    if dec.len() >= 16 {
+        let tok16: [u8; 16] = dec[..16].try_into().unwrap();
+        // The most likely shape: the decoded token IS the first epoch tag.
+        push("env17-token", 0x17, tok16, [0u8; 8]);
+        if dec.len() >= 18 {
+            // Unpadded tokens decode to 18 bytes; maybe the first two bytes
+            // are a sub-header the tag follows.
+            let tok18: [u8; 16] = dec[2..18].try_into().unwrap();
+            push("env17-token18", 0x17, tok18, [0u8; 8]);
+        }
+        // Direction 0x1f variants (8-byte mux field after the tag).
+        push("env1f-token", 0x1f, tok16, [0u8; 8]);
+        let muxtok: [u8; 8] = dec[..8].try_into().unwrap();
+        push("env1f-token-muxtok", 0x1f, tok16, muxtok);
+        let mut muxpe = [0u8; 8];
+        muxpe[..4].copy_from_slice(&pe);
+        muxpe[4..].copy_from_slice(&pe);
+        push("env1f-token-muxpe", 0x1f, tok16, muxpe);
+        // Pepper mixed into the tag.
+        let mut pe_tok = [0u8; 16];
+        pe_tok[..4].copy_from_slice(&pe);
+        pe_tok[4..].copy_from_slice(&dec[..12]);
+        push("env17-pe+token", 0x17, pe_tok, [0u8; 8]);
+        let mut tok_pe = [0u8; 16];
+        tok_pe[..12].copy_from_slice(&dec[..12]);
+        tok_pe[12..].copy_from_slice(&pe);
+        push("env17-token+pe", 0x17, tok_pe, [0u8; 8]);
     }
-    let ascii = token.as_bytes().to_vec();
-    out.push(("ascii", ascii.clone()));
-    out.push((
-        "pe-le+ascii",
-        pe.to_le_bytes().into_iter().chain(ascii.into_iter()).collect(),
-    ));
+    // Raw ASCII token (in case TokenValue is not base64 at all).
+    let mut ascii = [0u8; 16];
+    let n = token.as_bytes().len().min(16);
+    ascii[..n].copy_from_slice(&token.as_bytes()[..n]);
+    push("env17-ascii", 0x17, ascii, [0u8; 8]);
+    // All-zero tag: proves whether the proxy routes by source 5-tuple.
+    push("env17-zeros", 0x17, [0u8; 16], [0u8; 8]);
     out
 }
 
@@ -178,21 +275,86 @@ mod tests {
     }
 
     #[test]
-    fn wrap_candidates_cover_the_observed_shapes() {
+    fn envelope_candidates_cover_the_observed_shapes() {
         // No token -> bare only (direct dial keeps working unchanged).
-        assert_eq!(wrap_candidates("", 0), vec![("bare", Vec::<u8>::new())]);
+        assert_eq!(envelope_candidates("", 0), vec![BARE]);
 
-        let cands = wrap_candidates("AAAAAAAAAAAAAAAAAAAAAAAA", 1794414724);
-        let labels: Vec<&str> = cands.iter().map(|(l, _)| *l).collect();
+        // A padded 24-char token decodes to exactly 16 bytes -> the epoch tag.
+        let padded = "AAAAAAAAAAAAAAAAAAAAAA==";
+        assert_eq!(b64_decode(padded).len(), 16);
+        let cands = envelope_candidates(padded, 1794414724);
+        let labels: Vec<&str> = cands.iter().map(|c| c.label).collect();
         assert_eq!(
             labels,
-            vec!["bare", "b64", "pe-le+b64", "pe-be+b64", "ascii", "pe-le+ascii"]
+            vec![
+                "bare",
+                "env17-token",
+                "env1f-token",
+                "env1f-token-muxtok",
+                "env1f-token-muxpe",
+                "env17-pe+token",
+                "env17-token+pe",
+                "env17-ascii",
+                "env17-zeros",
+            ]
         );
-        assert_eq!(cands[1].1, vec![0u8; 18]);
-        // pepper u32 LE (1794414724 = 0x6AFA0004... verify little-endian bytes)
-        assert_eq!(&cands[2].1[..4], &1794414724u32.to_le_bytes());
-        assert_eq!(cands[2].1.len(), 4 + 18);
-        assert_eq!(cands[4].1, b"AAAAAAAAAAAAAAAAAAAAAAAA".to_vec());
+        // env17-token: the decoded token IS the tag, no 18-byte skip variant.
+        assert_eq!(cands[1].direction, 0x17);
+        assert_eq!(cands[1].epoch, [0u8; 16]);
+        // env1f-token-muxpe: the 8-byte mux field is the pepper repeated.
+        let pe = 1794414724u32.to_le_bytes();
+        assert_eq!(&cands[4].mux[..4], &pe);
+        assert_eq!(&cands[4].mux[4..], &pe);
+        // env17-pe+token mixes the pepper into the first 4 tag bytes.
+        assert_eq!(&cands[5].epoch[..4], &pe);
+    }
+
+    #[test]
+    fn unpadded_tokens_add_the_18_byte_variant() {
+        // 24 chars without padding -> 18 bytes -> a tok18 (skip-2) candidate.
+        let cands = envelope_candidates("AAAAAAAAAAAAAAAAAAAAAAAA", 0);
+        let labels: Vec<&str> = cands.iter().map(|c| c.label).collect();
+        assert!(labels.contains(&"env17-token18"), "labels: {:?}", labels);
+        let tok18 = cands.iter().find(|c| c.label == "env17-token18").unwrap();
+        assert_eq!(tok18.epoch, [0u8; 16]);
+    }
+
+    #[test]
+    fn rupp_frame_round_trips_through_parse() {
+        let env = Envelope {
+            label: "test17",
+            direction: 0x17,
+            epoch: *b"0123456789abcdef",
+            mux: [0u8; 8],
+        };
+        let framed = rupp_frame(&env, b"PINGBODY");
+        let (dir, epoch, mux, hlen) = rupp_parse(&framed).expect("17 must parse");
+        assert_eq!((dir, hlen), (0x17, 23usize));
+        assert_eq!(&epoch, b"0123456789abcdef");
+        assert_eq!(mux, [0u8; 8]);
+        assert_eq!(&framed[hlen..], b"PINGBODY");
+
+        let env31 = Envelope {
+            label: "test1f",
+            direction: 0x1f,
+            epoch: [9u8; 16],
+            mux: *b"MUXMUXMX",
+        };
+        let framed31 = rupp_frame(&env31, b"X");
+        let (dir, epoch, mux, hlen) = rupp_parse(&framed31).expect("1f must parse");
+        assert_eq!((dir, hlen), (0x1f, 31usize));
+        assert_eq!(epoch, [9u8; 16]);
+        assert_eq!(&mux, b"MUXMUXMX");
+        assert_eq!(&framed31[hlen..], b"X");
+    }
+
+    #[test]
+    fn rupp_parse_rejects_non_envelopes() {
+        // Raw RakNet offline packets never start with the RUPP signature.
+        assert!(rupp_parse(&[]).is_none());
+        assert!(rupp_parse(&[0x06, 0x00, 0x00, 0x17, 0x01, 0x11, 0x02]).is_none());
+        assert!(rupp_parse(&[0x01, 0x00, 0x00, 0x99, 0x01, 0x11, 0x02]).is_none());
+        assert!(rupp_parse(&[0x01, 0x00, 0x00, 0x17, 0x09, 0x09, 0x09]).is_none());
     }
 
     #[test]

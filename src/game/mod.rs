@@ -198,19 +198,25 @@ fn game_thread(
     // defaults to 5, Minecraft Bedrock bumped to 10/11). Every guess now
     // really gets sent — each variant gets its own retransmit window — and
     // each attempt is logged, so the log shows which shapes were tried.
-    // When the join script carries a udmux routing token, the matrix also
-    // includes token-derived datagram prefixes (see udmux::wrap_candidates).
+    // When the join script carries a udmux routing token, phase 0 first
+    // probes token-derived RUPP envelope headers (see
+    // udmux::envelope_candidates), so a udmux session needs a longer budget.
     let protocols: [u8; 4] = [5, 10, 11, 1];
     let udmux_token = if resp.udmux_token.is_empty() {
         None
     } else {
         Some((resp.udmux_token.as_str(), resp.udmux_pepper))
     };
+    let handshake_timeout = if udmux_token.is_some() {
+        Duration::from_secs(30)
+    } else {
+        Duration::from_secs(6)
+    };
     let mut client = match RakClient::connect(
         &dial_host,
         dial_port,
         &protocols,
-        Duration::from_secs(6),
+        handshake_timeout,
         udmux_token,
     ) {
         Ok(c) => c,

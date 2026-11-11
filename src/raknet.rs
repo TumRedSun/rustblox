@@ -264,10 +264,11 @@ pub struct RakClient {
     pub mtu: u16,
     pub state: RakState,
     pub ping_ms: Option<f32>,
-    /// UDMUX routing-token prefix confirmed by the handshake (label, bytes).
+    /// Datagram envelope confirmed by the handshake (a RUPP header with the
+    /// join script's routing token, or bare/raw when no envelope is needed).
     /// Applied to every datagram sent after it was confirmed — the proxy
-    /// binds the client->RCC mapping to the exact prefix shape it accepted.
-    wrap: Option<(&'static str, Vec<u8>)>,
+    /// binds the client->RCC mapping to the exact clear-header shape.
+    envelope: Option<crate::roblox::udmux::Envelope>,
 
     // Send side
     reliability_index: u32,
@@ -304,9 +305,11 @@ impl RakClient {
     /// Perform the full offline + connected handshake against a game server.
     ///
     /// `udmux_token` carries the join script's per-session routing material
-    /// (`(TokenValue, PepperId)`) when the dial goes through a UDMUX proxy;
-    /// phase 1 then also probes token-derived datagram prefixes and keeps
-    /// the first shape the proxy answers, applying it to every later send.
+    /// (`(TokenValue, PepperId)`) when the dial goes through a UDMUX proxy.
+    /// Phase 0 then probes token-derived RUPP envelope headers with
+    /// unconnected pings and pins the first shape that draws a reply;
+    /// phase 1 runs the OCR1 matrix on that envelope, and every later
+    /// datagram rides the confirmed shape.
     pub fn connect(
         host: &str,
         port: u16,
@@ -340,7 +343,7 @@ impl RakClient {
             mtu: 1400,
             state: RakState::Connecting,
             ping_ms: None,
-            wrap: None,
+            envelope: None,
             reliability_index: 0,
             datagram_seq: 0,
             split_id: 0,
@@ -358,74 +361,107 @@ impl RakClient {
             buf: vec![0u8; 65536],
         };
 
+        // Phase 0 (udmux sessions): pin the datagram ENVELOPE with
+        // unconnected pings before spending anything on the OCR1 matrix.
+        //
+        // Real clients wrap EVERY datagram in Roblox's RUPP envelope
+        // (0x01 00 00 <dir> 01 11 02 <epoch:16> [<mux:8>], measured by the
+        // rbxraknet decoder) and a proxy only sees that clear header — a raw
+        // RakNet ping never drew a single reply (0.2.0 log: silence in every
+        // token-prefix shape). The unconnected ping carries no protocol
+        // byte, so whichever envelope draws a pong is the routing shape,
+        // independent of the handshake parameters.
+        let envelopes: Vec<crate::roblox::udmux::Envelope> = match udmux_token {
+            None => vec![crate::roblox::udmux::BARE],
+            Some((tok, pepper)) => crate::roblox::udmux::envelope_candidates(tok, pepper),
+        };
+        let pinned = if envelopes.len() > 1 {
+            let p = c.probe_reachability(&envelopes, Duration::from_millis(700));
+            match &p {
+                Some(env) => netlog!(
+                    net,
+                    "envelope probe: '{}' drew a pong — pinning it for the session",
+                    env.label
+                ),
+                None => netlog!(
+                    net,
+                    "envelope probe: no pong in any RUPP shape — trying the OCR1 matrix anyway"
+                ),
+            }
+            p
+        } else {
+            None
+        };
+
         // Phase 1: OPEN_CONNECTION_REQUEST_1 -> REPLY_1 (MTU probing).
         //
-        // Variant matrix = udmux wrapper x protocol byte. "bare" first: if
-        // the proxy routes by port alone, a token prefix would only confuse
-        // it. Every (wrapper, protocol) pair gets its own retransmit window
-        // and the first one that draws a valid REPLY_1 wins for the session.
-        let wraps: Vec<(&'static str, Vec<u8>)> = match udmux_token {
-            None => vec![("bare", Vec::new())],
-            Some((tok, pepper)) => crate::roblox::udmux::wrap_candidates(tok, pepper),
+        // With a pinned envelope: that envelope x every protocol byte.
+        // Without one: bare x every protocol byte (a direct dial must not
+        // inherit a token header), then each envelope x the first protocol
+        // byte — enough to notice a shape that answers OCR1 but not pings.
+        let p1_variants: Vec<(crate::roblox::udmux::Envelope, u8)> = match &pinned {
+            Some(env) => protocol_versions.iter().map(|&pr| (*env, pr)).collect(),
+            None => {
+                let mut v: Vec<(crate::roblox::udmux::Envelope, u8)> = protocol_versions
+                    .iter()
+                    .map(|&pr| (crate::roblox::udmux::BARE, pr))
+                    .collect();
+                if envelopes.len() > 1 {
+                    if let Some(&pr) = protocol_versions.first() {
+                        for env in envelopes.iter().skip(1) {
+                            v.push((*env, pr));
+                        }
+                    }
+                }
+                v
+            }
         };
-        let p1_variants: Vec<(&'static str, &[u8], u8)> = wraps
-            .iter()
-            .flat_map(|(label, prefix)| {
-                protocol_versions.iter().map(move |&proto| (*label, &prefix[..], proto))
-            })
-            .collect();
         let reply1 = match c.offline_roundtrip(
             &p1_variants,
             handshake_timeout,
             "request-1",
-            |(_, prefix, proto), out, mtu| {
-                out.extend_from_slice(prefix);
+            |(env, proto), out, mtu| {
                 out.push(ID_OPEN_CONNECTION_REQUEST_1);
                 out.extend_from_slice(&OFFLINE_MAGIC);
                 out.push(*proto);
-                // MTU probe: pad to the datagram size (prefix included —
-                // the proxy judges the path MTU by the whole datagram).
-                out.resize(mtu as usize, 0x00);
+                // MTU probe: pad to the datagram size (envelope header
+                // included — the proxy judges the path MTU by the whole
+                // datagram, and send_raw adds the header on top).
+                out.resize((mtu as usize).saturating_sub(env.direction as usize), 0x00);
             },
+            |(env, _)| *env,
             |c, payload| c.parse_reply1(payload),
         ) {
             Ok((r, winner)) => {
-                let (label, prefix, proto) = p1_variants[winner];
-                c.wrap = if prefix.is_empty() {
-                    None
-                } else {
-                    Some((label, prefix.to_vec()))
-                };
+                let (env, proto) = p1_variants[winner];
+                c.envelope = if env.direction == 0 { None } else { Some(env) };
                 netlog!(
                     net,
-                    "handshake wrapper '{}' (protocol {}) confirmed — applying it to every datagram this session",
-                    label,
+                    "handshake envelope '{}' (protocol {}) confirmed — applying it to every datagram this session",
+                    env.label,
                     proto
                 );
                 r
             }
             Err(e) => {
-                // Classify the failure for the log: a pong proves the UDP
-                // path and the magic are fine (blame the handshake params);
-                // silence means proxy:port never answered anything at all.
-                // The probe replays unconnected pings through EVERY wrapper
-                // candidate, so "pong via wrapper X" pins down the routing
-                // shape even when the OCR1 shape/protocol is what's wrong.
-                match c.probe_reachability(&wraps, Duration::from_millis(1200)) {
-                    Some(label) if label != "bare" => netlog!(
+                // The ping probe already ran in phase 0, so the failure is
+                // classifiable without re-probing: a pinned envelope that
+                // still fails OCR1 means the proxy routed us but the RCC
+                // rejected the handshake shape; total silence means the
+                // proxy dropped every candidate.
+                match &pinned {
+                    Some(env) => netlog!(
                         net,
-                        "path probe: pong via wrapper '{}' — the proxy wants this token prefix, \
-                         but rejected our OPEN_CONNECTION_REQUEST_1 (protocol byte or MTU shape)",
-                        label
-                    ),
-                    Some(_) => netlog!(
-                        net,
-                        "path probe: pong — proxy:port is reachable, the handshake packet shape is the problem"
+                        "path diagnosis: envelope '{}' got a pong but no OCR1 reply — \
+                         the proxy routes this shape, the RCC rejects the handshake \
+                         (protocol byte, MTU or required encryption)",
+                        env.label
                     ),
                     None => netlog!(
                         net,
-                        "path probe: no reply to unconnected pings in any wrapper — proxy:port unreachable \
-                         (stale session port, firewall, or proxy that drops unauthenticated packets)"
+                        "path diagnosis: no envelope shape answered pings or OCR1 — the proxy \
+                         drops unauthenticated datagrams (stale session port, firewall, or \
+                         a routing shape we did not try)"
                     ),
                 }
                 return Err(e);
@@ -438,6 +474,9 @@ impl RakClient {
 
         // Phase 2: OPEN_CONNECTION_REQUEST_2 -> REPLY_2.
         let guid = c.guid;
+        // The envelope pinned in phase 1 (Copy) — every later datagram,
+        // including OCR2, must ride the shape the proxy accepted.
+        let pinned_env = c.envelope;
         let (reply2, _) = c.offline_roundtrip(
             &[()],
             handshake_timeout,
@@ -455,6 +494,7 @@ impl RakClient {
                 out.extend_from_slice(&mtu.to_le_bytes());
                 out.extend_from_slice(&guid.to_le_bytes());
             },
+            move |_| pinned_env.unwrap_or(crate::roblox::udmux::BARE),
             |c, payload| c.parse_reply2(payload),
         )?;
         netlog!(net, "REPLY_2: guid={} mtu={}", reply2.0, reply2.1);
@@ -505,19 +545,42 @@ impl RakClient {
         Ok(c)
     }
 
-    /// Send one datagram to the server, applying the confirmed UDMUX token
-    /// prefix. ALL session traffic must ride the exact prefix shape the
-    /// proxy accepted during the handshake — bare packets would no longer
-    /// map to our client->RCC binding (if a prefix was what got us in).
+    /// Send one datagram to the server, applying the confirmed RUPP
+    /// envelope. ALL session traffic must ride the exact clear-header shape
+    /// the proxy accepted during the handshake — bare packets would no
+    /// longer map to our client->RCC binding (if an envelope was what got
+    /// us in).
     fn send_raw(&self, buf: &[u8]) -> std::io::Result<()> {
-        match &self.wrap {
+        match &self.envelope {
             None => self.socket.send_to(buf, self.server).map(|_| ()),
-            Some((_, prefix)) => {
-                let mut out = Vec::with_capacity(prefix.len() + buf.len());
-                out.extend_from_slice(prefix);
-                out.extend_from_slice(buf);
+            Some(env) if env.direction == 0 => {
+                self.socket.send_to(buf, self.server).map(|_| ())
+            }
+            Some(env) => {
+                let out = crate::roblox::udmux::rupp_frame(env, buf);
                 self.socket.send_to(&out, self.server).map(|_| ())
             }
+        }
+    }
+
+    /// Detect a RUPP-framed incoming datagram, log its clear header and
+    /// return the inner bytes. Raw datagrams pass through unchanged — the
+    /// server answers inside the envelope of its direction (0x1f), so this
+    /// runs on every recv path.
+    fn strip_incoming(&self, payload: Vec<u8>, ctx: &str) -> Vec<u8> {
+        if let Some((dir, epoch, mux, hlen)) = crate::roblox::udmux::rupp_parse(&payload) {
+            netlog!(
+                net,
+                "{}: RUPP reply dir 0x{:02x} epoch {} mux {} body {} bytes",
+                ctx,
+                dir,
+                hex_head(&epoch, 16),
+                hex_head(&mux, 8),
+                payload.len() - hlen
+            );
+            payload[hlen..].to_vec()
+        } else {
+            payload
         }
     }
 
@@ -528,13 +591,15 @@ impl RakClient {
     /// budget to the first variant, so "4 protocol attempts" in the failure
     /// message really sent only the first packet shape. Any datagram that
     /// arrives is logged (first bytes) whether or not it parses, so a wrong
-    /// reply shape is visible in the client log alone.
+    /// reply shape is visible in the client log alone. `env_of` selects the
+    /// datagram envelope for a variant (phase 1 probes several).
     fn offline_roundtrip<P, R, F>(
         &mut self,
         variants: &[P],
         timeout: Duration,
         label: &str,
         mut build: impl FnMut(&P, &mut Vec<u8>, u16),
+        env_of: impl Fn(&P) -> crate::roblox::udmux::Envelope,
         mut parse: F,
     ) -> Result<(R, usize), RakError>
     where
@@ -554,10 +619,11 @@ impl RakClient {
                 if Instant::now() >= next_send {
                     out.clear();
                     build(v, &mut out, self.mtu);
+                    // send_raw frames the body with this variant's envelope;
+                    // phases after phase 1 always see their pinned envelope.
+                    let env = env_of(v);
+                    self.envelope = if env.direction == 0 { None } else { Some(env) };
                     sends += 1;
-                    // send_raw applies the confirmed wrapper for phases
-                    // after phase 1; during phase 1 the prefix is already
-                    // part of `out` (the wrapper is being probed).
                     if let Err(e) = self.send_raw(&out) {
                         netlog!(net, "handshake {}: attempt {} send #{} failed: {}", label, i + 1, sends, e);
                     } else if sends == 1 {
@@ -580,6 +646,7 @@ impl RakClient {
                             continue;
                         }
                         self.last_recv = Instant::now();
+                        let payload = self.strip_incoming(payload, label);
                         if let Some(r) = parse(self, &payload) {
                             netlog!(net, "handshake {}: attempt {} got a valid reply after {} send(s)", label, i + 1, sends);
                             return Ok((r, i));
@@ -607,31 +674,28 @@ impl RakClient {
     }
 
     /// Reachability probe: RakNet unconnected pings (0x01 / 0x02) with the
-    /// standard magic, replayed through EVERY udmux wrapper candidate.
-    /// Returns the wrapper label that drew a pong. This separates "the
-    /// network path is dead" from "the handshake packet shape is rejected"
-    /// AND pins down which token prefix (if any) the proxy expects.
+    /// standard magic, replayed through EVERY envelope candidate (bare +
+    /// token-derived RUPP headers). Returns the envelope that drew a reply.
+    /// This separates "the network path is dead" from "the handshake packet
+    /// shape is rejected" AND pins down which clear-header shape the proxy
+    /// expects.
     fn probe_reachability(
         &mut self,
-        wraps: &[(&'static str, Vec<u8>)],
-        per_wrap: Duration,
-    ) -> Option<&'static str> {
-        for (label, prefix) in wraps {
-            self.wrap = if prefix.is_empty() {
-                None
-            } else {
-                Some((*label, prefix.clone()))
-            };
+        envelopes: &[crate::roblox::udmux::Envelope],
+        per_env: Duration,
+    ) -> Option<crate::roblox::udmux::Envelope> {
+        for env in envelopes {
+            self.envelope = if env.direction == 0 { None } else { Some(*env) };
             for pid in [0x01u8, 0x02u8] {
                 let mut pkt = Vec::with_capacity(1 + 16 + 8);
                 pkt.push(pid);
                 pkt.extend_from_slice(&OFFLINE_MAGIC);
                 pkt.extend_from_slice(&self.guid.to_le_bytes());
                 if let Err(e) = self.send_raw(&pkt) {
-                    netlog!(net, "path probe: ping 0x{:02x} send failed: {}", pid, e);
+                    netlog!(net, "envelope probe: ping 0x{:02x} via '{}' send failed: {}", pid, env.label, e);
                     continue;
                 }
-                let deadline = Instant::now() + per_wrap;
+                let deadline = Instant::now() + per_env;
                 while Instant::now() < deadline {
                     match self.socket.recv_from(&mut self.buf) {
                         Ok((n, from)) => {
@@ -639,15 +703,16 @@ impl RakClient {
                                 continue;
                             }
                             self.last_recv = Instant::now();
+                            let payload = self.strip_incoming(self.buf[..n].to_vec(), "envelope probe");
                             netlog!(
                                 net,
-                                "path probe: reply to 0x{:02x} via wrapper '{}' ({} bytes: {})",
+                                "envelope probe: reply to 0x{:02x} via '{}' ({} bytes: {})",
                                 pid,
-                                label,
-                                n,
-                                hex_head(&self.buf[..n], 24)
+                                env.label,
+                                payload.len(),
+                                hex_head(&payload, 24)
                             );
-                            return Some(label);
+                            return Some(*env);
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             std::thread::sleep(Duration::from_millis(8));
@@ -657,7 +722,7 @@ impl RakClient {
                 }
             }
         }
-        self.wrap = None;
+        self.envelope = None;
         None
     }
 
@@ -669,7 +734,7 @@ impl RakClient {
             match self.socket.recv_from(&mut self.buf) {
                 Ok((n, from)) if from == self.server => {
                     self.last_recv = Instant::now();
-                    return Some(self.buf[..n].to_vec());
+                    return Some(self.strip_incoming(self.buf[..n].to_vec(), "recv"));
                 }
                 Ok((n, from)) => {
                     netlog!(
@@ -927,7 +992,7 @@ impl RakClient {
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => return None,
                 Err(_) => return None,
             };
-            let pkt: Vec<u8> = self.buf[..n].to_vec();
+            let pkt: Vec<u8> = self.strip_incoming(self.buf[..n].to_vec(), "poll");
             self.handle_packet(&pkt);
         }
         self.pending.pop_front()
