@@ -25,6 +25,11 @@ static LOGS: Mutex<Option<VecDeque<String>>> = Mutex::new(None);
 /// mirrored here so a crash cannot take the diagnostics with it — the
 /// in-memory ring dies with the process, the file does not.
 static LOG_FILE: Mutex<Option<std::fs::File>> = Mutex::new(None);
+/// Extra append-only mirror files registered with [`add_mirror_file`]. On
+/// Android the primary file lives in app-private storage (unreadable
+/// without root), so the harness mirrors it into the external files dir
+/// where a file manager / USB can reach it.
+static LOG_MIRRORS: Mutex<Vec<std::fs::File>> = Mutex::new(Vec::new());
 
 /// UTC time-of-day as `[HH:MM:SS]` (no chrono dependency; the date is not
 /// needed for live diagnostics and keeps lines short).
@@ -91,10 +96,6 @@ pub fn log_file_path() -> Option<PathBuf> {
 /// it forever. Called once at startup; safe to call again (no-op while the
 /// file is already open).
 pub fn init_file() {
-    let Ok(mut guard) = LOG_FILE.lock() else { return };
-    if guard.is_some() {
-        return;
-    }
     let Some(path) = log_file_path() else { return };
     let dir = match path.parent() {
         Some(d) => d,
@@ -107,14 +108,26 @@ pub fn init_file() {
         }
     }
     let file = std::fs::OpenOptions::new().create(true).append(true).open(&path);
+    let started = format!(
+        "{} [app] --- rustblox session started (pid {}) ---\n",
+        stamp(),
+        std::process::id()
+    );
+    // All filesystem work above happens BEFORE taking the lock; the marker
+    // write below re-locks through file_write, so the guard must be dropped
+    // first (std Mutex is not reentrant — re-locking here deadlocked the
+    // whole app at startup).
+    let mut guard = match LOG_FILE.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    if guard.is_some() {
+        return;
+    }
     match file {
         Ok(f) => {
             *guard = Some(f);
-            let started = format!(
-                "{} [app] --- rustblox session started (pid {}) ---\n",
-                stamp(),
-                std::process::id()
-            );
+            drop(guard);
             file_write(&started);
         }
         Err(e) => {
@@ -123,7 +136,7 @@ pub fn init_file() {
     }
 }
 
-/// Append raw text to the log file. Poison-tolerant and panic-free on
+/// Append raw text to the log file(s). Poison-tolerant and panic-free on
 /// purpose: this runs inside the panic hook.
 fn file_write(text: &str) {
     use std::io::Write;
@@ -133,6 +146,72 @@ fn file_write(text: &str) {
             let _ = f.flush();
         }
     }
+    if let Ok(mut mirrors) = LOG_MIRRORS.lock() {
+        for f in mirrors.iter_mut() {
+            use std::io::Write;
+            let _ = f.write_all(text.as_bytes());
+            let _ = f.flush();
+        }
+    }
+}
+
+/// Register an additional append-only mirror file (e.g. the Android
+/// external-files log). Best effort: storage failures are reported to
+/// stderr and ignored. Applies the same 1 MiB rotation as [`init_file`].
+pub fn add_mirror_file(path: &std::path::Path) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > 1024 * 1024 {
+            let _ = std::fs::rename(path, path.with_extension("prev.log"));
+        }
+    }
+    match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        Ok(f) => {
+            if let Ok(mut guard) = LOG_MIRRORS.lock() {
+                guard.push(f);
+            }
+        }
+        Err(e) => eprintln!("[rustblox] log mirror unavailable ({}): {}", path.display(), e),
+    }
+}
+
+/// Surface panics from earlier sessions: scan the persistent log files and
+/// re-push every `[panic]` entry into the ring buffer (buffer only — they
+/// are not echoed back into the file), so a crash is visible and copyable
+/// in Settings → Logs on the next launch even though the old process is
+/// gone. Called once at startup, right after [`init_file`].
+pub fn load_previous_crash() {
+    let Some(path) = log_file_path() else { return };
+    let Some(dir) = path.parent() else { return };
+    let mut crashes: Vec<String> = Vec::new();
+    for name in ["client.prev.log", "client.log"] {
+        let Ok(data) = std::fs::read_to_string(dir.join(name)) else { continue };
+        crashes.extend(data.lines().filter(|l| l.contains(" [panic] ")).map(|l| l.to_string()));
+    }
+    if crashes.is_empty() {
+        return;
+    }
+    let total = crashes.len();
+    let Ok(mut guard) = LOGS.lock() else { return };
+    let buf = guard.get_or_insert_with(|| VecDeque::with_capacity(CAP));
+    push_into(
+        buf,
+        &stamp(),
+        "app",
+        &format!(
+            "previous session crashed! {total} panic line(s) recovered from {}",
+            path.display()
+        ),
+    );
+    // Newest five panics, chronological order.
+    for line in crashes.iter().rev().take(5).rev() {
+        if buf.len() >= CAP {
+            buf.pop_front();
+        }
+        buf.push_back(clamp_line(line));
+    }
 }
 
 /// Install the panic hook: every panic is stamped with thread, message and
@@ -140,7 +219,16 @@ fn file_write(text: &str) {
 /// context) BEFORE the default hook prints to stderr. Without this a crash
 /// took the whole diagnostic ring buffer with it — exactly the un-reportable
 /// "client just crashed" case.
+///
+/// Idempotent: platform entry points call it as early as possible, then
+/// [`run_with`](crate::run_with) calls it again — the second call is a no-op
+/// (otherwise wrapping hooks would double-write every panic).
 pub fn install_panic_hook() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    if INSTALLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let thread = std::thread::current();
