@@ -49,7 +49,14 @@ fn main() {
     println!("      avatar type: {}", appearance.player_avatar_type);
 
     println!("[4/4] RakNet handshake against {}:{}...", resp.ip, resp.port);
-    let mut rak = match RakClient::connect(&resp.ip, resp.port, &[10, 11, 5, 1], Duration::from_secs(8)) {
+    // The join script may hand out a udmux routing token — the example dials
+    // the RCC address directly, so the token is only forwarded when present.
+    let udmux_token = if resp.udmux_token.is_empty() {
+        None
+    } else {
+        Some((resp.udmux_token.as_str(), resp.udmux_pepper))
+    };
+    let mut rak = match RakClient::connect(&resp.ip, resp.port, &[10, 11, 5, 1], Duration::from_secs(8), udmux_token) {
         Ok(c) => {
             println!("      CONNECTED (server guid {})", c.server_guid);
             c

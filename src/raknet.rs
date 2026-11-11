@@ -264,6 +264,10 @@ pub struct RakClient {
     pub mtu: u16,
     pub state: RakState,
     pub ping_ms: Option<f32>,
+    /// UDMUX routing-token prefix confirmed by the handshake (label, bytes).
+    /// Applied to every datagram sent after it was confirmed — the proxy
+    /// binds the client->RCC mapping to the exact prefix shape it accepted.
+    wrap: Option<(&'static str, Vec<u8>)>,
 
     // Send side
     reliability_index: u32,
@@ -298,11 +302,17 @@ struct SplitState {
 
 impl RakClient {
     /// Perform the full offline + connected handshake against a game server.
+    ///
+    /// `udmux_token` carries the join script's per-session routing material
+    /// (`(TokenValue, PepperId)`) when the dial goes through a UDMUX proxy;
+    /// phase 1 then also probes token-derived datagram prefixes and keeps
+    /// the first shape the proxy answers, applying it to every later send.
     pub fn connect(
         host: &str,
         port: u16,
         protocol_versions: &[u8],
         handshake_timeout: Duration,
+        udmux_token: Option<(&str, u64)>,
     ) -> Result<RakClient, RakError> {
         let addr: SocketAddr = (host, port)
             .to_socket_addrs()
@@ -330,6 +340,7 @@ impl RakClient {
             mtu: 1400,
             state: RakState::Connecting,
             ping_ms: None,
+            wrap: None,
             reliability_index: 0,
             datagram_seq: 0,
             split_id: 0,
@@ -348,28 +359,74 @@ impl RakClient {
         };
 
         // Phase 1: OPEN_CONNECTION_REQUEST_1 -> REPLY_1 (MTU probing).
+        //
+        // Variant matrix = udmux wrapper x protocol byte. "bare" first: if
+        // the proxy routes by port alone, a token prefix would only confuse
+        // it. Every (wrapper, protocol) pair gets its own retransmit window
+        // and the first one that draws a valid REPLY_1 wins for the session.
+        let wraps: Vec<(&'static str, Vec<u8>)> = match udmux_token {
+            None => vec![("bare", Vec::new())],
+            Some((tok, pepper)) => crate::roblox::udmux::wrap_candidates(tok, pepper),
+        };
+        let p1_variants: Vec<(&'static str, &[u8], u8)> = wraps
+            .iter()
+            .flat_map(|(label, prefix)| {
+                protocol_versions.iter().map(move |&proto| (*label, &prefix[..], proto))
+            })
+            .collect();
         let reply1 = match c.offline_roundtrip(
-            protocol_versions,
+            &p1_variants,
             handshake_timeout,
             "request-1",
-            |protocol, out, mtu| {
+            |(_, prefix, proto), out, mtu| {
+                out.extend_from_slice(prefix);
                 out.push(ID_OPEN_CONNECTION_REQUEST_1);
                 out.extend_from_slice(&OFFLINE_MAGIC);
-                out.push(*protocol);
-                // MTU probe: pad to the datagram size.
+                out.push(*proto);
+                // MTU probe: pad to the datagram size (prefix included —
+                // the proxy judges the path MTU by the whole datagram).
                 out.resize(mtu as usize, 0x00);
             },
             |c, payload| c.parse_reply1(payload),
         ) {
-            Ok(r) => r,
+            Ok((r, winner)) => {
+                let (label, prefix, proto) = p1_variants[winner];
+                c.wrap = if prefix.is_empty() {
+                    None
+                } else {
+                    Some((label, prefix.to_vec()))
+                };
+                netlog!(
+                    net,
+                    "handshake wrapper '{}' (protocol {}) confirmed — applying it to every datagram this session",
+                    label,
+                    proto
+                );
+                r
+            }
             Err(e) => {
                 // Classify the failure for the log: a pong proves the UDP
                 // path and the magic are fine (blame the handshake params);
                 // silence means proxy:port never answered anything at all.
-                if c.probe_reachability(Duration::from_secs(2)).is_some() {
-                    netlog!(net, "path probe: pong — proxy:port is reachable, the handshake packet shape is the problem");
-                } else {
-                    netlog!(net, "path probe: no reply to unconnected pings either — proxy:port unreachable (stale session port, firewall or proxy that ignores pings)");
+                // The probe replays unconnected pings through EVERY wrapper
+                // candidate, so "pong via wrapper X" pins down the routing
+                // shape even when the OCR1 shape/protocol is what's wrong.
+                match c.probe_reachability(&wraps, Duration::from_millis(1200)) {
+                    Some(label) if label != "bare" => netlog!(
+                        net,
+                        "path probe: pong via wrapper '{}' — the proxy wants this token prefix, \
+                         but rejected our OPEN_CONNECTION_REQUEST_1 (protocol byte or MTU shape)",
+                        label
+                    ),
+                    Some(_) => netlog!(
+                        net,
+                        "path probe: pong — proxy:port is reachable, the handshake packet shape is the problem"
+                    ),
+                    None => netlog!(
+                        net,
+                        "path probe: no reply to unconnected pings in any wrapper — proxy:port unreachable \
+                         (stale session port, firewall, or proxy that drops unauthenticated packets)"
+                    ),
                 }
                 return Err(e);
             }
@@ -381,7 +438,7 @@ impl RakClient {
 
         // Phase 2: OPEN_CONNECTION_REQUEST_2 -> REPLY_2.
         let guid = c.guid;
-        let reply2 = c.offline_roundtrip(
+        let (reply2, _) = c.offline_roundtrip(
             &[()],
             handshake_timeout,
             "request-2",
@@ -418,7 +475,7 @@ impl RakClient {
                 .as_millis() as u64;
             out.extend_from_slice(&t.to_le_bytes());
             out.push(0); // useSecurity = false
-            if let Err(e) = c.socket.send_to(&out, c.server) {
+            if let Err(e) = c.send_raw(&out) {
                 netlog!(net, "CONNECTION_REQUEST send failed: {}", e);
             } else {
                 netlog!(net, "CONNECTION_REQUEST sent");
@@ -448,6 +505,22 @@ impl RakClient {
         Ok(c)
     }
 
+    /// Send one datagram to the server, applying the confirmed UDMUX token
+    /// prefix. ALL session traffic must ride the exact prefix shape the
+    /// proxy accepted during the handshake — bare packets would no longer
+    /// map to our client->RCC binding (if a prefix was what got us in).
+    fn send_raw(&self, buf: &[u8]) -> std::io::Result<()> {
+        match &self.wrap {
+            None => self.socket.send_to(buf, self.server).map(|_| ()),
+            Some((_, prefix)) => {
+                let mut out = Vec::with_capacity(prefix.len() + buf.len());
+                out.extend_from_slice(prefix);
+                out.extend_from_slice(buf);
+                self.socket.send_to(&out, self.server).map(|_| ())
+            }
+        }
+    }
+
     /// Generic offline request/reply round.
     ///
     /// Every variant gets an equal slice of `timeout` (with mid-window
@@ -463,7 +536,7 @@ impl RakClient {
         label: &str,
         mut build: impl FnMut(&P, &mut Vec<u8>, u16),
         mut parse: F,
-    ) -> Result<R, RakError>
+    ) -> Result<(R, usize), RakError>
     where
         F: FnMut(&mut RakClient, &[u8]) -> Option<R>,
     {
@@ -482,7 +555,10 @@ impl RakClient {
                     out.clear();
                     build(v, &mut out, self.mtu);
                     sends += 1;
-                    if let Err(e) = self.socket.send_to(&out, self.server) {
+                    // send_raw applies the confirmed wrapper for phases
+                    // after phase 1; during phase 1 the prefix is already
+                    // part of `out` (the wrapper is being probed).
+                    if let Err(e) = self.send_raw(&out) {
                         netlog!(net, "handshake {}: attempt {} send #{} failed: {}", label, i + 1, sends, e);
                     } else if sends == 1 {
                         netlog!(net, "handshake {}: attempt {} — {} bytes on the wire (retransmitting every 500 ms)", label, i + 1, out.len());
@@ -506,7 +582,7 @@ impl RakClient {
                         self.last_recv = Instant::now();
                         if let Some(r) = parse(self, &payload) {
                             netlog!(net, "handshake {}: attempt {} got a valid reply after {} send(s)", label, i + 1, sends);
-                            return Ok(r);
+                            return Ok((r, i));
                         }
                         netlog!(
                             net,
@@ -531,44 +607,57 @@ impl RakClient {
     }
 
     /// Reachability probe: RakNet unconnected pings (0x01 / 0x02) with the
-    /// standard magic. Returns the reply length on any pong. This separates
-    /// "the network path is dead" from "the handshake packet shape is
-    /// rejected" — servers that answer pings but ignore our handshake point
-    /// at protocol-level mismatches, not at the proxy/port.
-    fn probe_reachability(&mut self, timeout: Duration) -> Option<usize> {
-        for pid in [0x01u8, 0x02u8] {
-            let mut pkt = Vec::with_capacity(1 + 16 + 8);
-            pkt.push(pid);
-            pkt.extend_from_slice(&OFFLINE_MAGIC);
-            pkt.extend_from_slice(&self.guid.to_le_bytes());
-            if let Err(e) = self.socket.send_to(&pkt, self.server) {
-                netlog!(net, "path probe: ping 0x{:02x} send failed: {}", pid, e);
-                continue;
-            }
-            let deadline = Instant::now() + timeout;
-            while Instant::now() < deadline {
-                match self.socket.recv_from(&mut self.buf) {
-                    Ok((n, from)) => {
-                        if from != self.server {
-                            continue;
+    /// standard magic, replayed through EVERY udmux wrapper candidate.
+    /// Returns the wrapper label that drew a pong. This separates "the
+    /// network path is dead" from "the handshake packet shape is rejected"
+    /// AND pins down which token prefix (if any) the proxy expects.
+    fn probe_reachability(
+        &mut self,
+        wraps: &[(&'static str, Vec<u8>)],
+        per_wrap: Duration,
+    ) -> Option<&'static str> {
+        for (label, prefix) in wraps {
+            self.wrap = if prefix.is_empty() {
+                None
+            } else {
+                Some((*label, prefix.clone()))
+            };
+            for pid in [0x01u8, 0x02u8] {
+                let mut pkt = Vec::with_capacity(1 + 16 + 8);
+                pkt.push(pid);
+                pkt.extend_from_slice(&OFFLINE_MAGIC);
+                pkt.extend_from_slice(&self.guid.to_le_bytes());
+                if let Err(e) = self.send_raw(&pkt) {
+                    netlog!(net, "path probe: ping 0x{:02x} send failed: {}", pid, e);
+                    continue;
+                }
+                let deadline = Instant::now() + per_wrap;
+                while Instant::now() < deadline {
+                    match self.socket.recv_from(&mut self.buf) {
+                        Ok((n, from)) => {
+                            if from != self.server {
+                                continue;
+                            }
+                            self.last_recv = Instant::now();
+                            netlog!(
+                                net,
+                                "path probe: reply to 0x{:02x} via wrapper '{}' ({} bytes: {})",
+                                pid,
+                                label,
+                                n,
+                                hex_head(&self.buf[..n], 24)
+                            );
+                            return Some(label);
                         }
-                        self.last_recv = Instant::now();
-                        netlog!(
-                            net,
-                            "path probe: reply to 0x{:02x} ({} bytes: {})",
-                            pid,
-                            n,
-                            hex_head(&self.buf[..n], 24)
-                        );
-                        return Some(n);
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(8));
+                        }
+                        Err(_) => break,
                     }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(8));
-                    }
-                    Err(_) => break,
                 }
             }
         }
+        self.wrap = None;
         None
     }
 
@@ -650,7 +739,7 @@ impl RakClient {
         out.push(ID_NEW_INCOMING_CONNECTION);
         write_address(&mut out, self.local_addr_for());
         write_address(&mut out, self.server);
-        let _ = self.socket.send_to(&out, self.server);
+        let _ = self.send_raw(&out);
         Ok(())
     }
 
@@ -759,7 +848,7 @@ impl RakClient {
         pkt.push(DATAGRAM_VALID | 0x04);
         put_u24(&mut pkt, *seq);
         pkt.extend_from_slice(dg);
-        let _ = self.socket.send_to(&pkt, self.server);
+        let _ = self.send_raw(&pkt);
         *seq = seq.wrapping_add(1);
     }
 
@@ -933,7 +1022,7 @@ impl RakClient {
                 if pkt.len() >= 9 {
                     let mut out = vec![ID_CONNECTED_PONG];
                     out.extend_from_slice(&pkt[1..9]);
-                    let _ = self.socket.send_to(&out, self.server);
+                    let _ = self.send_raw(&out);
                 }
                 None
             }
@@ -1018,7 +1107,7 @@ impl RakClient {
                 put_u24(&mut out, lo);
             }
         }
-        let _ = self.socket.send_to(&out, self.server);
+        let _ = self.send_raw(&out);
         self.ack_buffer.clear();
     }
 
@@ -1081,7 +1170,7 @@ impl RakClient {
     pub fn close(&mut self) {
         if self.state == RakState::Connected {
             let out = [ID_DISCONNECTION_NOTIFICATION];
-            let _ = self.socket.send_to(&out, self.server);
+            let _ = self.send_raw(&out);
             self.flush();
         }
         self.state = RakState::Disconnected;
@@ -1343,7 +1432,7 @@ mod tests {
         });
 
         let mut client =
-            RakClient::connect("127.0.0.1", sport, &[10, 5], Duration::from_secs(5))
+            RakClient::connect("127.0.0.1", sport, &[10, 5], Duration::from_secs(5), None)
                 .expect("handshake failed");
         assert_eq!(client.state, RakState::Connected);
         assert_eq!(client.server_guid, 1234567);

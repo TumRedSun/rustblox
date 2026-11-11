@@ -133,9 +133,16 @@ fn game_thread(
 ) {
     // Roblox hands out private RCC addresses (10.x.x.x) that are unroutable
     // from the open internet: real clients dial the datacenter's public
-    // UDMUX proxy on the SAME port instead. Resolve that proxy up front and
-    // log every decision so a failed join is diagnosable from the log alone.
-    let mut dial = resp.ip.clone();
+    // UDMUX proxy instead. Resolve that proxy up front and log every
+    // decision so a failed join is diagnosable from the log alone.
+    //
+    // NOTE: host and port are carried SEPARATELY from here on — the join
+    // script's udmux endpoint already includes its own port (equal to the
+    // RCC port today, but not guaranteed), and appending resp.port to a
+    // host:port string used to produce "ip:port:port", which to_socket_addrs
+    // tried to resolve as a DNS name ("Name or service not known").
+    let mut dial_host = resp.ip.clone();
+    let mut dial_port = resp.port;
     if !resp.udmux_host.is_empty() {
         netlog!(
             net,
@@ -144,7 +151,17 @@ fn game_thread(
             resp.ip,
             resp.port
         );
-        dial = resp.udmux_host.clone();
+        match resp.udmux_host.rsplit_once(':') {
+            Some((h, p)) => {
+                dial_host = h.to_string();
+                if let Ok(p) = p.parse::<u16>() {
+                    if p != 0 {
+                        dial_port = p;
+                    }
+                }
+            }
+            None => dial_host = resp.udmux_host.clone(),
+        }
     } else {
         match resp.ip.parse::<std::net::Ipv4Addr>() {
             Ok(ip) if crate::roblox::udmux::is_private(ip) => {
@@ -157,7 +174,7 @@ fn game_thread(
                             proxy,
                             resp.port
                         );
-                        dial = proxy.to_string();
+                        dial_host = proxy.to_string();
                     }
                     None => {
                         netlog!(
@@ -175,26 +192,34 @@ fn game_thread(
             Err(_) => netlog!(net, "rcc address {:?} is not an IPv4 literal", resp.ip),
         }
     }
-    netlog!(game, "connecting to {} (rcc {}:{})", dial, resp.ip, resp.port);
+    netlog!(game, "connecting to {}:{} (rcc {}:{})", dial_host, dial_port, resp.ip, resp.port);
     // RakNet handshake with several protocol version guesses (the Roblox
     // fork's exact protocol byte is not public knowledge; vanilla RakNet 4
     // defaults to 5, Minecraft Bedrock bumped to 10/11). Every guess now
     // really gets sent — each variant gets its own retransmit window — and
     // each attempt is logged, so the log shows which shapes were tried.
+    // When the join script carries a udmux routing token, the matrix also
+    // includes token-derived datagram prefixes (see udmux::wrap_candidates).
     let protocols: [u8; 4] = [5, 10, 11, 1];
+    let udmux_token = if resp.udmux_token.is_empty() {
+        None
+    } else {
+        Some((resp.udmux_token.as_str(), resp.udmux_pepper))
+    };
     let mut client = match RakClient::connect(
-        &dial,
-        resp.port,
+        &dial_host,
+        dial_port,
         &protocols,
         Duration::from_secs(6),
+        udmux_token,
     ) {
         Ok(c) => c,
         Err(e) => {
             netlog!(
                 game,
                 "raknet handshake to {}:{} failed after {} protocol attempt(s): {}",
-                dial,
-                resp.port,
+                dial_host,
+                dial_port,
                 protocols.len(),
                 e
             );
@@ -203,7 +228,7 @@ fn game_thread(
             return;
         }
     };
-    netlog!(game, "raknet connected: {}:{} (rcc {})", dial, resp.port, resp.ip);
+    netlog!(game, "raknet connected: {}:{} (rcc {}:{})", dial_host, dial_port, resp.ip, resp.port);
     lock_state(&state).phase = GamePhase::InGame;
 
     // Fetch our avatar appearance (best effort, no cookie needed for the
