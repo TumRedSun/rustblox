@@ -28,6 +28,13 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 dirs = "5.0"
 flate2 = "1"
 
+# Early-encryption (handshake crypto, join hypothesis (c)): the fork OCR2
+# carries an X25519 public key + an AEAD box, and the reply announces the
+# session keys (libsodium crypto_kx shape). Pure-Rust stacks, no C build.
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
+blake2 = "0.10"
+chacha20poly1305 = "0.10"
+
 # Desktop clipboard (arboard has no Android/iOS backend). wayland-data-control
 # adds a native Wayland clipboard backend so Copy works under Wayland too,
 # not only through XWayland.

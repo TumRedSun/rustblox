@@ -225,6 +225,18 @@ fn game_thread(
     } else {
         Duration::from_secs(6)
     };
+    // Early-encryption material (join hypothesis (c), Nov-12 live capture):
+    // the crypto OCR2/OpenReply2 handshake keyed by the join script's
+    // percent-encoded `EphemeralEarlyPubKey`. Built here so a missing or
+    // undecodable key falls back to the legacy handshake with a log line.
+    let early = crate::roblox::early::EarlyCrypto::from_join(&resp.ephemeral_pubkey);
+    if early.is_none() && !resp.ephemeral_pubkey.is_empty() {
+        netlog!(
+            game,
+            "early crypto: join script carried EphemeralEarlyPubKey ({} chars) but it did not decode to a 32-byte X25519 key — using the legacy handshake",
+            resp.ephemeral_pubkey.len()
+        );
+    }
     let mut client = match RakClient::connect(
         &dial_host,
         dial_port,
@@ -232,6 +244,7 @@ fn game_thread(
         handshake_timeout,
         udmux_token,
         rcc,
+        early,
     ) {
         Ok(c) => c,
         Err(e) => {

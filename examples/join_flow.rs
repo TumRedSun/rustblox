@@ -63,7 +63,10 @@ fn main() {
     } else {
         None
     };
-    let mut rak = match RakClient::connect(&resp.ip, resp.port, &[10, 11, 5, 1], Duration::from_secs(8), udmux_token, rcc) {
+    // Early-encryption material from the join script (hypothesis (c)): the
+    // crypto OCR2/OpenReply2 handshake keyed by EphemeralEarlyPubKey.
+    let early = rustblox::roblox::early::EarlyCrypto::from_join(&resp.ephemeral_pubkey);
+    let mut rak = match RakClient::connect(&resp.ip, resp.port, &[10, 11, 5, 1], Duration::from_secs(8), udmux_token, rcc, early) {
         Ok(c) => {
             println!("      CONNECTED (server guid {})", c.server_guid);
             c

@@ -118,3 +118,74 @@ of the SAME session (`jobId 96a696fd…`, place 537413528, RCC
   `TokenGenAlgorithm` comment unlinked from the (now settled) tag question.
 * Next wall: the OCR2 blob — needs the client binary (libroblox) around the
   strings `UniqueNumber`, `RakNetEarlyPublicKey`, `EphemeralEarlyPubKey`.
+
+## Nov 12 (evening) — the crypto handshake decoded to its framing
+
+New material: the full RE corpus from the working session (`asdasd.zip`):
+`libroblox.so` disassembly fragments (`verify_func`, `material40ca584`,
+`preauth_window`, `keyring_parse`, `keyringclient`, `derive40c9d5a`,
+`mac68b20c0`), `str_addrs.json` (string→address map), probe scripts
+(`probe.py`..`probe4.py`), `good_tag.bin`, `reply1.bin`, `rustblox.dmp`, and
+`ref/raknet-decryption` (a public PoC that decrypts the Roblox RakNet stream
+when given session keys). Everything below is either byte-measured or
+cross-checked between the dump, the pcap and that reference.
+
+### Framing: two distinct crypto phases
+
+1. **Offline crypto boxes** (the OCR2 request box and the OpenReply2 reply
+   box): `nonce(12, random, on the wire) || ct || tag(16)`.
+   * OCR2: AAD = the 90-byte RakNet prefix (`78 | magic | 03 5a 00 5d 00 05 |
+     pub32 | 11 | pa_len | pa33`); box = 93 = 12 + 65 + 16.
+   * OpenReply2: box = 53 on the wire (its own header declares `01 2c 00 3a
+     03` = ver 1, aad 44, box 58 — the declared 58 does not match the 53
+     measured; parsed tolerantly).
+2. **Everything after OpenReply2** (boxed CONNECTION_REQUEST, ACCEPTED,
+   NEW_INCOMING, the whole connected session — one scheme):
+   `wire = ct || counter_hint(u16 LE) || tag(16)`, nonce =
+   `u64 LE counter || "mbeR"`, AAD EMPTY. Proven: the pcap's 56/59-byte
+   keepalives carry strictly sequential hints (39970, 39971, 39972, …
+   shared across sizes), and the dump's pkt4..7 hints are `6e55, 6e55,
+   6e56, 6e56` — both directions count from the SAME negotiated base.
+   This is exactly `ref/raknet-decryption`'s scheme (`get_nonce_bytes`).
+   The `"mbeR"` tail comes from the literal `UniqueNumbeR` string.
+
+### The counter base is NOT zero
+
+The dump's first post-OR2 counter is 0x6e55 on both sides — the base rides
+inside session material we cannot decrypt offline (probably the OpenReply2
+box or `ID_SET_GLOBALS`). The client takes `RUSTBLOX_NONCE_BASE` (default 0)
+and the opener scans a window of high bits around the base.
+
+### Key schedule (probe4.py + ref, not yet server-validated)
+
+`H = BLAKE2b-512(x25519(client_sk, server_pk) || client_pk || server_pk)`;
+client sends with `H[32:]`, receives with `H[:32]` (libsodium crypto_kx).
+Two agreements: the join script's `EphemeralEarlyPubKey` (OCR2 box) and the
+OpenReply2's server key (everything after). ChaCha20-Poly1305
+(ref also tries AES-256-GCM).
+
+### What is implemented now (src/roblox/early.rs)
+
+* `from_join` — percent-decode + b64 the join key (the "0 bytes" bug).
+* `crypto_kx` — the schedule above (RFC 7748 + BLAKE2b vector tested).
+* `build_ocr2` — the byte-exact crypto OCR2 (AAD 90, box 93,
+  `UniqueNumber` + 16).
+* `parse_reply2` — the crypto OpenReply2 (server key, box, UniqueNumber).
+* `seal_counter`/`open_counter` — the post-OR2 counter framing.
+* `parse_keyring` — `ClientPublicKeyData` JSON (versions + send id).
+* RakClient: crypto OCR2 first, sala shapes as fallback; boxed CR; counter
+  open on every recv path; tag adoption + cls byte switch unchanged.
+
+### Open items (needs a live probe run — tools/udmux_probe.py)
+
+* The 65-byte OCR2 box plaintext (default zeros, `RUSTBLOX_OCR2_PAYLOAD`).
+* The 33-byte preauth blob: 240 HMAC/BLAKE2/keying combinations over the
+  public join fields miss the captured sample; carried verbatim
+  (`RUSTBLOX_PREAUTH`) until the libroblox derivation is recovered.
+  The libroblox preauth-window code accepts exactly 32, 50 or 33 bytes.
+* The fork's CONNECTION_REQUEST plaintext: the dump's box holds **34**
+  bytes; the vanilla CR is 24 (`ID+guid+time+useSec+password`). The
+  extra 10 bytes are unresolved — the probe tries both sizes.
+* The counter base (see above) and the OpenReply2 box content.
+* The 16 bytes after `UniqueNumber` in both directions (client-chosen?
+  server-chosen? a MAC over the clear section?).

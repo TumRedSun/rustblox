@@ -396,6 +396,15 @@ pub struct RakClient {
     /// The server's 16-byte tag, learned from any incoming RUPP header.
     /// Once the connection is up, both sides send the SAME tag.
     server_tag: Option<[u8; 16]>,
+    /// Early-encryption state (join hypothesis (c)): key schedule + the
+    /// crypto OCR2/OpenReply2 handshake. `None` = legacy unencrypted fork
+    /// handshake (direct dials without join-script crypto material).
+    early: Option<crate::roblox::early::EarlyCrypto>,
+    /// Connected-phase framing: after ACCEPTED the session switches from
+    /// the tagged handshake boxes (`nonce12+ct+tag16`) to the stream shape
+    /// the pcap proves out (`nonce12+ct`, no tag — the 56-byte keepalives
+    /// are 31+12+13 = envelope+nonce+13-byte ping datagram).
+    crypto_connected: bool,
     /// Offline-id generation that answered phase 1.
     fork: ForkGen,
 
@@ -449,6 +458,7 @@ impl RakClient {
         handshake_timeout: Duration,
         udmux_token: Option<(&str, u64)>,
         rcc: Option<(std::net::Ipv4Addr, u16)>,
+        early: Option<crate::roblox::early::EarlyCrypto>,
     ) -> Result<RakClient, RakError> {
         let addr: SocketAddr = (host, port)
             .to_socket_addrs()
@@ -478,7 +488,11 @@ impl RakClient {
             ping_ms: None,
             envelope: None,
             client_tag: [0u8; 16],
+            // The server's 16-byte tag, learned from any incoming RUPP header.
             server_tag: None,
+            early,
+            crypto_connected: false,
+            // Offline-id generation that answered phase 1.
             fork: ForkGen::Roblox,
             reliability_index: 0,
             order_index: 0,
@@ -687,43 +701,100 @@ impl RakClient {
 
         // Phase 2: OPEN_CONNECTION_REQUEST_2 -> REPLY_2.
         //
-        // The fork's OCR2 has no security cookie and appends two fields the
-        // vanilla packet does not carry: SupportedVersion (u32 BE — value
-        // not published, matrix 5/1/0) and Capabilities (u64 BE — base
-        // client set vs the modern superset). The server address block is
-        // XOR-obfuscated (Sala readAddress: family, ip^0xFF, port BE).
-        let mut p2_variants: Vec<(u8, u32, u64)> = Vec::new();
-        for &sv in &[5u32, 1, 0] {
-            p2_variants.push((RBX_ID_OPEN_CONNECTION_REQUEST_2, sv, RBX_CAPABILITY_MODERN));
-            p2_variants.push((RBX_ID_OPEN_CONNECTION_REQUEST_2, sv, RBX_CAPABILITY_ROBLOX));
-        }
-        // Vanilla fallback (direct dials): the legacy OCR2 shape.
-        p2_variants.push((ID_OPEN_CONNECTION_REQUEST_2, 0, 0));
-        let guid = c.guid;
         // The envelope pinned in phase 1 (Copy) — every later datagram,
         // including OCR2, must ride the shape the proxy accepted.
         let pinned_env = c.envelope;
         let env_for_pad = pinned_env;
-        let (reply2, _) = c.offline_roundtrip(
-            &p2_variants,
-            handshake_timeout,
-            "request-2",
-            |(id, sv, caps), out, mtu| {
-                *out = build_ocr2(*id, *sv, *caps, addr, mtu, guid);
-                // The capture pads OCR2 to the same 1160-byte datagram as
-                // OCR1 (real content ends ~243 bytes in, the rest is zero
-                // pad) — the negotiated MTU only governs the connected
-                // phase, not the offline probe size.
+
+        // Fork crypto path (join hypothesis (c), byte-verified against the
+        // Nov-12 live capture): when the join script hands out the ephemeral
+        // early key, the OCR2 is the CRYPTO shape — `78 | magic | 03 5a 00
+        // 5d 00 05 | client_pub(32) | 11 | 21 | preauth(33) | nonce(12) |
+        // box(81) | "UniqueNumber" | unique(16)` — NOT the sala sv/caps
+        // shape, which the RCC silently drops. The reply is the crypto
+        // OpenReply2 and announces the session keys. The sala matrix stays
+        // as the fallback for sessions without (or failing) early material.
+        let mut crypto_reply2 = false;
+        if c.early.is_some() {
+            let early_body = c
+                .early
+                .as_mut()
+                .map(|ec| {
+                    let (_aad, body) = ec.build_ocr2();
+                    body
+                });
+            if let Some(mut body) = early_body {
                 let hlen = env_for_pad.map(|e| e.direction as usize).unwrap_or(0);
-                out.resize(RBX_OFFLINE_PROBE.saturating_sub(hlen), 0x00);
-            },
-            move |_| pinned_env.unwrap_or(crate::roblox::udmux::BARE),
-            |c, payload| c.parse_reply2(payload),
-        )?;
+                body.resize(RBX_OFFLINE_PROBE.saturating_sub(hlen), 0x00);
+                let res = c.offline_roundtrip(
+                    &[body],
+                    handshake_timeout,
+                    "request-2-crypto",
+                    |b, out, _mtu| {
+                        out.clear();
+                        out.extend_from_slice(b);
+                        // Keep the capture's total: content ends at 242
+                        // bytes, the rest is the zero pad to 1160.
+                        out.resize(RBX_OFFLINE_PROBE.saturating_sub(hlen), 0x00);
+                    },
+                    move |_| pinned_env.unwrap_or(crate::roblox::udmux::BARE),
+                    |c, payload| c.parse_reply2_crypto(payload),
+                );
+                match res {
+                    Ok((_, _)) => {
+                        netlog!(net, "crypto OpenReply2 accepted — session keys adopted, skipping the sala matrix");
+                        crypto_reply2 = true;
+                    }
+                    Err(e) => {
+                        netlog!(net, "crypto OCR2 got no reply ({}); falling back to the sala shapes", e);
+                    }
+                }
+            }
+        }
+        let (reply2, _) = if crypto_reply2 {
+            ((c.server_guid, c.mtu), 0usize)
+        } else {
+            // The fork's legacy OCR2 has no security cookie and appends two
+            // fields the vanilla packet does not carry: SupportedVersion
+            // (u32 BE — value not published, matrix 5/1/0) and Capabilities
+            // (u64 BE — base client set vs the modern superset). The server
+            // address block is XOR-obfuscated (Sala readAddress: family,
+            // ip^0xFF, port BE).
+            let mut p2_variants: Vec<(u8, u32, u64)> = Vec::new();
+            for &sv in &[5u32, 1, 0] {
+                p2_variants.push((RBX_ID_OPEN_CONNECTION_REQUEST_2, sv, RBX_CAPABILITY_MODERN));
+                p2_variants.push((RBX_ID_OPEN_CONNECTION_REQUEST_2, sv, RBX_CAPABILITY_ROBLOX));
+            }
+            // Vanilla fallback (direct dials): the legacy OCR2 shape.
+            p2_variants.push((ID_OPEN_CONNECTION_REQUEST_2, 0, 0));
+            let guid = c.guid;
+            c.offline_roundtrip(
+                &p2_variants,
+                handshake_timeout,
+                "request-2",
+                |(id, sv, caps), out, mtu| {
+                    *out = build_ocr2(*id, *sv, *caps, addr, mtu, guid);
+                    // The capture pads OCR2 to the same 1160-byte datagram as
+                    // OCR1 (real content ends ~243 bytes in, the rest is zero
+                    // pad) — the negotiated MTU only governs the connected
+                    // phase, not the offline probe size.
+                    let hlen = env_for_pad.map(|e| e.direction as usize).unwrap_or(0);
+                    out.resize(RBX_OFFLINE_PROBE.saturating_sub(hlen), 0x00);
+                },
+                move |_| pinned_env.unwrap_or(crate::roblox::udmux::BARE),
+                |c, payload| c.parse_reply2(payload),
+            )?
+        };
         netlog!(net, "REPLY_2: guid={} mtu={}", reply2.0, reply2.1);
         c.server_guid = reply2.0;
 
         // Phase 3: CONNECTION_REQUEST -> ACCEPTED -> NEW_INCOMING_CONNECTION.
+        //
+        // With early crypto the request rides inside an AEAD box
+        // (`nonce12 + ct + tag16`) — the dump's pkt4 is exactly
+        // envelope(31) + box(52-12-16 = 24-byte plaintext CONNECTION_REQUEST),
+        // and the libroblox preauth-window code validates the same
+        // `payload + 0x1c` (nonce12+tag16) overhead rule.
         let deadline = Instant::now() + handshake_timeout;
         loop {
             if Instant::now() >= deadline {
@@ -741,13 +812,42 @@ impl RakClient {
             // The fork checks this 6-byte password (Sala Packet09:
             // DefaultPasswordBytes) — without it the RCC refuses silently.
             out.extend_from_slice(&RBX_PASSWORD);
-            if let Err(e) = c.send_raw(&out) {
+            let wire: Vec<u8> = match c.early.as_mut() {
+                Some(ec) => {
+                    let boxed = ec.seal_counter(&out);
+                    netlog!(net, "CONNECTION_REQUEST boxed (pt {} + 18 overhead = {} bytes, counter hint {})", out.len(), boxed.len(), boxed[boxed.len()-18..boxed.len()-16].iter().map(|b| format!("{:02x}", b)).collect::<String>());
+                    boxed
+                }
+                None => out,
+            };
+            if let Err(e) = c.send_raw(&wire) {
                 netlog!(net, "CONNECTION_REQUEST send failed: {}", e);
             } else {
                 netlog!(net, "CONNECTION_REQUEST sent");
             }
 
             if let Some(payload) = c.wait_readable(deadline) {
+                // Early crypto: post-OpenReply2 datagrams ride the counter
+                // framing (`ct || hint u16 LE || tag 16`, nonce = counter ||
+                // "mbeR", AAD empty — dump pkt4..7). Plaintext sessions pass
+                // through unchanged.
+                let payload = match c.early.as_ref() {
+                    Some(ec) => match ec.open_counter(&payload) {
+                        Some((pt, counter)) => {
+                            netlog!(net, "connect-phase box opened (counter {:#x}, pt {} bytes)", counter, pt.len());
+                            pt
+                        }
+                        None => {
+                            netlog!(
+                                net,
+                                "connect-phase datagram did not open as a counter box ({} bytes) — treating as plaintext",
+                                payload.len()
+                            );
+                            payload
+                        }
+                    },
+                    None => payload,
+                };
                 // A 0-byte UDP datagram is legal — payload.first() keeps the
                 // match panic-free (payload[0] here took the process down).
                 match payload.split_first() {
@@ -782,6 +882,13 @@ impl RakClient {
                 c.envelope = Some(e2);
             }
         }
+        // And the crypto framing switches from the tagged handshake boxes to
+        // the untagged session stream (pcap: 56-byte keepalives are
+        // envelope(31) + nonce(12) + ct(13), no MAC).
+        if c.early.is_some() {
+            c.crypto_connected = true;
+            netlog!(net, "crypto: switching to the connected-phase stream framing (nonce12+ct, no tag)");
+        }
         Ok(c)
     }
 
@@ -807,6 +914,54 @@ impl RakClient {
             netlog!(net, "out[{}] {}", out.len(), hex_head(out, 32));
         }
         res
+    }
+
+    /// Open a connect-phase AEAD box (early crypto). Live capture: pkt4 is
+    /// envelope(31) + box(52) = ct(34) + hint + tag(16).
+    pub fn open_handshake_box(&self, body: &[u8]) -> Option<Vec<u8>> {
+        self.early.as_ref()?.open_counter(body).map(|(pt, _)| pt)
+    }
+
+    /// Parse the crypto OpenReply2 (`7d | magic | 01 2c 00 3a 03 |
+    /// server_pub(32) | box | "UniqueNumber" | unique(16)`), adopt the
+    /// session keys, and report the wire facts in the log. Returns the
+    /// current (guid, mtu) so the crypto path plugs into the legacy
+    /// phase-2 result tuple.
+    fn parse_reply2_crypto(&mut self, payload: &[u8]) -> Option<(u64, u16)> {
+        let (server_pub, box_wire, unique) =
+            crate::roblox::early::EarlyCrypto::parse_reply2(payload)?;
+        let ec = self.early.as_mut()?;
+        ec.adopt_reply2_key(server_pub);
+        netlog!(
+            net,
+            "crypto OpenReply2: server_pub {} box {} bytes unique {} (hdr 01 2c 00 3a 03)",
+            hex_head(&server_pub, 32),
+            box_wire.len(),
+            hex_head(&unique, 16)
+        );
+        // Diagnostic: the reply2 box is nonce-on-the-wire (the dump's first
+        // 12 bytes look random, unlike the sequential counter hints after it).
+        // Try the nonce-on-wire open with an empty AAD and the reply's own
+        // RakNet prefix as the AAD.
+        let mut aads: Vec<Vec<u8>> = vec![Vec::new()];
+        if payload.len() > 54 {
+            aads.push(payload[..54].to_vec());
+        }
+        let mut opened = false;
+        if let Some(sk) = ec.session_rx {
+            if crate::roblox::early::open(&sk, box_wire, &[&aads[0], &aads[1]]).is_some() {
+                opened = true;
+            }
+        }
+        if !opened && crate::roblox::early::open(&ec.rx, box_wire, &[&aads[0], &aads[1]]).is_some() {
+            opened = true;
+        }
+        netlog!(
+            net,
+            "crypto OpenReply2 box {} (no key matched — content stays opaque until a live session validates the schedule)",
+            if opened { "OPENED" } else { "not opened" }
+        );
+        Some((self.server_guid, self.mtu))
     }
 
     /// Detect a RUPP-framed incoming datagram, log its clear header and
@@ -1098,6 +1253,8 @@ impl RakClient {
         // (Sala Packet13): our external address + 10 address slots + the two
         // timestamps — the old two-address body was not parseable by the
         // RCC and left the connection dead right after the handshake.
+        // With early crypto this rides a tagged handshake box (the dump's
+        // pkt7: 31 + 12 + 16 + plaintext).
         let mut out = Vec::with_capacity(96);
         out.push(ID_NEW_INCOMING_CONNECTION);
         match self.fork {
@@ -1123,7 +1280,11 @@ impl RakClient {
                 write_address(&mut out, self.server);
             }
         }
-        let _ = self.send_raw(&out);
+        let boxed = match self.early.as_mut() {
+            Some(ec) => ec.seal_counter(&out),
+            None => out,
+        };
+        let _ = self.send_raw(&boxed);
         Ok(())
     }
 
@@ -1237,7 +1398,20 @@ impl RakClient {
         pkt.push(DATAGRAM_VALID | 0x04);
         put_u24(&mut pkt, *seq);
         pkt.extend_from_slice(dg);
-        let _ = self.send_raw(&pkt);
+        let _ = if self.crypto_connected {
+            // Connected phase AND the late handshake: one counter-framed
+            // scheme (`ct || hint || tag`, nonce = counter || "mbeR").
+            let sealed = self
+                .early
+                .as_mut()
+                .map(|ec| ec.seal_counter(&pkt));
+            match sealed {
+                Some(s) => self.send_raw(&s),
+                None => self.send_raw(&pkt),
+            }
+        } else {
+            self.send_raw(&pkt)
+        };
         *seq = seq.wrapping_add(1);
     }
 
@@ -1317,6 +1491,22 @@ impl RakClient {
                 Err(_) => return None,
             };
             let pkt: Vec<u8> = self.strip_incoming(self.buf[..n].to_vec(), "poll");
+            // Connected-phase crypto: counter-framed box.
+            let pkt = if self.crypto_connected {
+                match self.early.as_ref().map(|ec| ec.open_counter(&pkt)) {
+                    Some(Some((pt, counter))) => {
+                        netlog!(net, "poll: box opened (counter {:#x}, pt {} bytes)", counter, pt.len());
+                        pt
+                    }
+                    Some(None) => {
+                        netlog!(net, "poll: datagram ({}) failed counter-box decrypt", pkt.len());
+                        pkt
+                    }
+                    None => pkt,
+                }
+            } else {
+                pkt
+            };
             self.handle_packet(&pkt);
         }
         self.pending.pop_front()
@@ -1785,6 +1975,7 @@ fn hex_head(buf: &[u8], n: usize) -> String {
         .join(" ")
 }
 
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2089,7 +2280,7 @@ mod tests {
         });
 
         let mut client =
-            RakClient::connect("127.0.0.1", sport, &[10, 5], Duration::from_secs(5), None, None)
+            RakClient::connect("127.0.0.1", sport, &[10, 5], Duration::from_secs(5), None, None, None)
                 .expect("handshake failed");
         assert_eq!(client.state, RakState::Connected);
         assert_eq!(client.server_guid, 1234567);
