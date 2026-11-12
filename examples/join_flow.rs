@@ -51,12 +51,19 @@ fn main() {
     println!("[4/4] RakNet handshake against {}:{}...", resp.ip, resp.port);
     // The join script may hand out a udmux routing token — the example dials
     // the RCC address directly, so the token is only forwarded when present.
+    // The private RCC address also rides inside the client RUPP header
+    // (`02 06 <ip4> <port BE16>`) — pass it so the proxy can route.
     let udmux_token = if resp.udmux_token.is_empty() {
         None
     } else {
         Some((resp.udmux_token.as_str(), resp.udmux_pepper))
     };
-    let mut rak = match RakClient::connect(&resp.ip, resp.port, &[10, 11, 5, 1], Duration::from_secs(8), udmux_token) {
+    let rcc = if udmux_token.is_some() {
+        resp.ip.parse::<std::net::Ipv4Addr>().ok().map(|ip| (ip, resp.port))
+    } else {
+        None
+    };
+    let mut rak = match RakClient::connect(&resp.ip, resp.port, &[10, 11, 5, 1], Duration::from_secs(8), udmux_token, rcc) {
         Ok(c) => {
             println!("      CONNECTED (server guid {})", c.server_guid);
             c

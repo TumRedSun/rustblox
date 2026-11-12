@@ -198,14 +198,27 @@ fn game_thread(
     // defaults to 5, Minecraft Bedrock bumped to 10/11). Every guess now
     // really gets sent — each variant gets its own retransmit window — and
     // each attempt is logged, so the log shows which shapes were tried.
-    // When the join script carries a udmux routing token, phase 0 first
-    // probes token-derived RUPP envelope headers (see
+    // When the join script hands out both the udmux routing token and the
+    // private RCC address, phase 0 pins the live-capture client envelope
+    // (`01 00 00 1f 01 11 01 <tag> 02 06 <rcc ip:port>`) without probing;
+    // otherwise the legacy token-derived probe matrix runs (see
     // udmux::envelope_candidates), so a udmux session needs a longer budget.
     let protocols: [u8; 4] = [5, 10, 11, 1];
     let udmux_token = if resp.udmux_token.is_empty() {
         None
     } else {
         Some((resp.udmux_token.as_str(), resp.udmux_pepper))
+    };
+    // The private RCC address rides verbatim inside the client RUPP header
+    // (`02 06 <ip4> <port BE16>`) — the udmux proxy routes on it (live
+    // capture, Nov 2026). Only meaningful for a proxy session.
+    let rcc = if udmux_token.is_some() {
+        resp.ip
+            .parse::<std::net::Ipv4Addr>()
+            .ok()
+            .map(|ip| (ip, resp.port))
+    } else {
+        None
     };
     let handshake_timeout = if udmux_token.is_some() {
         Duration::from_secs(30)
@@ -218,6 +231,7 @@ fn game_thread(
         &protocols,
         handshake_timeout,
         udmux_token,
+        rcc,
     ) {
         Ok(c) => c,
         Err(e) => {

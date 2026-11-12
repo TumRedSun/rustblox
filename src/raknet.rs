@@ -371,11 +371,18 @@ pub struct RakClient {
     pub mtu: u16,
     pub state: RakState,
     pub ping_ms: Option<f32>,
-    /// Datagram envelope confirmed by the handshake (a RUPP header with the
-    /// join script's routing token, or bare/raw when no envelope is needed).
-    /// Applied to every datagram sent after it was confirmed — the proxy
-    /// binds the client->RCC mapping to the exact clear-header shape.
+    /// Datagram envelope confirmed by the handshake (the live-capture client
+    /// shape `01 00 00 1f 01 11 <cls> <tag> 02 06 <rcc ip:port>`, a legacy
+    /// probe candidate, or bare/raw when no envelope is needed). Applied to
+    /// every datagram sent after it was confirmed — the proxy binds the
+    /// client->RCC mapping to the exact clear-header shape.
     envelope: Option<crate::roblox::udmux::Envelope>,
+    /// The 16-byte tag we put in our pre-connect RUPP headers (client's own
+    /// choice — the live capture shows it matches no join-script field).
+    client_tag: [u8; 16],
+    /// The server's 16-byte tag, learned from any incoming RUPP header.
+    /// Once the connection is up, both sides send the SAME tag.
+    server_tag: Option<[u8; 16]>,
     /// Offline-id generation that answered phase 1.
     fork: ForkGen,
 
@@ -416,16 +423,19 @@ impl RakClient {
     ///
     /// `udmux_token` carries the join script's per-session routing material
     /// (`(TokenValue, PepperId)`) when the dial goes through a UDMUX proxy.
-    /// Phase 0 then probes token-derived RUPP envelope headers with
-    /// unconnected pings and pins the first shape that draws a reply;
-    /// phase 1 runs the OCR1 matrix on that envelope, and every later
-    /// datagram rides the confirmed shape.
+    /// `rcc` is the PRIVATE RCC `ip:port` from the join script's
+    /// `ServerConnections` — on a live capture (Nov 2026) the client RUPP
+    /// header embeds it verbatim (`02 06 <ip4> <port BE16>`) and the proxy
+    /// routes on that, so when it is known we skip the shape probing and pin
+    /// `udmux::client_envelope` directly; the legacy token-derived probe
+    /// matrix stays as the fallback.
     pub fn connect(
         host: &str,
         port: u16,
         protocol_versions: &[u8],
         handshake_timeout: Duration,
         udmux_token: Option<(&str, u64)>,
+        rcc: Option<(std::net::Ipv4Addr, u16)>,
     ) -> Result<RakClient, RakError> {
         let addr: SocketAddr = (host, port)
             .to_socket_addrs()
@@ -454,6 +464,8 @@ impl RakClient {
             state: RakState::Connecting,
             ping_ms: None,
             envelope: None,
+            client_tag: [0u8; 16],
+            server_tag: None,
             fork: ForkGen::Roblox,
             reliability_index: 0,
             order_index: 0,
@@ -473,21 +485,56 @@ impl RakClient {
             buf: vec![0u8; 65536],
         };
 
-        // Phase 0 (udmux sessions): pin the datagram ENVELOPE with
-        // unconnected pings before spending anything on the OCR1 matrix.
+        // Phase 0 (udmux sessions): pin the datagram ENVELOPE.
         //
-        // Real clients wrap EVERY datagram in Roblox's RUPP envelope
-        // (0x01 00 00 <dir> 01 11 02 <epoch:16> [<mux:8>], measured by the
-        // rbxraknet decoder) and a proxy only sees that clear header — a raw
-        // RakNet ping never drew a single reply (0.2.0 log: silence in every
-        // token-prefix shape). The unconnected ping carries no protocol
-        // byte, so whichever envelope draws a pong is the routing shape,
-        // independent of the handshake parameters.
+        // The live capture (`sober_ro.pcap` + the 8-datagram handshake dump,
+        // Nov 2026) shows the exact client header: `01 00 00 1f 01 11 01
+        // <tag:16> 02 06 <rcc ip4> <port BE16>`, with a client-chosen tag and
+        // the private RCC address in the mux field. When the join script
+        // gives us that address we pin the measured shape without probing;
+        // the legacy token-derived ping probe stays as fallback for sessions
+        // where the private address is unavailable.
+        //
+        // The pre-connect tag is 16 bytes of the client's own choosing — the
+        // capture proves it matches no join-script field.
+        {
+            let mut t = (guid
+                ^ std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64)
+                | 1;
+            for chunk in c.client_tag.chunks_mut(8) {
+                t = t.wrapping_add(0x9e3779b97f4a7c15);
+                let mut z = t;
+                z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+                z ^= z >> 31;
+                let n = chunk.len();
+                chunk.copy_from_slice(&z.to_le_bytes()[..n]);
+            }
+        }
+        let known_shape = match (udmux_token, rcc) {
+            (Some(_), Some((ip, port))) => {
+                let env = crate::roblox::udmux::client_envelope(&c.client_tag, (ip, port));
+                netlog!(
+                    net,
+                    "envelope: pinning the live-capture client shape (rcc {}:{}, tag {}) — skipping the probe",
+                    ip,
+                    port,
+                    hex_head(&env.epoch, 16)
+                );
+                Some(env)
+            }
+            _ => None,
+        };
         let envelopes: Vec<crate::roblox::udmux::Envelope> = match udmux_token {
             None => vec![crate::roblox::udmux::BARE],
             Some((tok, pepper)) => crate::roblox::udmux::envelope_candidates(tok, pepper),
         };
-        let pinned = if envelopes.len() > 1 {
+        let pinned = if known_shape.is_some() {
+            known_shape
+        } else if envelopes.len() > 1 {
             let p = c.probe_reachability(&envelopes, Duration::from_millis(700));
             match &p {
                 Some(env) => netlog!(
@@ -694,6 +741,20 @@ impl RakClient {
 
         c.state = RakState::Connected;
         c.last_recv = Instant::now();
+        // Connected phase (live capture): the client switches its header to
+        // class byte 0x02 and to the SERVER's 16-byte tag — both sides then
+        // frame every datagram with the same session tag.
+        if let Some(env) = c.envelope {
+            if env.direction == 0x1f {
+                let mut e2 = env;
+                e2.cls = 0x02;
+                if let Some(st) = c.server_tag {
+                    e2.epoch = st;
+                    netlog!(net, "envelope: adopting the server session tag {}", hex_head(&st, 16));
+                }
+                c.envelope = Some(e2);
+            }
+        }
         Ok(c)
     }
 
@@ -725,7 +786,7 @@ impl RakClient {
     /// return the inner bytes. Raw datagrams pass through unchanged — the
     /// server answers inside the envelope of its direction (0x1f), so this
     /// runs on every recv path.
-    fn strip_incoming(&self, payload: Vec<u8>, ctx: &str) -> Vec<u8> {
+    fn strip_incoming(&mut self, payload: Vec<u8>, ctx: &str) -> Vec<u8> {
         if let Some((dir, epoch, mux, hlen)) = crate::roblox::udmux::rupp_parse(&payload) {
             netlog!(
                 net,
@@ -736,6 +797,12 @@ impl RakClient {
                 hex_head(&mux, 8),
                 payload.len() - hlen
             );
+            // Live capture: the server announces its 16-byte session tag in
+            // every 0x17/0x1f-framed reply; once connected both sides send
+            // that SAME tag, so remember it (bare 0x04 frames carry none).
+            if dir == 0x17 || dir == 0x1f {
+                self.server_tag = Some(epoch);
+            }
             payload[hlen..].to_vec()
         } else {
             payload
@@ -1995,7 +2062,7 @@ mod tests {
         });
 
         let mut client =
-            RakClient::connect("127.0.0.1", sport, &[10, 5], Duration::from_secs(5), None)
+            RakClient::connect("127.0.0.1", sport, &[10, 5], Duration::from_secs(5), None, None)
                 .expect("handshake failed");
         assert_eq!(client.state, RakState::Connected);
         assert_eq!(client.server_guid, 1234567);

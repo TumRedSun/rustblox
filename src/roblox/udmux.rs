@@ -72,28 +72,38 @@ pub fn b64_decode(s: &str) -> Vec<u8> {
     out
 }
 
-/// The outer datagram framing every real client uses on the wire (measured
-/// by the `rbxraknet` decoder across a 16k-payload live capture — see the
-/// research notes in `docs/` of the upstream project):
+/// The outer datagram framing every real client uses on the wire, now
+/// measured byte-for-byte on a live capture (`sober_ro.pcap`, Nov 2026,
+/// ~34k-datagram session + an 8-datagram handshake dump):
 ///
 /// ```text
 /// byte[0]      0x01        UDMUX/RUPP flag — NOT a RakNet message id
 /// byte[1:3]    00 00       header length high bytes (always 0)
-/// byte[3]      0x17|0x1f   header length, doubles as the direction id
-/// byte[4:7]    01 11 02    constant sub-flags
-/// byte[7:23]   epoch_tag   16 bytes, rotates on re-key epochs
-/// byte[23:31]  mux_extra   only on direction 0x1f (header len 31)
-/// body                     RakNet datagram (AEAD-encrypted once the
-///                          session keys are active; plaintext handshake
-///                          bytes while it is not)
+/// byte[3]      04|17|1f    TOTAL header length (4 = bare, prefix only)
+/// byte[4:7]    01 11 <cls> sub-flags; <cls> = 0x01 on client datagrams while
+///                          the offline handshake (magic) is on the wire,
+///                          0x02 from the connected phase on (server: 0x02)
+/// byte[7:23]   tag         16-byte session tag. Pre-connect the client uses
+///                          16 bytes of its own choosing (they do NOT match
+///                          TokenValue/NetStackTokenValue); the server
+///                          announces its own tag in every reply header and
+///                          the client switches to it once connected (both
+///                          sides then send the SAME tag).
+/// byte[23:31]  mux         header length 0x1f only: `02 06` + the PRIVATE
+///                          RCC IPv4 (4B) + port (BE u16) straight from the
+///                          join script's ServerConnections — e.g.
+///                          02 06 0a ce 12 43 c0 63 = 10.206.18.67:49251.
+///                          This is what the proxy routes on, NOT the tag;
+///                          server replies (header len 0x17) omit it.
+/// body                     RakNet datagram (plaintext magic handshake first,
+///                          then early-key/session-encrypted datagrams)
 /// ```
 ///
-/// A proxy sees only the CLEAR part of that header, so the per-session
-/// routing token (`TokenValue` from the join script) almost certainly rides
-/// in the 16-byte `epoch_tag` — 24 base64 chars decode to exactly 16 bytes
-/// when the token carries `==` padding. Every candidate below therefore
-/// frames the handshake inside this envelope and lets the proxy pick the
-/// shape it answers.
+/// The server's REPLY_1 arrives with a bare `01 00 00 04` prefix (header
+/// length 4, no tag/mux) — `rupp_parse` must recognize that shape or the
+/// reply is misread as a raw datagram. The legacy token-derived candidates
+/// below are kept as probing fallbacks; `client_envelope` is the shape the
+/// live capture proves out.
 
 pub const RUPP_FLAG: u8 = 0x01;
 pub const RUPP_SUBFLAGS: [u8; 3] = [0x01, 0x11, 0x02];
@@ -103,8 +113,11 @@ pub const RUPP_SUBFLAGS: [u8; 3] = [0x01, 0x11, 0x02];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Envelope {
     pub label: &'static str,
-    /// 0 = send raw (no envelope); otherwise 0x17 or 0x1f.
+    /// 0 = send raw (no envelope); otherwise the header length 0x17 or 0x1f.
     pub direction: u8,
+    /// Clear sub-flag class byte (byte[6]): 0x01 = client offline handshake,
+    /// 0x02 = connected/session traffic (and every server datagram).
+    pub cls: u8,
     pub epoch: [u8; 16],
     pub mux: [u8; 8],
 }
@@ -113,9 +126,29 @@ pub struct Envelope {
 pub const BARE: Envelope = Envelope {
     label: "bare",
     direction: 0,
+    cls: 0x02,
     epoch: [0u8; 16],
     mux: [0u8; 8],
 };
+
+/// The client envelope the live capture proves out: header length 0x1f,
+/// class byte 0x01 (offline handshake), a client-chosen 16-byte tag, and the
+/// private RCC `ip:port` from the join script riding in the mux field as
+/// `02 06 <ip4> <port BE16>`. The proxy routes on that embedded address.
+pub fn client_envelope(label_tag: &[u8; 16], rcc: (Ipv4Addr, u16)) -> Envelope {
+    let mut mux = [0u8; 8];
+    mux[0] = 0x02;
+    mux[1] = 0x06;
+    mux[2..6].copy_from_slice(&rcc.0.octets());
+    mux[6..8].copy_from_slice(&rcc.1.to_be_bytes());
+    Envelope {
+        label: "client-2026",
+        direction: 0x1f,
+        cls: 0x01,
+        epoch: *label_tag,
+        mux,
+    }
+}
 
 /// Wrap `body` in the RUPP envelope described by `env`.
 pub fn rupp_frame(env: &Envelope, body: &[u8]) -> Vec<u8> {
@@ -124,7 +157,9 @@ pub fn rupp_frame(env: &Envelope, body: &[u8]) -> Vec<u8> {
     out.push(0);
     out.push(0);
     out.push(env.direction);
-    out.extend_from_slice(&RUPP_SUBFLAGS);
+    out.push(RUPP_SUBFLAGS[0]);
+    out.push(RUPP_SUBFLAGS[1]);
+    out.push(env.cls);
     out.extend_from_slice(&env.epoch);
     if env.direction == 0x1f {
         out.extend_from_slice(&env.mux);
@@ -138,14 +173,19 @@ pub fn rupp_frame(env: &Envelope, body: &[u8]) -> Vec<u8> {
 /// for direction 0x17 (it has no mux field). `None` when the payload is not
 /// a RUPP datagram (e.g. a legacy raw RakNet reply).
 pub fn rupp_parse(p: &[u8]) -> Option<(u8, [u8; 16], [u8; 8], usize)> {
-    if p.len() < 7 || p[0] != RUPP_FLAG || p[1] != 0 || p[2] != 0 {
+    if p.len() < 4 || p[0] != RUPP_FLAG || p[1] != 0 || p[2] != 0 {
         return None;
     }
     let dir = p[3];
+    // Header length 4 = a bare RUPP prefix with no tag/mux fields — the
+    // shape REPLY_1 arrives in on the live capture. Strip just the prefix.
+    if dir == 0x04 {
+        return Some((4, [0u8; 16], [0u8; 8], 4));
+    }
     if dir != 0x17 && dir != 0x1f {
         return None;
     }
-    if p[4..7] != RUPP_SUBFLAGS {
+    if p.len() < 7 || p[4..6] != [RUPP_SUBFLAGS[0], RUPP_SUBFLAGS[1]] {
         return None;
     }
     if p.len() < dir as usize {
@@ -172,7 +212,7 @@ pub fn envelope_candidates(token: &str, pepper: u64) -> Vec<Envelope> {
     let dec = b64_decode(token);
     let pe = (pepper as u32).to_le_bytes();
     let mut push = |label: &'static str, direction: u8, epoch: [u8; 16], mux: [u8; 8]| {
-        out.push(Envelope { label, direction, epoch, mux });
+        out.push(Envelope { label, direction, cls: 0x02, epoch, mux });
     };
 
     if dec.len() >= 16 {
@@ -368,6 +408,7 @@ mod tests {
         let env = Envelope {
             label: "test17",
             direction: 0x17,
+            cls: 0x02,
             epoch: *b"0123456789abcdef",
             mux: [0u8; 8],
         };
@@ -381,6 +422,7 @@ mod tests {
         let env31 = Envelope {
             label: "test1f",
             direction: 0x1f,
+            cls: 0x01,
             epoch: [9u8; 16],
             mux: *b"MUXMUXMX",
         };
@@ -390,6 +432,42 @@ mod tests {
         assert_eq!(epoch, [9u8; 16]);
         assert_eq!(&mux, b"MUXMUXMX");
         assert_eq!(&framed31[hlen..], b"X");
+    }
+
+    #[test]
+    fn client_envelope_matches_the_live_capture_bytes() {
+        // Handshake dump, pkt 0 (C->S OCR1): header bytes 0..30 measured on
+        // the wire with rcc 10.206.18.67:49251 and tag 84 03 fd 4a .. cc 55.
+        let env = client_envelope(
+            &[
+                0x84, 0x03, 0xfd, 0x4a, 0xec, 0x75, 0x0b, 0xce, 0x1c, 0x44, 0x12, 0xc3, 0xe6, 0xf4,
+                0xcc, 0x55,
+            ],
+            (
+                Ipv4Addr::new(10, 206, 18, 67),
+                49251,
+            ),
+        );
+        let framed = rupp_frame(&env, &[0x7b]);
+        assert_eq!(
+            &framed[..32],
+            &[
+                0x01, 0x00, 0x00, 0x1f, 0x01, 0x11, 0x01, 0x84, 0x03, 0xfd, 0x4a, 0xec, 0x75, 0x0b,
+                0xce, 0x1c, 0x44, 0x12, 0xc3, 0xe6, 0xf4, 0xcc, 0x55, 0x02, 0x06, 0x0a, 0xce, 0x12,
+                0x43, 0xc0, 0x63, 0x7b,
+            ][..]
+        );
+
+        // REPLY_1 arrives with a bare 01 00 00 04 prefix (capture pkt 1) and
+        // must parse so the 0x7E body is not misread as a raw datagram.
+        let reply1 = [
+            0x01, 0x00, 0x00, 0x04, 0x7e, 0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe, 0xfd,
+            0xfd, 0xfd, 0xfd, 0x12, 0x34, 0x56, 0x78, 0x41, 0xef, 0x3f, 0xd3, 0x2e, 0xfc, 0x18,
+            0xa9, 0x00, 0x04, 0xb0,
+        ];
+        let (dir, _tag, _mux, hlen) = rupp_parse(&reply1).expect("bare prefix must parse");
+        assert_eq!((dir, hlen), (0x04, 4usize));
+        assert_eq!(reply1[hlen], 0x7e);
     }
 
     #[test]
