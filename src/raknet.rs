@@ -870,7 +870,8 @@ impl RakClient {
         c.last_recv = Instant::now();
         // Connected phase (live capture): the client switches its header to
         // class byte 0x02 and to the SERVER's 16-byte tag — both sides then
-        // frame every datagram with the same session tag.
+        // frame every datagram with the same session tag (which keeps
+        // rotating every second; send_raw mirrors the newest server tag).
         if let Some(env) = c.envelope {
             if env.direction == 0x1f {
                 let mut e2 = env;
@@ -899,7 +900,29 @@ impl RakClient {
     /// us in). During the handshake every outgoing datagram is logged as
     /// hex (first 32 bytes, exactly as framed for the wire) — one look at
     /// the log shows which shape left the machine.
-    fn send_raw(&self, buf: &[u8]) -> std::io::Result<()> {
+    ///
+    /// Tag mirroring (sober_ro.pcap, 33k-datagram session): the RUPP tag is
+    /// a TIME-ROTATING epoch — it changes every wall-clock second. The
+    /// proxy switches to the new tag first and the client mirrors it within
+    /// ~10-70 ms (165 tags / 169 s, client and server ALWAYS carried the
+    /// same tag within the same second). A tag pinned once at connect time
+    /// goes stale after the first second, so every outgoing datagram in the
+    /// connected phase carries the newest server tag we have seen.
+    fn send_raw(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        if self.state == RakState::Connected {
+            if let Some(env) = self.envelope.as_mut() {
+                // Connected phase (pcap: cls byte 0x02 on 100% of the client
+                // datagrams) + the newest server tag (rotates every second —
+                // the proxy leads, the client mirrors).
+                env.cls = 0x02;
+                if let Some(st) = self.server_tag {
+                    if env.epoch != st {
+                        netlog!(net, "envelope: mirroring the server's rotated tag {}", hex_head(&st, 16));
+                        env.epoch = st;
+                    }
+                }
+            }
+        }
         let owned;
         let out: &[u8] = match &self.envelope {
             None => buf,
@@ -981,7 +1004,11 @@ impl RakClient {
             );
             // Live capture: the server announces its 16-byte session tag in
             // every 0x17/0x1f-framed reply; once connected both sides send
-            // that SAME tag, so remember it (bare 0x04 frames carry none).
+            // that SAME tag (bare 0x04 frames carry none). The tag ROTATES
+            // every wall-clock second (165 distinct tags over 169 s in the
+            // capture) and the proxy leads the rotation — tracking the
+            // newest one here is what keeps the mirrored outgoing tag fresh
+            // (send_raw re-frames with it on every datagram).
             if dir == 0x17 || dir == 0x1f {
                 self.server_tag = Some(epoch);
             }
@@ -1255,6 +1282,28 @@ impl RakClient {
         // RCC and left the connection dead right after the handshake.
         // With early crypto this rides a tagged handshake box (the dump's
         // pkt7: 31 + 12 + 16 + plaintext).
+        //
+        // Header switch (dump pkt7, byte-exact): the datagram right after
+        // ACCEPTED ALREADY rides the SERVER's tag and class byte 0x02 —
+        // pkt4 (CONNECTION_REQUEST) still had the client tag + 0x01, pkt7
+        // (`01 00 00 1f 01 11 02 26 0e 2c 77 …`) does not. Adopt both here,
+        // before the reply leaves, or the RCC drops it and the session
+        // dies right after the handshake.
+        if let Some(env) = self.envelope.as_mut() {
+            if env.direction == 0x1f {
+                env.cls = 0x02;
+                if let Some(st) = self.server_tag {
+                    if env.epoch != st {
+                        netlog!(
+                            net,
+                            "envelope: adopting the server tag {} ahead of NEW_INCOMING_CONNECTION",
+                            hex_head(&st, 16)
+                        );
+                    }
+                    env.epoch = st;
+                }
+            }
+        }
         let mut out = Vec::with_capacity(96);
         out.push(ID_NEW_INCOMING_CONNECTION);
         match self.fork {
@@ -2303,5 +2352,93 @@ mod tests {
         assert_eq!(got.as_deref(), Some(&b"reply-from-server"[..]));
         client.close();
         server_thread.join().unwrap();
+    }
+
+    /// A minimal connected client with a pinned 0x1f envelope, for the
+    /// tag-mirroring tests below.
+    fn test_client(state: RakState, server_tag: Option<[u8; 16]>) -> RakClient {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        RakClient {
+            socket,
+            server: "127.0.0.1:1".parse().unwrap(),
+            guid: 1,
+            server_guid: 2,
+            mtu: 1400,
+            state,
+            ping_ms: None,
+            envelope: Some(crate::roblox::udmux::client_envelope(
+                &[7u8; 16],
+                ("10.206.18.67".parse().unwrap(), 49251),
+            )),
+            client_tag: [7u8; 16],
+            server_tag,
+            early: None,
+            crypto_connected: false,
+            fork: ForkGen::Roblox,
+            reliability_index: 0,
+            order_index: 0,
+            datagram_seq: 0,
+            split_id: 0,
+            out_queue: HashMap::new(),
+            frame_buf: Vec::new(),
+            received_datagrams: HashSet::new(),
+            ack_buffer: Vec::new(),
+            delivered_ordered: 0,
+            ordered_hold: HashMap::new(),
+            splits: HashMap::new(),
+            pending: VecDeque::new(),
+            last_ping: Instant::now(),
+            ping_time: None,
+            last_recv: Instant::now(),
+            buf: vec![0u8; 65536],
+        }
+    }
+
+    #[test]
+    fn connected_send_mirrors_the_rotating_server_tag() {
+        // sober_ro.pcap: the tag rotates every wall-clock second, the proxy
+        // leads and the client mirrors. A datagram sent while connected must
+        // ride the NEWEST server tag (not the tag pinned at connect time)
+        // and class byte 0x02.
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let mut c = test_client(RakState::Connected, Some([9u8; 16]));
+        c.server = peer.local_addr().unwrap();
+        c.send_raw(b"X").unwrap();
+        let mut b = vec![0u8; 2048];
+        let (n, _) = peer.recv_from(&mut b).unwrap();
+        assert_eq!(
+            &b[..31],
+            &[
+                0x01, 0x00, 0x00, 0x1f, 0x01, 0x11, 0x02, // cls 0x02
+                9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, // rotated tag
+                0x02, 0x06, 10, 206, 18, 67, 0xc0, 0x63, // mux = 10.206.18.67:49251
+            ][..]
+        );
+        assert_eq!(&b[31..n], b"X");
+    }
+
+    #[test]
+    fn connecting_send_keeps_the_client_tag() {
+        // Dump pkt0/pkt2/pkt4: until ACCEPTED the client still frames its
+        // datagrams with ITS OWN tag and class byte 0x01 — mirroring starts
+        // only in the connected phase.
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let mut c = test_client(RakState::Connecting, Some([9u8; 16]));
+        c.server = peer.local_addr().unwrap();
+        c.send_raw(b"X").unwrap();
+        let mut b = vec![0u8; 2048];
+        let (n, _) = peer.recv_from(&mut b).unwrap();
+        assert_eq!(
+            &b[..31],
+            &[
+                0x01, 0x00, 0x00, 0x1f, 0x01, 0x11, 0x01, // cls 0x01
+                7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, // client tag
+                0x02, 0x06, 10, 206, 18, 67, 0xc0, 0x63,
+            ][..]
+        );
+        assert_eq!(&b[31..n], b"X");
     }
 }

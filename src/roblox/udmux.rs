@@ -23,6 +23,7 @@ const PROXIES: &[(u8, &str)] = &[
     (8, "128.116.95.33"),      // Dallas
     (9, "128.116.44.33"),      // Frankfurt
     (12, "128.116.45.33"),     // Miami
+    (17, "128.116.21.33"),     // observed: RCC 10.17.6.165 → 128.116.21.33 (Sober pcap, Nov 2026)
     (18, "128.116.32.33"),     // observed: RCC 10.18.8.89 → 128.116.32.33
     (20, "128.116.50.33"),     // Singapore
     (60, "128.116.51.33"),     // Sydney
@@ -109,12 +110,19 @@ pub fn percent_decode(s: &str) -> String {
 /// byte[4:7]    01 11 <cls> sub-flags; <cls> = 0x01 on client datagrams while
 ///                          the offline handshake (magic) is on the wire,
 ///                          0x02 from the connected phase on (server: 0x02)
-/// byte[7:23]   tag         16-byte session tag. Pre-connect the client uses
-///                          16 bytes of its own choosing (they do NOT match
-///                          TokenValue/NetStackTokenValue); the server
-///                          announces its own tag in every reply header and
-///                          the client switches to it once connected (both
-///                          sides then send the SAME tag).
+/// byte[7:23]   tag         16-byte session tag — a TIME-ROTATING epoch:
+///                          it changes EVERY WALL-CLOCK SECOND. The proxy
+///                          derives/switches to the new tag first and the
+///                          client mirrors the newest tag the server sent
+///                          (capture: 165 distinct tags over 169 s, ~1/s,
+///                          both sides always carried the SAME tag within
+///                          the same second). Pre-connect the client may
+///                          use 16 bytes of its own choosing — the server
+///                          answers regardless (dump pkt0→pkt1) and
+///                          announces its own tag in every reply header;
+///                          the client adopts it by NEW_INCOMING_
+///                          CONNECTION (dump pkt4 = client tag, pkt7 =
+///                          server tag) and mirrors the rotations after.
 /// byte[23:31]  mux         header length 0x1f only: `02 06` + the PRIVATE
 ///                          RCC IPv4 (4B) + port (BE u16) straight from the
 ///                          join script's ServerConnections — e.g.
@@ -369,6 +377,11 @@ mod tests {
         assert_eq!(
             proxy_for("10.208.1.2".parse().unwrap()),
             Some("128.116.49.254".parse().unwrap())
+        );
+        // Prefix 17 from the Nov-2026 Sober capture (RCC 10.17.6.165).
+        assert_eq!(
+            proxy_for("10.17.6.165".parse().unwrap()),
+            Some("128.116.21.33".parse().unwrap())
         );
     }
 
