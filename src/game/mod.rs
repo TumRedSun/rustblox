@@ -390,6 +390,10 @@ pub struct GameController {
     pub pointer_locked: bool,
     pub last_mouse: (f32, f32),
     pub keys: std::collections::HashSet<winit::keyboard::PhysicalKey>,
+    /// Touch pad (mobile): joystick deflection (strafe, fwd), each -1..=1.
+    pub touch_stick: (f32, f32),
+    /// Touch pad (mobile): +1 while the up button is held, -1 down, 0 none.
+    pub touch_lift: f32,
 }
 
 impl Default for GameController {
@@ -399,6 +403,8 @@ impl Default for GameController {
             pointer_locked: false,
             last_mouse: (-1.0, -1.0),
             keys: std::collections::HashSet::new(),
+            touch_stick: (0.0, 0.0),
+            touch_lift: 0.0,
         }
     }
 }
@@ -430,6 +436,17 @@ impl GameController {
         if held(PhysicalKey::Code(winit::keyboard::KeyCode::ShiftLeft), &self.keys) {
             move_vec[1] -= 1.0;
         }
+        // Touch pad (mobile): the joystick deflects fly direction, +/− lift.
+        let (sx, sy) = self.touch_stick;
+        if sx.abs() > 1e-3 {
+            move_vec = crate::gfx::math::add3(move_vec, crate::gfx::math::scale3(right, sx));
+        }
+        if sy.abs() > 1e-3 {
+            move_vec = crate::gfx::math::add3(move_vec, crate::gfx::math::scale3(fwd, sy));
+        }
+        if self.touch_lift.abs() > 1e-3 {
+            move_vec[1] += self.touch_lift;
+        }
         let len = crate::gfx::math::len3(move_vec);
         if len > 1e-4 {
             let dir = crate::gfx::math::scale3(move_vec, 1.0 / len);
@@ -453,5 +470,12 @@ impl GameController {
         self.camera.yaw -= dx * 0.0028;
         self.camera.pitch = (self.camera.pitch - dy * 0.0028)
             .clamp(-1.55, 1.55);
+    }
+
+    /// Camera look from a touch drag (mobile game pad): the finger delta
+    /// rotates the camera with the same sensitivity as the locked mouse.
+    pub fn touch_look(&mut self, dx: f32, dy: f32) {
+        self.camera.yaw -= dx * 0.0028;
+        self.camera.pitch = (self.camera.pitch - dy * 0.0028).clamp(-1.55, 1.55);
     }
 }

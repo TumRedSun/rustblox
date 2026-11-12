@@ -71,6 +71,68 @@ pub struct UiCtx<'a> {
     pub icons: &'a mut HashMap<u64, Arc<Vec<u8>>>,
 }
 
+/// On-screen touch controls for the game screen (mobile). The UI pointer
+/// path is single-finger; flying needs MULTIPLE fingers at once (steer with
+/// the left thumb while looking with the right), so game touches are routed
+/// by touch id into per-role slots instead of the synthetic pointer.
+#[derive(Default)]
+pub struct GamePad {
+    /// Joystick finger: (touch id, origin x, origin y).
+    pub stick: Option<(u64, f32, f32)>,
+    /// Current joystick deflection: (strafe, fwd), each -1..=1 (screen y is
+    /// inverted: dragging up = fly forward).
+    pub stick_vec: (f32, f32),
+    /// Camera-look finger: (touch id, last x, last y).
+    pub look: Option<(u64, f32, f32)>,
+    /// Finger holding the + (up) / - (down) button.
+    pub up: Option<u64>,
+    pub down: Option<u64>,
+}
+
+/// Geometry of the on-screen game pad for a (w, h) window at `s` scale:
+/// (stick center, stick radius, up rect, down rect, leave rect).
+/// The same layout is used for hit-testing (`game_touch`) and drawing
+/// (`draw_game_hud`) so the two can never drift apart.
+pub fn game_pad_layout(
+    w: f32,
+    h: f32,
+    s: f32,
+) -> (
+    (f32, f32),
+    f32,
+    (i32, i32, i32, i32),
+    (i32, i32, i32, i32),
+    (i32, i32, i32, i32),
+) {
+    let r = 96.0 * s;
+    let m = 40.0 * s;
+    let stick_center = (r + m, h - r - m);
+    let bw = 96.0 * s;
+    let bh = 76.0 * s;
+    let gap = 18.0 * s;
+    let up = (
+        (w - bw - m) as i32,
+        (h - bh * 2.0 - gap - m) as i32,
+        bw as i32,
+        bh as i32,
+    );
+    let down = ((w - bw - m) as i32, (h - bh - m) as i32, bw as i32, bh as i32);
+    let lw = 64.0 * s;
+    let lh = 52.0 * s;
+    let leave = ((w - lw - 14.0 * s) as i32, (14.0 * s) as i32, lw as i32, lh as i32);
+    (stick_center, r, up, down, leave)
+}
+
+/// Joystick deadzone: tiny deflections near the center read as zero so a
+/// resting thumb does not drift the character.
+fn deadzone(v: f32) -> f32 {
+    if v.abs() < 0.12 {
+        0.0
+    } else {
+        v
+    }
+}
+
 pub struct App {
     pub window: Option<Arc<Window>>,
     pub gfx: Option<crate::gfx::Gfx>,
@@ -81,6 +143,8 @@ pub struct App {
     pub drag_scroll: Option<(f32, f32)>, // (start cursor y, start scroll)
     /// Touch id of the finger driving the synthetic pointer (mobile).
     pub pointer_touch: Option<u64>,
+    /// Per-finger role slots for the on-screen game pad (mobile).
+    pub game_pad: GamePad,
     /// Touch drag over empty content: scroll the active pane 1:1 with the finger.
     pub content_drag: Option<(f32, f32)>, // (start cursor y, start scroll)
     /// Touch drag that started on the horizontal friends strip:
@@ -130,6 +194,7 @@ impl App {
             mouse_down: None,
             drag_scroll: None,
             pointer_touch: None,
+            game_pad: GamePad::default(),
             content_drag: None,
             strip_drag: None,
             arrow_hold: None,
@@ -207,7 +272,16 @@ impl App {
                     crate::menu_ui::draw(view, &mut ctx, &mut fb);
                 }
                 Screen::Game(gv) => {
-                    Self::draw_game_hud(&self.fonts, self.scale, fb.w, fb.h, gv, &mut fb, now_ms);
+                    Self::draw_game_hud(
+                        &self.fonts,
+                        self.scale,
+                        fb.w,
+                        fb.h,
+                        gv,
+                        &mut fb,
+                        now_ms,
+                        &self.game_pad,
+                    );
                 }
             }
             let prims = fb.take_prims();
@@ -237,6 +311,7 @@ impl App {
         gv: &GameView,
         fb: &mut FB,
         now_ms: u64,
+        pad_state: &GamePad,
     ) {
         let t = theme::cur();
         let s = scale;
@@ -301,9 +376,54 @@ impl App {
                         y += size + 8.0 * s;
                     }
                 }
-                crate::font::draw(fonts, fb, pad + 12.0 * s, h as f32 - pad - 8.0 * s,
-                    "Esc — leave   LMB — capture mouse   WASD — fly   Space/Shift — up/down",
-                    12.0 * s, t.text_dim, false, 0.0);
+                if cfg!(any(target_os = "android", target_os = "ios")) {
+                    // On-screen controls: joystick base + knob, +/− lift
+                    // buttons, "X" leave. Highlight the ones being touched.
+                    let (sc, sr, up_r, down_r, leave_r) = game_pad_layout(w as f32, h as f32, s);
+                    fb.rect_rounded(
+                        (sc.0 - sr) as i32,
+                        (sc.1 - sr) as i32,
+                        (sr * 2.0) as i32,
+                        (sr * 2.0) as i32,
+                        sr as i32,
+                        t.surface,
+                    );
+                    let kr = 40.0 * s;
+                    let kx = sc.0 + pad_state.stick_vec.0 * sr * 0.62;
+                    let ky = sc.1 - pad_state.stick_vec.1 * sr * 0.62;
+                    fb.rect_rounded(
+                        (kx - kr) as i32,
+                        (ky - kr) as i32,
+                        (kr * 2.0) as i32,
+                        (kr * 2.0) as i32,
+                        kr as i32,
+                        t.text_dim,
+                    );
+                    let held_up = pad_state.up.is_some();
+                    let held_down = pad_state.down.is_some();
+                    fb.rect_rounded(up_r.0, up_r.1, up_r.2, up_r.3, 14, if held_up { t.text_dim } else { t.surface });
+                    fb.rect_rounded(down_r.0, down_r.1, down_r.2, down_r.3, 14, if held_down { t.text_dim } else { t.surface });
+                    crate::font::draw(fonts, fb,
+                        up_r.0 as f32 + up_r.2 as f32 / 2.0 - 10.0 * s,
+                        up_r.1 as f32 + up_r.3 as f32 / 2.0 - 12.0 * s,
+                        "+", 22.0 * s, if held_up { t.surface } else { t.text }, true, 0.0);
+                    crate::font::draw(fonts, fb,
+                        down_r.0 as f32 + down_r.2 as f32 / 2.0 - 8.0 * s,
+                        down_r.1 as f32 + down_r.3 as f32 / 2.0 - 12.0 * s,
+                        "-", 22.0 * s, if held_down { t.surface } else { t.text }, true, 0.0);
+                    fb.rect_rounded(leave_r.0, leave_r.1, leave_r.2, leave_r.3, 12, t.surface);
+                    crate::font::draw(fonts, fb,
+                        leave_r.0 as f32 + leave_r.2 as f32 / 2.0 - 9.0 * s,
+                        leave_r.1 as f32 + leave_r.3 as f32 / 2.0 - 14.0 * s,
+                        "X", 20.0 * s, t.text, true, 0.0);
+                    crate::font::draw(fonts, fb, pad + 12.0 * s, h as f32 - pad - 8.0 * s,
+                        "joystick — fly   drag — look   +/- — up/down   X — leave",
+                        12.0 * s, t.text_dim, false, 0.0);
+                } else {
+                    crate::font::draw(fonts, fb, pad + 12.0 * s, h as f32 - pad - 8.0 * s,
+                        "Esc — leave   LMB — capture mouse   WASD — fly   Space/Shift — up/down",
+                        12.0 * s, t.text_dim, false, 0.0);
+                }
             }
         }
     }
@@ -433,6 +553,12 @@ impl App {
     }
 
     fn handle_touch(&mut self, touch: Touch) {
+        // The game screen uses its own multi-touch pad (joystick / look /
+        // buttons); the single-finger pointer emulation below is UI-only.
+        if matches!(&self.screen, Screen::Game(GameView::Active { .. })) {
+            self.game_touch(touch);
+            return;
+        }
         // Single-finger pointer emulation: the first finger down drives the
         // synthetic pointer; other fingers are ignored while it is active.
         match touch.phase {
@@ -457,6 +583,99 @@ impl App {
                 self.pointer_touch = None;
                 self.pointer_moved(touch.location.x as f32, touch.location.y as f32);
                 self.pointer_released();
+            }
+        }
+    }
+
+    /// Touch input on the game screen (mobile): each finger claims one role
+    /// by its touch id — joystick (bottom-left circle), camera-look (any
+    /// other spot), +/− buttons (bottom-right), "X" (leave, top-right).
+    /// The game screen redraws every frame, so no redraw bookkeeping here.
+    fn game_touch(&mut self, touch: Touch) {
+        let (w, h) = match &self.window {
+            Some(win) => {
+                let sz = win.inner_size();
+                (sz.width as f32, sz.height as f32)
+            }
+            None => return,
+        };
+        let s = self.scale;
+        let (sc, sr, up_r, down_r, leave_r) = game_pad_layout(w, h, s);
+        let (x, y) = (touch.location.x as f32, touch.location.y as f32);
+        let in_rect = |r: (i32, i32, i32, i32)| {
+            x >= r.0 as f32 && x < (r.0 + r.2) as f32 && y >= r.1 as f32 && y < (r.1 + r.3) as f32
+        };
+        let stick_id = self.game_pad.stick.map(|(id, _, _)| id);
+        let look_id = self.game_pad.look.map(|(id, _, _)| id);
+        match touch.phase {
+            TouchPhase::Started => {
+                let dx = x - sc.0;
+                let dy = y - sc.1;
+                if dx * dx + dy * dy <= sr * sr {
+                    self.game_pad.stick = Some((touch.id, sc.0, sc.1));
+                    self.game_pad.stick_vec = (0.0, 0.0);
+                } else if in_rect(up_r) {
+                    self.game_pad.up = Some(touch.id);
+                    if let Screen::Game(GameView::Active { ctrl, .. }) = &mut self.screen {
+                        ctrl.touch_lift = 1.0;
+                    }
+                } else if in_rect(down_r) {
+                    self.game_pad.down = Some(touch.id);
+                    if let Screen::Game(GameView::Active { ctrl, .. }) = &mut self.screen {
+                        ctrl.touch_lift = -1.0;
+                    }
+                } else if in_rect(leave_r) {
+                    self.leave_game(None);
+                } else {
+                    self.game_pad.look = Some((touch.id, x, y));
+                }
+            }
+            TouchPhase::Moved => {
+                if stick_id == Some(touch.id) {
+                    let (_, cx, cy) = self.game_pad.stick.unwrap_or((touch.id, sc.0, sc.1));
+                    let mut vx = (x - cx) / sr;
+                    let mut vy = -(y - cy) / sr; // screen y grows downward
+                    let len = (vx * vx + vy * vy).sqrt();
+                    if len > 1.0 {
+                        vx /= len;
+                        vy /= len;
+                    }
+                    self.game_pad.stick_vec = (vx, vy);
+                    if let Screen::Game(GameView::Active { ctrl, .. }) = &mut self.screen {
+                        ctrl.touch_stick = (deadzone(vx), deadzone(vy));
+                    }
+                } else if look_id == Some(touch.id) {
+                    let (_, lx, ly) = self.game_pad.look.unwrap_or((touch.id, x, y));
+                    let (dx, dy) = (x - lx, y - ly);
+                    self.game_pad.look = Some((touch.id, x, y));
+                    if let Screen::Game(GameView::Active { ctrl, .. }) = &mut self.screen {
+                        ctrl.touch_look(dx, dy);
+                    }
+                }
+            }
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                if stick_id == Some(touch.id) {
+                    self.game_pad.stick = None;
+                    self.game_pad.stick_vec = (0.0, 0.0);
+                    if let Screen::Game(GameView::Active { ctrl, .. }) = &mut self.screen {
+                        ctrl.touch_stick = (0.0, 0.0);
+                    }
+                }
+                if look_id == Some(touch.id) {
+                    self.game_pad.look = None;
+                }
+                if self.game_pad.up == Some(touch.id) {
+                    self.game_pad.up = None;
+                    if let Screen::Game(GameView::Active { ctrl, .. }) = &mut self.screen {
+                        ctrl.touch_lift = 0.0;
+                    }
+                }
+                if self.game_pad.down == Some(touch.id) {
+                    self.game_pad.down = None;
+                    if let Screen::Game(GameView::Active { ctrl, .. }) = &mut self.screen {
+                        ctrl.touch_lift = 0.0;
+                    }
+                }
             }
         }
     }
