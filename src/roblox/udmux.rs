@@ -213,6 +213,50 @@ pub fn envelope_candidates(token: &str, pepper: u64) -> Vec<Envelope> {
     out
 }
 
+/// Best-effort parse of the join script's `NetStackConfig` blob. Roblox has
+/// shipped it both as a JSON object and as a flat `k=v;k=v` (or `k:v,k:v`)
+/// string; neither form is documented. Returns the key/value pairs we could
+/// dig out, in order. Empty input yields an empty list; an unparsable blob
+/// yields a single pair with an empty key so the raw value stays visible.
+pub fn parse_netstack_config(cfg: &str) -> Vec<(String, String)> {
+    let s = cfg.trim();
+    if s.is_empty() {
+        return Vec::new();
+    }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+        if let Some(obj) = v.as_object() {
+            return obj
+                .iter()
+                .map(|(k, val)| {
+                    let val = match val {
+                        serde_json::Value::String(t) => t.clone(),
+                        other => other.to_string(),
+                    };
+                    (k.clone(), val)
+                })
+                .collect();
+        }
+    }
+    // Flat form: pairs separated by `;` or `,`, key/value split on the
+    // first `=` or `:`. A pair without a separator is kept verbatim under
+    // an empty key.
+    let mut out = Vec::new();
+    for part in s.split([';', ',']) {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        match part.find(['=', ':']) {
+            Some(p) => out.push((
+                part[..p].trim().to_string(),
+                part[p + 1..].trim().to_string(),
+            )),
+            None => out.push((String::new(), part.to_string())),
+        }
+    }
+    out
+}
+
 /// Public dial endpoint for a private RCC address: `Some(proxy_ip)` when the
 /// datacenter prefix is known, `None` otherwise (the caller then dials the
 /// address as-is — which cannot leave the user's LAN — and logs why).
@@ -355,6 +399,26 @@ mod tests {
         assert!(rupp_parse(&[0x06, 0x00, 0x00, 0x17, 0x01, 0x11, 0x02]).is_none());
         assert!(rupp_parse(&[0x01, 0x00, 0x00, 0x99, 0x01, 0x11, 0x02]).is_none());
         assert!(rupp_parse(&[0x01, 0x00, 0x00, 0x17, 0x09, 0x09, 0x09]).is_none());
+    }
+
+    #[test]
+    fn netstack_config_parses_json_and_flat_forms() {
+        // JSON form (one of the two shapes Roblox ships).
+        let pairs = parse_netstack_config(
+            r#"{"port":64469,"mtuSize":1200,"canUseAesGcm":true,"protocolVersion":"1"}"#,
+        );
+        assert!(pairs.contains(&("port".to_string(), "64469".to_string())));
+        assert!(pairs.contains(&("mtuSize".to_string(), "1200".to_string())));
+        assert!(pairs.contains(&("canUseAesGcm".to_string(), "true".to_string())));
+        assert!(pairs.contains(&("protocolVersion".to_string(), "1".to_string())));
+        // Flat `;`-separated form with `=` and `:` separators mixed.
+        let flat = "mtuSize=1200; canUseAesGcm:true ,protocolVersion=1";
+        let pairs = parse_netstack_config(flat);
+        assert!(pairs.contains(&("mtuSize".to_string(), "1200".to_string())));
+        assert!(pairs.contains(&("canUseAesGcm".to_string(), "true".to_string())));
+        assert!(pairs.contains(&("protocolVersion".to_string(), "1".to_string())));
+        assert!(parse_netstack_config("").is_empty());
+        assert!(parse_netstack_config("   ").is_empty());
     }
 
     #[test]

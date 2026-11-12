@@ -82,6 +82,29 @@ pub struct JoinResponse {
     pub udmux_token: String,
     #[serde(default, deserialize_with = "null_to_default")]
     pub udmux_pepper: u64,
+    /// NetStack side-channel (join hypothesis (b)): if game traffic moved
+    /// off the legacy udmux port, the transport lives on `NetStackPort` with
+    /// `NetStackTokenValue` as its routing token. Both default to
+    /// zero/empty when the join script omits them.
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub netstack_port: u16,
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub netstack_config: String,
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub netstack_token: String,
+    /// `TokenGenAlgorithm` from the join script (1 = current generation) —
+    /// selects how the official client derives the 16-byte routing tag from
+    /// `TokenValue` × `PepperId` (still unresolved without the binary).
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub token_gen_algorithm: u64,
+    /// Early-encryption material (join hypothesis (c)): the server's
+    /// ephemeral X25519 public key (`EphemeralEarlyPubKey`) and the client's
+    /// key-rotation config (`ClientPublicKeyData`). Present when the
+    /// handshake is expected to be encrypted from the first datagram.
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub ephemeral_pubkey: String,
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub client_pubkey_data: String,
 }
 
 impl JoinResponse {
@@ -440,6 +463,79 @@ fn join_request(
         if let Some(p) = pepper {
             crate::netlog!(info, "join: udmux pepper {}", p);
             resp.udmux_pepper = p;
+        }
+        // NetStack side-channel fields (hypothesis (b)) — parse, dump and
+        // carry them so a failed handshake can be diagnosed from the log.
+        if let Some(p) = js.get("NetStackPort").and_then(|v| v.as_u64()) {
+            if p > 0 && p <= u64::from(u16::MAX) {
+                crate::netlog!(
+                    info,
+                    "join: netstack port {} (hypothesis (b): side-channel transport)",
+                    p
+                );
+                resp.netstack_port = p as u16;
+            }
+        }
+        if let Some(c) = js
+            .get("NetStackConfig")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+        {
+            // The raw dump the reverse-engineering task calls for — the
+            // config itself is not a credential; token-ish VALUES inside the
+            // parsed pairs are logged as lengths only (see below).
+            crate::netlog!(info, "join: NetStackConfig raw ({} chars): {}", c.len(), c);
+            resp.netstack_config = c.to_string();
+            for (k, val) in crate::roblox::udmux::parse_netstack_config(c) {
+                if is_secret_join_field(&k) {
+                    crate::netlog!(info, "join: netstack config: {} = <len {}>", k, val.len());
+                } else {
+                    crate::netlog!(info, "join: netstack config: {} = {}", k, val);
+                }
+            }
+        }
+        if let Some(t) = js
+            .get("NetStackTokenValue")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            crate::netlog!(
+                info,
+                "join: netstack token present ({} chars, b64 -> {} bytes)",
+                t.len(),
+                crate::roblox::udmux::b64_decode(t).len()
+            );
+            resp.netstack_token = t.to_string();
+        }
+        if let Some(a) = js.get("TokenGenAlgorithm").and_then(|v| v.as_u64()) {
+            crate::netlog!(
+                info,
+                "join: token gen algorithm {} (1 = current token generation)",
+                a
+            );
+            resp.token_gen_algorithm = a;
+        }
+        for (key, slot) in [
+            ("EphemeralEarlyPubKey", &mut resp.ephemeral_pubkey),
+            ("ClientPublicKeyData", &mut resp.client_pubkey_data),
+        ] {
+            if let Some(p) = js
+                .get(key)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+            {
+                crate::netlog!(
+                    info,
+                    "join: {} present ({} chars, b64 -> {} bytes) — early-encryption hypothesis (c) is live",
+                    key,
+                    p.len(),
+                    crate::roblox::udmux::b64_decode(p).len()
+                );
+                *slot = p.to_string();
+            }
         }
     }
     if resp.server_addr().is_none() {
@@ -992,6 +1088,37 @@ mod tests {
         assert_eq!(host3, None);
         assert_eq!(token3, None);
         assert_eq!(pepper3, None);
+    }
+
+    #[test]
+    fn netstack_fields_extracted_from_join_script() {
+        // Field set mirrored from the live session documented in the udmux
+        // reverse-engineering report (place 6243699076): NetStackPort +
+        // NetStackTokenValue + TokenGenAlgorithm + early-pubkey material.
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"jobId":"j1","status":2,"ip":"10.30.2.71","port":63646,
+                "joinScript":{"MachineAddress":"10.30.2.71","ServerPort":63646,
+                "UdmuxEndpoints":[{"Address":"128.116.13.34","Port":63646}],
+                "TokenValue":"AAAAAAAAAAAAAAAAAAAAAA==","PepperId":1794420914,
+                "TokenGenAlgorithm":1,"NetStackPort":64469,
+                "NetStackConfig":"{\"port\":64469,\"mtuSize\":1200}",
+                "NetStackTokenValue":"BBBBBBBBBBBBBBBBBBBBBB==",
+                "EphemeralEarlyPubKey":"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+                "ClientPublicKeyData":"{\"applications\":{\"RakNetEarlyPublicKey\":{}}}"}}"#,
+        )
+        .unwrap();
+        let resp: JoinResponse = serde_json::from_value(v.clone()).unwrap();
+        // Top-level defaults first (the fields live in the joinScript).
+        assert_eq!(resp.netstack_port, 0);
+        let js = v.get("joinScript").unwrap().as_object().unwrap();
+        assert_eq!(extract_udmux(js).0.as_deref(), Some("128.116.13.34:63646"));
+        assert_eq!(js.get("NetStackPort").and_then(|p| p.as_u64()), Some(64469));
+        assert_eq!(js.get("TokenGenAlgorithm").and_then(|p| p.as_u64()), Some(1));
+        // The raw NetStackConfig parses through the best-effort parser.
+        let cfg = js.get("NetStackConfig").unwrap().as_str().unwrap();
+        let pairs = crate::roblox::udmux::parse_netstack_config(cfg);
+        assert!(pairs.contains(&("port".to_string(), "64469".to_string())));
+        assert!(pairs.contains(&("mtuSize".to_string(), "1200".to_string())));
     }
 
     #[test]

@@ -229,6 +229,34 @@ fn game_thread(
                 protocols.len(),
                 e
             );
+            // Hypothesis (b) diagnostic: if the join script handed us a
+            // NetStack side-channel, probe it before giving up — game
+            // traffic may have moved off the legacy udmux port entirely.
+            // The probe is read-only and its verdict goes to the log.
+            if resp.netstack_port != 0 {
+                netlog!(
+                    game,
+                    "netstack probe: join script advertises NetStackPort {} — testing hypothesis (b) (transport on the NetStack channel)",
+                    resp.netstack_port
+                );
+                match crate::raknet::netstack_probe(
+                    &dial_host,
+                    resp.netstack_port,
+                    &resp.netstack_token,
+                    Duration::from_millis(400),
+                ) {
+                    Some(shape) => netlog!(
+                        game,
+                        "netstack probe: channel ALIVE via '{}' — the transport moved to NetStack; the session must be ported onto it next",
+                        shape
+                    ),
+                    None => netlog!(
+                        game,
+                        "netstack probe: silent — the NetStack channel is not the answer for this session; next suspects are the token-tag format (hypothesis (a), TokenGenAlgorithm={}) or early encryption (hypothesis (c))",
+                        resp.token_gen_algorithm
+                    ),
+                }
+            }
             let mut st = lock_state(&state);
             st.phase = GamePhase::Failed(format!("Не удалось подключиться: {}", e));
             return;
