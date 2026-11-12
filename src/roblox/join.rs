@@ -92,9 +92,11 @@ pub struct JoinResponse {
     pub netstack_config: String,
     #[serde(default, deserialize_with = "null_to_default")]
     pub netstack_token: String,
-    /// `TokenGenAlgorithm` from the join script (1 = current generation) —
-    /// selects how the official client derives the 16-byte routing tag from
-    /// `TokenValue` × `PepperId` (still unresolved without the binary).
+    /// `TokenGenAlgorithm` from the join script (1 = current generation).
+    /// The Nov-2026 capture settled the tag question: the pre-connect RUPP
+    /// tag is 16 client-chosen bytes and matches no join-script field, so
+    /// this field no longer feeds the routing tag — it stays recorded for
+    /// the early-encryption work (the OCR1 epoch byte may be it in disguise).
     #[serde(default, deserialize_with = "null_to_default")]
     pub token_gen_algorithm: u64,
     /// Early-encryption material (join hypothesis (c)): the server's
@@ -482,12 +484,22 @@ fn join_request(
             .map(str::trim)
             .filter(|c| !c.is_empty())
         {
-            // The raw dump the reverse-engineering task calls for — the
-            // config itself is not a credential; token-ish VALUES inside the
-            // parsed pairs are logged as lengths only (see below).
-            crate::netlog!(info, "join: NetStackConfig raw ({} chars): {}", c.len(), c);
-            resp.netstack_config = c.to_string();
-            for (k, val) in crate::roblox::udmux::parse_netstack_config(c) {
+            // NetStackConfig arrives PERCENT-ENCODED (`%7B%22pubKey%22…` — live
+            // join_full.json, Nov 2026): decoding must happen before the JSON
+            // parse, or the parser falls back to the flat split and the keys
+            // (pubKey/port/caps/certHashes) never come out. The config itself is
+            // not a credential; token-ish VALUES inside the parsed pairs are
+            // logged as lengths only (see below).
+            let dec = crate::roblox::udmux::percent_decode(c);
+            crate::netlog!(
+                info,
+                "join: NetStackConfig ({} chars raw, {} decoded): {}",
+                c.len(),
+                dec.len(),
+                dec
+            );
+            resp.netstack_config = dec.clone();
+            for (k, val) in crate::roblox::udmux::parse_netstack_config(&dec) {
                 if is_secret_join_field(&k) {
                     crate::netlog!(info, "join: netstack config: {} = <len {}>", k, val.len());
                 } else {
@@ -527,14 +539,31 @@ fn join_request(
                 .map(str::trim)
                 .filter(|p| !p.is_empty())
             {
-                crate::netlog!(
-                    info,
-                    "join: {} present ({} chars, b64 -> {} bytes) — early-encryption hypothesis (c) is live",
-                    key,
-                    p.len(),
-                    crate::roblox::udmux::b64_decode(p).len()
-                );
-                *slot = p.to_string();
+                // EphemeralEarlyPubKey rides percent-encoded (`%2B`/`%2F`/
+                // `%3D`); without the decode the base64 reader saw `%` and
+                // bailed with 0 bytes, hiding a perfectly good 32-byte
+                // X25519 public key. ClientPublicKeyData is not base64 at
+                // all but a JSON key-rotation config — log it verbatim.
+                let dec = crate::roblox::udmux::percent_decode(p);
+                let n = crate::roblox::udmux::b64_decode(&dec).len();
+                if n > 0 {
+                    crate::netlog!(
+                        info,
+                        "join: {} present ({} chars, b64 -> {} bytes) — early-encryption hypothesis (c) is live",
+                        key,
+                        dec.len(),
+                        n
+                    );
+                } else {
+                    crate::netlog!(
+                        info,
+                        "join: {} present ({} chars, not b64): {} — early-encryption hypothesis (c) is live",
+                        key,
+                        dec.len(),
+                        dec
+                    );
+                }
+                *slot = dec;
             }
         }
     }

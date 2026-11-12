@@ -71,3 +71,50 @@ Measured header bytes, handshake dump pkt 0 (C->S OCR1, rcc `10.206.18.67:49251`
   belong to (early-pubkey auth vs session AEAD) and their plaintext framing.
 * Whether the advertised `UdmuxEndpoints[0]` port is really the dial target
   (the 11:04 session used proxy `128.116.21.33:61446`, not a `:49251` endpoint).
+
+## Nov 12 follow-up — handshake_full.txt + join_full.json (same session)
+
+The user uploaded the full 8-datagram handshake dump and the full join script
+of the SAME session (`jobId 96a696fd…`, place 537413528, RCC
+`10.206.18.67:49251`, proxy `128.116.5.33:49251`). Re-measured byte-exact:
+
+* **Our OCR1 was rejected for two provable reasons, not the tag.**
+  1. Size: the real client probes OCR1 at **1160 bytes on the wire**
+     (MTU 1200 minus a 40-byte allowance); REPLY_1 answers `mtu = 04 b0`
+     (1200). We sent 1400 (`mtu: 1400` − 31 header) — above the proxy's
+     1200 path MTU, silently dropped in transit.
+  2. Tail: OCR1 is `7b | magic | 05 | 01 | zero pad` — the byte after the
+     protocol version is `01`, not pad. Meaning unknown (epoch/auth flag);
+     our `05 00` never drew a reply. Fixed as `RBX_OCR1_EPOCH`.
+  The pre-connect tag stays client-chosen (capture tag `84 03 fd 4a…`
+  matches no join-script field, again) — the pinned envelope was never the
+  blocker. OCR2 is zero-padded to the same 1160-byte datagram
+  (content ends at byte 243).
+* **Post-REPLY_2 framing identified** (matches `ref/raknet-decryption`):
+  body = `ciphertext || counter_hint(u16 LE) || tag(16)`, ChaCha20-Poly1305
+  or AES-256-GCM, key 32 B, nonce = `u64 LE counter || "mbeR"`. Hints in the
+  dump are consecutive per direction (`…6e55`, `…6e56`).
+* **OCR2/OR2 tail**: both end with the ASCII string `UniqueNumber` (12 B)
+  followed by exactly 16 B (in OR2 it sits at `n-28`, i.e. the last 16 B is
+  plausibly the AEAD tag; in OCR2 one more byte precedes it at content end).
+  The opaque middle is 189 B (OCR2) / 113 B (OR2) — the early-encryption
+  exchange. Undecoded without the client binary.
+* **Join-script crypto material, decoded** (URL-encoding gotcha:
+  `EphemeralEarlyPubKey` rides percent-encoded — `%2B/%2F/%3D` — which made
+  our b64 reader bail with 0 bytes; now decoded before base64):
+  - `EphemeralEarlyPubKey` = **32 B X25519 public key** (per-session).
+  - `ClientPublicKeyData` = JSON, not binary: a persistent client key
+    `RakNetEarlyPublicKey`, version id 5, 32 B, `"send":5,"revert":5` —
+    created 2022, rotated by version.
+  - `NetStackConfig` = percent-encoded JSON: `pubKey` (32 B), `port`,
+    `caps "120ddbe750bb1896"`, `certHashes` (SHA-256-looking, 32 B).
+  - `joinTicket.EncryptedServerFields` = AES-GCM envelope for the client:
+    `ephPubKey` 64 B + `nonce` 12 B + `ciphertext` 2607 B + `tag` 16 B —
+    the server→client secret drop encrypted under the client's early key.
+  - `TokenValue` / `NetStackTokenValue` = 16 B each; neither appears in the
+    captured datagrams.
+* Fixed in the client: OCR1 probe size 1160 + `05 01` tail, OCR2 padded to
+  1160, percent-decode of `EphemeralEarlyPubKey`/`NetStackConfig`,
+  `TokenGenAlgorithm` comment unlinked from the (now settled) tag question.
+* Next wall: the OCR2 blob — needs the client binary (libroblox) around the
+  strings `UniqueNumber`, `RakNetEarlyPublicKey`, `EphemeralEarlyPubKey`.

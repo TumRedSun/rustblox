@@ -72,6 +72,32 @@ pub fn b64_decode(s: &str) -> Vec<u8> {
     out
 }
 
+/// Percent-decode a join-script string (`%XX` sequences). `+` is kept
+/// verbatim: these blobs are base64 first and query strings second — the
+/// live join script encodes a literal `+` as `%2B`, so a bare `+` must not
+/// become a space. Undecoded input passes through unchanged, which makes
+/// this safe to apply unconditionally (EphemeralEarlyPubKey arrives
+/// percent-encoded and used to fail base64 decoding with `%` in alphabet).
+pub fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hi = (b[i + 1] as char).to_digit(16);
+            let lo = (b[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// The outer datagram framing every real client uses on the wire, now
 /// measured byte-for-byte on a live capture (`sober_ro.pcap`, Nov 2026,
 /// ~34k-datagram session + an 8-datagram handshake dump):
@@ -432,6 +458,20 @@ mod tests {
         assert_eq!(epoch, [9u8; 16]);
         assert_eq!(&mux, b"MUXMUXMX");
         assert_eq!(&framed31[hlen..], b"X");
+    }
+
+    #[test]
+    fn percent_decode_handles_the_join_script_encoding() {
+        // EphemeralEarlyPubKey verbatim from the live join_full.json
+        // (Nov 2026): %2B = '+', %2F = '/', %3D = '=' — plain base64 below.
+        assert_eq!(
+            percent_decode("M17S4M%2Bk%2FCjattHW2WMEufaCnwrgd6itqO%2FVngg5R0k%3D"),
+            "M17S4M+k/CjattHW2WMEufaCnwrgd6itqO/Vngg5R0k="
+        );
+        // Already-decoded input passes through; '+' is not a space here.
+        assert_eq!(percent_decode("a+b=="), "a+b==");
+        // A trailing lone % stays literal.
+        assert_eq!(percent_decode("100%"), "100%");
     }
 
     #[test]

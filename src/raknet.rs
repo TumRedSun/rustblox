@@ -71,6 +71,19 @@ pub const RBX_ID_OPEN_CONNECTION_REPLY_2: u8 = 0x7D;
 /// The fork keeps RakNet protocol version 5 in OCR1 (Sala: "always 5").
 pub const RBX_PROTOCOL_VERSION: u8 = 5;
 
+/// The byte the live capture shows immediately after the protocol byte in
+/// the fork OCR1: `7b | magic | 05 | 01 | zero pad`. Meaning unknown (an
+/// auth/encryption epoch flag is the best guess), but the wire does not
+/// lie: the Nov-12 run sent `05 00` and the RCC never answered, while the
+/// capture client's `05 01` drew REPLY_1 in 65 ms.
+pub const RBX_OCR1_EPOCH: u8 = 0x01;
+
+/// Exact C->S datagram size (envelope header included) of OCR1/OCR2 in the
+/// live capture: MTU 1200 minus a 40-byte probe allowance. The old probe
+/// sized OCR1 to 1400 bytes, above the proxy's 1200 path MTU, and the
+/// datagram died in transit before the RCC ever saw it.
+pub const RBX_OFFLINE_PROBE: usize = 1160;
+
 /// Connection password in CONNECTION_REQUEST (0x09) — Sala's
 /// `DefaultPasswordBytes`. (Studio sends `{0x5E, 0x11}`; our old packets had
 /// no password at all.)
@@ -460,7 +473,7 @@ impl RakClient {
             server: addr,
             guid,
             server_guid: 0,
-            mtu: 1400,
+            mtu: RBX_OFFLINE_PROBE as u16,
             state: RakState::Connecting,
             ping_ms: None,
             envelope: None,
@@ -611,6 +624,13 @@ impl RakClient {
                 out.push(*id);
                 out.extend_from_slice(&OFFLINE_MAGIC);
                 out.push(*proto);
+                // Live capture, byte-exact: the fork OCR1 carries one more
+                // byte after the protocol byte (`05 01` on the wire, then
+                // the zero pad). Without it the RCC ignores the request —
+                // the `05 00` shape never drew a REPLY_1.
+                if *id == RBX_ID_OPEN_CONNECTION_REQUEST_1 {
+                    out.push(RBX_OCR1_EPOCH);
+                }
                 // MTU probe: pad to the datagram size (envelope header
                 // included — the proxy judges the path MTU by the whole
                 // datagram, and send_raw adds the header on top).
@@ -683,12 +703,19 @@ impl RakClient {
         // The envelope pinned in phase 1 (Copy) — every later datagram,
         // including OCR2, must ride the shape the proxy accepted.
         let pinned_env = c.envelope;
+        let env_for_pad = pinned_env;
         let (reply2, _) = c.offline_roundtrip(
             &p2_variants,
             handshake_timeout,
             "request-2",
             |(id, sv, caps), out, mtu| {
                 *out = build_ocr2(*id, *sv, *caps, addr, mtu, guid);
+                // The capture pads OCR2 to the same 1160-byte datagram as
+                // OCR1 (real content ends ~243 bytes in, the rest is zero
+                // pad) — the negotiated MTU only governs the connected
+                // phase, not the offline probe size.
+                let hlen = env_for_pad.map(|e| e.direction as usize).unwrap_or(0);
+                out.resize(RBX_OFFLINE_PROBE.saturating_sub(hlen), 0x00);
             },
             move |_| pinned_env.unwrap_or(crate::roblox::udmux::BARE),
             |c, payload| c.parse_reply2(payload),
