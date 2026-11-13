@@ -107,22 +107,32 @@ pub fn percent_decode(s: &str) -> String {
 /// byte[0]      0x01        UDMUX/RUPP flag — NOT a RakNet message id
 /// byte[1:3]    00 00       header length high bytes (always 0)
 /// byte[3]      04|17|1f    TOTAL header length (4 = bare, prefix only)
-/// byte[4:7]    01 11 <cls> sub-flags; <cls> = 0x01 on client datagrams while
-///                          the offline handshake (magic) is on the wire,
-///                          0x02 from the connected phase on (server: 0x02)
-/// byte[7:23]   tag         16-byte session tag — a TIME-ROTATING epoch:
-///                          it changes EVERY WALL-CLOCK SECOND. The proxy
-///                          derives/switches to the new tag first and the
-///                          client mirrors the newest tag the server sent
-///                          (capture: 165 distinct tags over 169 s, ~1/s,
-///                          both sides always carried the SAME tag within
-///                          the same second). Pre-connect the client may
-///                          use 16 bytes of its own choosing — the server
-///                          answers regardless (dump pkt0→pkt1) and
-///                          announces its own tag in every reply header;
-///                          the client adopts it by NEW_INCOMING_
-///                          CONNECTION (dump pkt4 = client tag, pkt7 =
-///                          server tag) and mirrors the rotations after.
+/// byte[4:7]    01 11 <tt>  TLV-1 header: type 01 = TokenTlv, length 0x11
+///                          (17 = 1 + 16). <tt> is the TOKEN TYPE byte —
+///                          0x02 on 100% of the 34k captured datagrams
+///                          (Rupp.h: `struct TokenTlv { type[1]; value[16]; }`,
+///                          ErrorCode::INVALID_TOKEN). The old reading
+///                          ("cls 0x01 while the offline handshake is on the
+///                          wire") came from an 8-datagram dump that likely
+///                          mixed in our own probe datagrams; the OCR1 matrix
+///                          still tries 0x01 as a variant.
+/// byte[7:23]   tag         the 16-byte TOKEN VALUE. In the connected phase
+///                          it is a TIME-ROTATING epoch: it changes every
+///                          wall-clock second, the proxy switches first and
+///                          the client mirrors the newest tag the server
+///                          sent (main flow: 165 distinct tags over 169 s,
+///                          transitions exactly on 1 s boundaries; the
+///                          second flow shows the client/server overlap
+///                          dance at each boundary). The rotation key
+///                          schedule is not published — until it is,
+///                          pre-connect datagrams ride the session's static
+///                          TokenValue (b64-decoded — the same material the
+///                          known UDMUX-bypass abuse is built on), with the
+///                          random client tag kept as a matrix fallback.
+///                          The server announces its own tag in every reply
+///                          header; the client adopts it by NEW_INCOMING_
+///                          CONNECTION and mirrors the rotations once
+///                          connected (see RakClient::send_raw).
 /// byte[23:31]  mux         header length 0x1f only: `02 06` + the PRIVATE
 ///                          RCC IPv4 (4B) + port (BE u16) straight from the
 ///                          join script's ServerConnections — e.g.
@@ -149,8 +159,9 @@ pub struct Envelope {
     pub label: &'static str,
     /// 0 = send raw (no envelope); otherwise the header length 0x17 or 0x1f.
     pub direction: u8,
-    /// Clear sub-flag class byte (byte[6]): 0x01 = client offline handshake,
-    /// 0x02 = connected/session traffic (and every server datagram).
+    /// TokenTlv token-type byte (byte[6]): 0x02 on every datagram the live
+    /// client sent (34k-datagram pcap, both game flows, both directions).
+    /// 0x01 is kept as an OCR1-matrix variant.
     pub cls: u8,
     pub epoch: [u8; 16],
     pub mux: [u8; 8],
@@ -165,10 +176,13 @@ pub const BARE: Envelope = Envelope {
     mux: [0u8; 8],
 };
 
-/// The client envelope the live capture proves out: header length 0x1f,
-/// class byte 0x01 (offline handshake), a client-chosen 16-byte tag, and the
-/// private RCC `ip:port` from the join script riding in the mux field as
-/// `02 06 <ip4> <port BE16>`. The proxy routes on that embedded address.
+/// The client envelope: header length 0x1f, token type 0x02, and the private
+/// RCC `ip:port` from the join script riding in the mux field as
+/// `02 06 <ip4> <port BE16>`. The proxy routes on that embedded address and
+/// gates on the TokenTlv — the type-0x01 + random-tag shape the old builds
+/// pinned is what the RCC silently dropped (total OCR1 silence, not even an
+/// incompatible-protocol error, while the leaked server handler proves it
+/// would have answered a datagram that reached it).
 pub fn client_envelope(label_tag: &[u8; 16], rcc: (Ipv4Addr, u16)) -> Envelope {
     let mut mux = [0u8; 8];
     mux[0] = 0x02;
@@ -178,10 +192,20 @@ pub fn client_envelope(label_tag: &[u8; 16], rcc: (Ipv4Addr, u16)) -> Envelope {
     Envelope {
         label: "client-2026",
         direction: 0x1f,
-        cls: 0x01,
+        cls: 0x02,
         epoch: *label_tag,
         mux,
     }
+}
+
+/// The session token as a 16-byte tag: `TokenValue` is base64 and its first
+/// 16 decoded bytes are the token the UDMUX proxy expects in the TokenTlv.
+pub fn decode_token16(token: &str) -> Option<[u8; 16]> {
+    let dec = b64_decode(token);
+    if dec.len() < 16 {
+        return None;
+    }
+    Some(dec[..16].try_into().unwrap())
 }
 
 /// Wrap `body` in the RUPP envelope described by `env`.
@@ -489,8 +513,9 @@ mod tests {
 
     #[test]
     fn client_envelope_matches_the_live_capture_bytes() {
-        // Handshake dump, pkt 0 (C->S OCR1): header bytes 0..30 measured on
-        // the wire with rcc 10.206.18.67:49251 and tag 84 03 fd 4a .. cc 55.
+        // Live capture (both game flows, 34k datagrams): header bytes 0..30
+        // with token type 0x02, rcc 10.206.18.67:49251 in the mux field and
+        // the 16-byte token value as the tag.
         let env = client_envelope(
             &[
                 0x84, 0x03, 0xfd, 0x4a, 0xec, 0x75, 0x0b, 0xce, 0x1c, 0x44, 0x12, 0xc3, 0xe6, 0xf4,
@@ -505,7 +530,7 @@ mod tests {
         assert_eq!(
             &framed[..32],
             &[
-                0x01, 0x00, 0x00, 0x1f, 0x01, 0x11, 0x01, 0x84, 0x03, 0xfd, 0x4a, 0xec, 0x75, 0x0b,
+                0x01, 0x00, 0x00, 0x1f, 0x01, 0x11, 0x02, 0x84, 0x03, 0xfd, 0x4a, 0xec, 0x75, 0x0b,
                 0xce, 0x1c, 0x44, 0x12, 0xc3, 0xe6, 0xf4, 0xcc, 0x55, 0x02, 0x06, 0x0a, 0xce, 0x12,
                 0x43, 0xc0, 0x63, 0x7b,
             ][..]

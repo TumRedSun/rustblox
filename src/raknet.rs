@@ -448,9 +448,11 @@ impl RakClient {
     /// `rcc` is the PRIVATE RCC `ip:port` from the join script's
     /// `ServerConnections` — on a live capture (Nov 2026) the client RUPP
     /// header embeds it verbatim (`02 06 <ip4> <port BE16>`) and the proxy
-    /// routes on that, so when it is known we skip the shape probing and pin
-    /// `udmux::client_envelope` directly; the legacy token-derived probe
-    /// matrix stays as the fallback.
+    /// routes on that. The proxy also gates on the TokenTlv, so when the
+    /// token is known the session's static TokenValue rides as the tag
+    /// (token type 0x02, per the 34k-datagram capture); the OCR1 matrix
+    /// still walks the tag/type variants (token vs random tag, type 02 vs
+    /// 01) so a wrong guess costs one 1160-byte probe, not the session.
     pub fn connect(
         host: &str,
         port: u16,
@@ -514,16 +516,21 @@ impl RakClient {
 
         // Phase 0 (udmux sessions): pin the datagram ENVELOPE.
         //
-        // The live capture (`sober_ro.pcap` + the 8-datagram handshake dump,
-        // Nov 2026) shows the exact client header: `01 00 00 1f 01 11 01
-        // <tag:16> 02 06 <rcc ip4> <port BE16>`, with a client-chosen tag and
-        // the private RCC address in the mux field. When the join script
-        // gives us that address we pin the measured shape without probing;
-        // the legacy token-derived ping probe stays as fallback for sessions
-        // where the private address is unavailable.
+        // The 34k-datagram live capture (`sober_ro.pcap`, Nov 2026) shows the
+        // client header `01 00 00 1f 01 11 02 <tag:16> 02 06 <rcc ip4> <port
+        // BE16>` on 100% of the datagrams: a TokenTlv with token TYPE 0x02
+        // (Rupp.h) and the private RCC address in the mux field. The proxy
+        // routes on the mux AND gates on the token — the type-0x01 +
+        // random-tag shape the older builds pinned is exactly what produced
+        // total OCR1 silence (no reply of any kind, while the leaked server
+        // handler proves it would have answered a datagram that reached it).
         //
-        // The pre-connect tag is 16 bytes of the client's own choosing — the
-        // capture proves it matches no join-script field.
+        // Pre-connect the tag rides the session's static TokenValue
+        // (b64-decoded — the same material the known UDMUX-bypass abuse is
+        // built on); the connected phase then mirrors the server's rotating
+        // epoch (send_raw). The random client tag below stays as a matrix
+        // fallback, and the OCR1 matrix walks {token,random} x {02,01} so a
+        // wrong guess costs one 1160-byte probe, not the session.
         {
             let mut t = (guid
                 ^ std::time::SystemTime::now()
@@ -541,12 +548,27 @@ impl RakClient {
                 chunk.copy_from_slice(&z.to_le_bytes()[..n]);
             }
         }
-        let known_shape = match (udmux_token, rcc) {
-            (Some(_), Some((ip, port))) => {
+        let token_tag: Option<[u8; 16]> = udmux_token
+            .and_then(|(tok, _)| crate::roblox::udmux::decode_token16(tok));
+        let known_shape = match (rcc, token_tag) {
+            (Some((ip, port)), Some(tag)) => {
+                let env = crate::roblox::udmux::client_envelope(&tag, (ip, port));
+                netlog!(
+                    net,
+                    "envelope: pinning the capture shape with the session token as the tag \
+                     (rcc {}:{}, tag {}) — the OCR1 matrix still walks the tag/type variants",
+                    ip,
+                    port,
+                    hex_head(&env.epoch, 16)
+                );
+                Some(env)
+            }
+            (Some((ip, port)), None) => {
                 let env = crate::roblox::udmux::client_envelope(&c.client_tag, (ip, port));
                 netlog!(
                     net,
-                    "envelope: pinning the live-capture client shape (rcc {}:{}, tag {}) — skipping the probe",
+                    "envelope: no usable TokenValue — pinning the capture shape with a random \
+                     tag (rcc {}:{}, tag {})",
                     ip,
                     port,
                     hex_head(&env.epoch, 16)
@@ -559,8 +581,8 @@ impl RakClient {
             None => vec![crate::roblox::udmux::BARE],
             Some((tok, pepper)) => crate::roblox::udmux::envelope_candidates(tok, pepper),
         };
-        let pinned = if known_shape.is_some() {
-            known_shape
+        let (pinned, probe_pong) = if known_shape.is_some() {
+            (known_shape, false)
         } else if envelopes.len() > 1 {
             let p = c.probe_reachability(&envelopes, Duration::from_millis(700));
             match &p {
@@ -574,9 +596,9 @@ impl RakClient {
                     "envelope probe: no pong in any RUPP shape — trying the OCR1 matrix anyway"
                 ),
             }
-            p
+            (p, p.is_some())
         } else {
-            None
+            (None, false)
         };
 
         // Phase 1: OPEN_CONNECTION_REQUEST_1 -> REPLY_1 (MTU probing).
@@ -591,13 +613,60 @@ impl RakClient {
         let mut p1_variants: Vec<(crate::roblox::udmux::Envelope, u8, u8)> = Vec::new();
         match &pinned {
             Some(env) => {
-                p1_variants.push((*env, RBX_ID_OPEN_CONNECTION_REQUEST_1, RBX_PROTOCOL_VERSION));
+                // Token type / tag-value variants FIRST — the proxy gates on
+                // the TokenTlv and the winning shape is pinned for the whole
+                // session. Order: the pinned tag (token when available) with
+                // type 02, then type 01, then the random client tag (02/01)
+                // when it differs.
+                let with_cls = |cls: u8| {
+                    let mut e = *env;
+                    e.cls = cls;
+                    e
+                };
+                let lead = with_cls(0x02);
+                p1_variants.push((
+                    lead,
+                    RBX_ID_OPEN_CONNECTION_REQUEST_1,
+                    RBX_PROTOCOL_VERSION,
+                ));
+                p1_variants.push((
+                    with_cls(0x01),
+                    RBX_ID_OPEN_CONNECTION_REQUEST_1,
+                    RBX_PROTOCOL_VERSION,
+                ));
+                if env.epoch != c.client_tag {
+                    let mut rnd02 = *env;
+                    rnd02.cls = 0x02;
+                    rnd02.epoch = c.client_tag;
+                    p1_variants.push((
+                        rnd02,
+                        RBX_ID_OPEN_CONNECTION_REQUEST_1,
+                        RBX_PROTOCOL_VERSION,
+                    ));
+                    let mut rnd01 = rnd02;
+                    rnd01.cls = 0x01;
+                    p1_variants.push((
+                        rnd01,
+                        RBX_ID_OPEN_CONNECTION_REQUEST_1,
+                        RBX_PROTOCOL_VERSION,
+                    ));
+                }
+                // Protocol variants on the leading shape, then the vanilla
+                // id fallback (direct dials without a proxy).
                 for &pr in protocol_versions {
                     if pr != RBX_PROTOCOL_VERSION {
-                        p1_variants.push((*env, RBX_ID_OPEN_CONNECTION_REQUEST_1, pr));
+                        p1_variants.push((
+                            lead,
+                            RBX_ID_OPEN_CONNECTION_REQUEST_1,
+                            pr,
+                        ));
                     }
                 }
-                p1_variants.push((*env, ID_OPEN_CONNECTION_REQUEST_1, RBX_PROTOCOL_VERSION));
+                p1_variants.push((
+                    lead,
+                    ID_OPEN_CONNECTION_REQUEST_1,
+                    RBX_PROTOCOL_VERSION,
+                ));
             }
             None => {
                 p1_variants.push((
@@ -663,28 +732,35 @@ impl RakClient {
                 };
                 netlog!(
                     net,
-                    "handshake envelope '{}' (id 0x{:02x}, protocol {}) confirmed — applying it to every datagram this session",
+                    "handshake envelope '{}' (id 0x{:02x}, protocol {}, token type 0x{:02x}, tag {}) confirmed — applying it to every datagram this session",
                     env.label,
                     id,
-                    proto
+                    proto,
+                    env.cls,
+                    hex_head(&env.epoch, 16)
                 );
                 r
             }
             Err(e) => {
-                // The ping probe already ran in phase 0, so the failure is
-                // classifiable without re-probing: a pinned envelope that
-                // still fails OCR1 means the proxy routed us but the RCC
-                // rejected the handshake shape; total silence means the
-                // proxy dropped every candidate.
-                match &pinned {
-                    Some(env) => netlog!(
+                // Classifiable without re-probing: when a ping probe ran and
+                // ponged, the proxy routes us and the RCC rejected the
+                // handshake shape; when the shape was pinned without a probe
+                // (rcc known), total silence means the proxy dropped every
+                // datagram it saw.
+                match (pinned, probe_pong) {
+                    (Some(env), true) => netlog!(
                         net,
-                        "path diagnosis: envelope '{}' got a pong but no OCR1 reply — \
+                        "path diagnosis: envelope '{}' got a probe pong but no OCR1 reply — \
                          the proxy routes this shape, the RCC rejects the handshake \
                          (protocol byte, MTU or required encryption)",
                         env.label
                     ),
-                    None => netlog!(
+                    (Some(_), false) => netlog!(
+                        net,
+                        "path diagnosis: no reply to any OCR1 shape and no ping probe ran — \
+                         the proxy dropped every datagram (TokenTlv gate) or the path is dead"
+                    ),
+                    (None, _) => netlog!(
                         net,
                         "path diagnosis: no envelope shape answered pings or OCR1 — the proxy \
                          drops unauthenticated datagrams (stale session port, firewall, or \
@@ -2421,9 +2497,9 @@ mod tests {
 
     #[test]
     fn connecting_send_keeps_the_client_tag() {
-        // Dump pkt0/pkt2/pkt4: until ACCEPTED the client still frames its
-        // datagrams with ITS OWN tag and class byte 0x01 — mirroring starts
-        // only in the connected phase.
+        // Until ACCEPTED the client still frames its datagrams with ITS OWN
+        // tag — mirroring starts only in the connected phase. The token-type
+        // byte is 0x02 (34k pcap: 100% of the captured client datagrams).
         let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
         peer.set_nonblocking(true).unwrap();
         let mut c = test_client(RakState::Connecting, Some([9u8; 16]));
@@ -2434,7 +2510,7 @@ mod tests {
         assert_eq!(
             &b[..31],
             &[
-                0x01, 0x00, 0x00, 0x1f, 0x01, 0x11, 0x01, // cls 0x01
+                0x01, 0x00, 0x00, 0x1f, 0x01, 0x11, 0x02, // token type 0x02
                 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, // client tag
                 0x02, 0x06, 10, 206, 18, 67, 0xc0, 0x63,
             ][..]
