@@ -1,0 +1,153 @@
+# Architecture
+
+Living document. Updated as each subsystem is refactored — this is not a
+one-time plan, it is the current, enforced set of rules the codebase is
+migrated toward, subsystem by subsystem.
+
+## Status
+
+| Subsystem | State |
+|---|---|
+| Tooling (fmt/clippy/lints/hooks) | Done (this doc, `rustfmt.toml`, `clippy.toml`, `Cargo.toml [lints]`, `.githooks/`) |
+| Network (`raknet`, `early` crypto, `udmux`, `net`) | Not started — next up |
+| HTTP/Roblox API (`join`, `client`, `auth`, `dns`, `types`, `errors`) | Not started |
+| UI (`app`, `menu_ui`, `ui`, `login_ui`, `draw`, `font`) | Not started |
+| Render (`gfx`, `world`, `game`, `model`) | Not started |
+| Mobile (`mobile/`) | Not started |
+
+## Module layout rules
+
+- **File length: 350 lines max** (including doc comments and blank lines).
+  Chosen over a tighter 250 because every `pub` item now carries a mandatory
+  doc comment (see below) — doc comments cost vertical space without adding
+  complexity, and a tighter cap would force splitting simple files for no
+  reason other than comment overhead. Enforced by a pre-commit check (no
+  native clippy lint for "lines per file" exists).
+- **4 files per folder max — subfolders do not count against this limit.**
+  A folder may hold `mod.rs` + up to 3 siblings, plus as many subfolders as
+  needed, each with its own 4-file budget. Split by **responsibility**, not
+  by raw size: wire-framing is separate from reliability bookkeeping,
+  handshake flow is separate from the connected session, crypto primitives
+  are separate from the key-schedule that uses them.
+- **Function length: 60 lines max**, enforced by
+  `clippy::too_many_lines` (`clippy.toml` → `too-many-lines-threshold = 60`).
+- **KISS/DRY/SOLID**: when a module is migrated, actively remove
+  now-dead fallback paths and duplicated logic rather than carrying them
+  into the new layout unchanged. Example done during tooling setup: a dead
+  `Reader::u32` method in `raknet.rs` was deleted rather than kept "just in
+  case" (YAGNI) — code that isn't called gets removed, not preserved.
+
+## Tests
+
+Unit tests live in a **separate file**, not inline at the bottom of the
+module they test. Pattern:
+
+```rust
+// src/net/raknet/handshake.rs
+#[cfg(test)]
+#[path = "handshake/tests.rs"]
+mod tests;
+```
+
+This keeps test code physically out of the file being read/edited, while
+staying part of the same crate (tests see private items, `cargo test` works
+normally — no separate-crate linking restrictions like true integration
+tests in `tests/` have). A `tests.rs` sibling (or `tests/` subfolder for a
+module split across several files) does **not** count against the parent
+folder's 4-file cap, same as any other subfolder.
+
+True black-box integration tests (crate's public API only, e.g.
+`tests/parse.rs`) stay in the top-level `tests/` directory as before.
+
+## Comments and docs
+
+- All comments and doc comments: **English**, no exceptions (verified:
+  `grep -rP '//.*[а-яА-ЯёЁ]' src/` returns zero hits as of this doc).
+- Every `pub` item (function, struct, field, enum, trait) gets a `///` doc
+  comment in rustdoc/JavaDoc spirit: a one-line summary, and where relevant
+  a `# Errors` section (what makes a `Result` err), a `# Panics` section
+  (what makes it panic — should be rare, see lints below), and `# Arguments`
+  only when the parameter names alone don't make usage obvious.
+
+## Formatting
+
+- `rustfmt.toml`: `hard_tabs = true`, `newline_style = "Unix"`. Every file
+  LF-terminated, indented with tabs.
+- `.gitattributes`: `* text eol=lf` — Unix line endings enforced at the git
+  layer too (normalizes line endings on checkin regardless of a
+  contributor's local `core.autocrlf`).
+
+## Lints
+
+Two layers:
+
+- **`clippy.toml`** — thresholds: `too-many-lines-threshold = 60`,
+  `cognitive-complexity-threshold = 15`, `type-complexity-threshold = 200`.
+- **`Cargo.toml [lints]`** — hard levels:
+  - `[lints.rust]`: `dead_code = "deny"`, `unused = "deny"` — no unused
+    anything, no code that nothing calls, enforced at every build (not just
+    CI).
+  - `[lints.clippy]`: `unwrap_used`, `expect_used`, `panic`,
+    `unimplemented`, `todo` — currently `"warn"`, **not yet `"deny"`**.
+    Reason: 143 existing `.unwrap()`/`.expect()` calls as of this doc, 103
+    of them in the network subsystem about to be rewritten anyway
+    (`raknet.rs` 44, `join.rs` 28, `udmux.rs` 18, `early.rs` 13). Flipping to
+    `deny` today would fail the build crate-wide for pre-existing debt, not
+    new code.
+    **Policy going forward**: every module, when migrated to the new
+    `src/net/...` layout (or any other subsystem's new layout), must replace
+    its `unwrap`/`expect`/`panic` calls with proper `Result` propagation
+    (or a documented, deliberate exception) **and** add
+    `#![forbid(clippy::unwrap_used, clippy::expect_used, clippy::panic)]`
+    at the top of that specific new module, so the module can't regress once
+    cleaned. Test code is exempt per-module via
+    `#[allow(clippy::unwrap_used, clippy::expect_used)]` on the `tests` mod
+    — a panic in a test is a correct, intended failure signal. Once every
+    subsystem is migrated and forbids these locally, the crate-wide
+    `Cargo.toml` level flips from `"warn"` to `"deny"` as the final step.
+
+## Pre-commit hook
+
+`.githooks/pre-commit` runs on every commit (after
+`git config core.hooksPath .githooks`, a one-time per-clone setup step —
+not automatic, since `.git/hooks` itself isn't tracked by git):
+
+1. `cargo fmt --check` — fails the commit if anything is unformatted.
+2. `cargo clippy --all-targets -- -D warnings` — fails the commit on any
+   clippy warning, not just the ones already hard-denied in `Cargo.toml`.
+
+## Dependencies
+
+- `cargo audit`: clean as of this doc — zero known vulnerabilities. One
+  unmaintained-crate warning (`ttf-parser`, pulled in transitively through
+  `ab_glyph`) — not actionable today, worth revisiting if the font stack
+  ever changes.
+- Duplicate crate versions in the dependency tree (`foldhash`, `hashbrown`,
+  `getrandom`, `rustix`, `thiserror`, `webpki-roots`, …) are all transitive,
+  pulled in through `wgpu`/`arboard`'s own dependency choices — not
+  something this project controls or should try to pin around.
+
+## Target layout — network subsystem (next up)
+
+```
+src/net/
+  mod.rs                 — public API surface, re-exports
+  raknet/
+    mod.rs               — RakClient, entry point
+    handshake.rs          — OCR1→OCR2→REPLY_1/2→CONNECTION_REQUEST flow
+    wire/
+      mod.rs              — datagram/frame encode/decode
+      reliability.rs      — ACK/NACK, send window, split reassembly
+  crypto/
+    mod.rs                — EarlyCrypto, X25519/BLAKE2b key exchange
+    counter.rs            — seal_counter/open_counter, nonce framing
+  udmux/
+    mod.rs
+    envelope.rs           — RUPP header encode/decode
+  socket.rs               — UDP socket (from the current net.rs)
+```
+
+Exact per-file line counts are finalized at plan time, not fixed here in
+advance — if `handshake.rs` alone would exceed 350 lines once extracted, it
+gets its own subfolder (e.g. `handshake/{mod,ocr,connection_request}.rs`)
+rather than a size exception.

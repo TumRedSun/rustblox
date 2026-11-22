@@ -10,23 +10,23 @@ static GAME_ENABLED: AtomicBool = AtomicBool::new(false);
 static GFX_ENABLED: AtomicBool = AtomicBool::new(false);
 
 fn init() {
-    let v = std::env::var("RUSTBLOX_DEBUG").unwrap_or_default().to_lowercase();
-    let all = v == "1" || v == "true" || v == "all";
-    NET_ENABLED.store(all || v.contains("net"), Ordering::Relaxed);
-    GAME_ENABLED.store(all || v.contains("game"), Ordering::Relaxed);
-    GFX_ENABLED.store(all || v.contains("gfx"), Ordering::Relaxed);
+	let v = std::env::var("RUSTBLOX_DEBUG").unwrap_or_default().to_lowercase();
+	let all = v == "1" || v == "true" || v == "all";
+	NET_ENABLED.store(all || v.contains("net"), Ordering::Relaxed);
+	GAME_ENABLED.store(all || v.contains("game"), Ordering::Relaxed);
+	GFX_ENABLED.store(all || v.contains("gfx"), Ordering::Relaxed);
 }
 
 pub fn enabled(kind: &str) -> bool {
-    use std::sync::Once;
-    static ONCE: Once = Once::new();
-    ONCE.call_once(init);
-    match kind {
-        "net" => NET_ENABLED.load(Ordering::Relaxed),
-        "game" => GAME_ENABLED.load(Ordering::Relaxed),
-        "gfx" => GFX_ENABLED.load(Ordering::Relaxed),
-        _ => false,
-    }
+	use std::sync::Once;
+	static ONCE: Once = Once::new();
+	ONCE.call_once(init);
+	match kind {
+		"net" => NET_ENABLED.load(Ordering::Relaxed),
+		"game" => GAME_ENABLED.load(Ordering::Relaxed),
+		"gfx" => GFX_ENABLED.load(Ordering::Relaxed),
+		_ => false,
+	}
 }
 
 #[macro_export]

@@ -31,338 +31,335 @@ pub const APIS_BASE: &str = "https://apis.roblox.com";
 
 /// Raw response we keep alive long enough to extract headers + body.
 pub struct RawResponse {
-    pub status: u16,
-    pub body: Vec<u8>,
-    pub csrf: Option<String>,
-    pub set_cookies: Vec<String>,
-    /// Every response header as (name, value) pairs — needed for endpoints
-    /// that deliver results in headers (the authentication ticket arrives in
-    /// `rbx-authentication-ticket`, not in the body).
-    pub headers: Vec<(String, String)>,
+	pub status: u16,
+	pub body: Vec<u8>,
+	pub csrf: Option<String>,
+	pub set_cookies: Vec<String>,
+	/// Every response header as (name, value) pairs — needed for endpoints
+	/// that deliver results in headers (the authentication ticket arrives in
+	/// `rbx-authentication-ticket`, not in the body).
+	pub headers: Vec<(String, String)>,
 }
 
 impl RawResponse {
-    /// Case-insensitive single-value header lookup (HTTP header names are
-    /// case-insensitive; servers emit both `RBX-Authentication-Ticket` and
-    /// `rbx-authentication-ticket`).
-    pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
-    }
+	/// Case-insensitive single-value header lookup (HTTP header names are
+	/// case-insensitive; servers emit both `RBX-Authentication-Ticket` and
+	/// `rbx-authentication-ticket`).
+	pub fn header(&self, name: &str) -> Option<&str> {
+		self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+	}
 
-    pub fn header_cookies_find(&self, name: &str) -> Option<String> {
-        for c in &self.set_cookies {
-            let prefix = format!("{}=", name);
-            if c.starts_with(&prefix) || c.to_lowercase().starts_with(&prefix.to_lowercase()) {
-                let val = c[prefix.len()..].split(';').next().unwrap_or("");
-                if !val.is_empty() {
-                    return Some(val.trim().to_string());
-                }
-            }
-        }
-        None
-    }
+	pub fn header_cookies_find(&self, name: &str) -> Option<String> {
+		for c in &self.set_cookies {
+			let prefix = format!("{}=", name);
+			if c.starts_with(&prefix) || c.to_lowercase().starts_with(&prefix.to_lowercase()) {
+				let val = c[prefix.len()..].split(';').next().unwrap_or("");
+				if !val.is_empty() {
+					return Some(val.trim().to_string());
+				}
+			}
+		}
+		None
+	}
 
-    pub fn json<T: serde::de::DeserializeOwned>(&self) -> Result<T, ApiError> {
-        serde_json::from_slice(&self.body).map_err(|e| ApiError::Parse(e.to_string()))
-    }
+	pub fn json<T: serde::de::DeserializeOwned>(&self) -> Result<T, ApiError> {
+		serde_json::from_slice(&self.body).map_err(|e| ApiError::Parse(e.to_string()))
+	}
 
-    pub fn error(&self) -> ApiError {
-        ApiError::from_body(self.status, &self.body)
-    }
+	pub fn error(&self) -> ApiError {
+		ApiError::from_body(self.status, &self.body)
+	}
 }
 
 pub struct RobloxClient {
-    agent: ureq::Agent,
-    pub csrf: Option<String>,
-    /// `.ROBLOSECURITY` cookie value (the session token).
-    pub security: Option<String>,
-    /// Browser-style cookie jar for all *.roblox.com hosts. The server
-    /// binds CSRF tokens to an anonymous cookie session, so replaying the
-    /// cookies we received is required for the auth dance to work.
-    jar: BTreeMap<String, String>,
+	agent: ureq::Agent,
+	pub csrf: Option<String>,
+	/// `.ROBLOSECURITY` cookie value (the session token).
+	pub security: Option<String>,
+	/// Browser-style cookie jar for all *.roblox.com hosts. The server
+	/// binds CSRF tokens to an anonymous cookie session, so replaying the
+	/// cookies we received is required for the auth dance to work.
+	jar: BTreeMap<String, String>,
 }
 
 fn build_agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
-        .redirects(0)
-        .user_agent(UA)
-        // Pinned Roblox IPs (see dns): DNS is bypassed entirely for the API
-        // hosts so resolver blocking/poisoning cannot take the client down.
-        .resolver(PinnedResolver)
-        .build()
+	ureq::AgentBuilder::new()
+		.timeout_connect(Duration::from_secs(10))
+		.timeout(Duration::from_secs(30))
+		.redirects(0)
+		.user_agent(UA)
+		// Pinned Roblox IPs (see dns): DNS is bypassed entirely for the API
+		// hosts so resolver blocking/poisoning cannot take the client down.
+		.resolver(PinnedResolver)
+		.build()
 }
 
 impl Default for RobloxClient {
-    fn default() -> Self {
-        Self::new()
-    }
+	fn default() -> Self {
+		Self::new()
+	}
 }
 
 impl RobloxClient {
-    pub fn new() -> Self {
-        RobloxClient { agent: build_agent(), csrf: None, security: None, jar: BTreeMap::new() }
-    }
+	pub fn new() -> Self {
+		RobloxClient { agent: build_agent(), csrf: None, security: None, jar: BTreeMap::new() }
+	}
 
-    pub fn set_security(&mut self, token: &str) {
-        self.security = Some(token.to_string());
-        self.jar.insert(".ROBLOSECURITY".to_string(), token.to_string());
-    }
+	pub fn set_security(&mut self, token: &str) {
+		self.security = Some(token.to_string());
+		self.jar.insert(".ROBLOSECURITY".to_string(), token.to_string());
+	}
 
-    pub fn clear_security(&mut self) {
-        self.security = None;
-        self.jar.remove(".ROBLOSECURITY");
-    }
+	pub fn clear_security(&mut self) {
+		self.security = None;
+		self.jar.remove(".ROBLOSECURITY");
+	}
 
-    /// Number of cookies currently in the jar.
-    pub fn jar_len(&self) -> usize {
-        self.jar.len()
-    }
+	/// Number of cookies currently in the jar.
+	pub fn jar_len(&self) -> usize {
+		self.jar.len()
+	}
 
-    /// True when the client carries a Roblox session (explicit field or the
-    /// browser-style jar holding `.ROBLOSECURITY`).
-    pub fn has_session(&self) -> bool {
-        self.security.is_some() || self.jar.contains_key(".ROBLOSECURITY")
-    }
+	/// True when the client carries a Roblox session (explicit field or the
+	/// browser-style jar holding `.ROBLOSECURITY`).
+	pub fn has_session(&self) -> bool {
+		self.security.is_some() || self.jar.contains_key(".ROBLOSECURITY")
+	}
 
-    /// Store every cookie the server sent us (browser-style jar). Empty
-    /// values (cookie deletion) are ignored.
-    fn apply_set_cookies(&mut self, raw: &RawResponse) {
-        for line in &raw.set_cookies {
-            let pair = line.split(';').next().unwrap_or("");
-            if let Some((name, value)) = pair.split_once('=') {
-                let name = name.trim();
-                let value = value.trim();
-                if !name.is_empty() && !value.is_empty() {
-                    self.jar.insert(name.to_string(), value.to_string());
-                }
-            }
-        }
-    }
+	/// Store every cookie the server sent us (browser-style jar). Empty
+	/// values (cookie deletion) are ignored.
+	fn apply_set_cookies(&mut self, raw: &RawResponse) {
+		for line in &raw.set_cookies {
+			let pair = line.split(';').next().unwrap_or("");
+			if let Some((name, value)) = pair.split_once('=') {
+				let name = name.trim();
+				let value = value.trim();
+				if !name.is_empty() && !value.is_empty() {
+					self.jar.insert(name.to_string(), value.to_string());
+				}
+			}
+		}
+	}
 
-    fn cookie_header(&self) -> Option<String> {
-        if self.jar.is_empty() {
-            return None;
-        }
-        let joined = self
-            .jar
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
-            .collect::<Vec<_>>()
-            .join("; ");
-        Some(joined)
-    }
+	fn cookie_header(&self) -> Option<String> {
+		if self.jar.is_empty() {
+			return None;
+		}
+		let joined =
+			self.jar.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("; ");
+		Some(joined)
+	}
 
-    /// Perform a request with the CSRF rotation dance, exactly like the
-    /// official site: on 403 "Token Validation Failed" the response carries a
-    /// fresh `x-csrf-token` plus fresh anonymous cookies; store both, retry.
-    pub fn send(
-        &mut self,
-        url: &str,
-        json_body: Option<&serde_json::Value>,
-    ) -> Result<RawResponse, ApiError> {
-        let mut attempts = 0usize;
-        loop {
-            attempts += 1;
-            let raw = self.send_once(url, json_body)?;
-            self.apply_set_cookies(&raw);
-            if let Some(tok) = &raw.csrf {
-                if self.csrf.as_deref() != Some(tok.as_str()) {
-                    self.csrf = Some(tok.clone());
-                }
-            }
-            let token_invalid = raw.status == 403
-                && String::from_utf8_lossy(&raw.body).contains("Token Validation Failed");
-            if token_invalid && attempts < 3 && raw.csrf.is_some() {
-                continue;
-            }
-            return Ok(raw);
-        }
-    }
+	/// Perform a request with the CSRF rotation dance, exactly like the
+	/// official site: on 403 "Token Validation Failed" the response carries a
+	/// fresh `x-csrf-token` plus fresh anonymous cookies; store both, retry.
+	pub fn send(
+		&mut self,
+		url: &str,
+		json_body: Option<&serde_json::Value>,
+	) -> Result<RawResponse, ApiError> {
+		let mut attempts = 0usize;
+		loop {
+			attempts += 1;
+			let raw = self.send_once(url, json_body)?;
+			self.apply_set_cookies(&raw);
+			if let Some(tok) = &raw.csrf {
+				if self.csrf.as_deref() != Some(tok.as_str()) {
+					self.csrf = Some(tok.clone());
+				}
+			}
+			let token_invalid = raw.status == 403
+				&& String::from_utf8_lossy(&raw.body).contains("Token Validation Failed");
+			if token_invalid && attempts < 3 && raw.csrf.is_some() {
+				continue;
+			}
+			return Ok(raw);
+		}
+	}
 
-    fn send_once(&mut self, url: &str, json_body: Option<&serde_json::Value>) -> Result<RawResponse, ApiError> {
-        let mut req = if json_body.is_some() {
-            self.agent.post(url)
-        } else {
-            self.agent.get(url)
-        };
-        req = req.set("Accept", "application/json");
-        if let Some(tok) = &self.csrf {
-            req = req.set("X-CSRF-Token", tok);
-        }
-        if let Some(cookie) = self.cookie_header() {
-            req = req.set("Cookie", &cookie);
-        }
+	fn send_once(
+		&mut self,
+		url: &str,
+		json_body: Option<&serde_json::Value>,
+	) -> Result<RawResponse, ApiError> {
+		let mut req = if json_body.is_some() { self.agent.post(url) } else { self.agent.get(url) };
+		req = req.set("Accept", "application/json");
+		if let Some(tok) = &self.csrf {
+			req = req.set("X-CSRF-Token", tok);
+		}
+		if let Some(cookie) = self.cookie_header() {
+			req = req.set("Cookie", &cookie);
+		}
 
-        let sent = if let Some(body) = json_body {
-            req.set("Content-Type", "application/json")
-                .send_bytes(&serde_json::to_vec(body).map_err(|e| ApiError::Network(e.to_string()))?)
-        } else {
-            req.call()
-        };
+		let sent = if let Some(body) = json_body {
+			req.set("Content-Type", "application/json").send_bytes(
+				&serde_json::to_vec(body).map_err(|e| ApiError::Network(e.to_string()))?,
+			)
+		} else {
+			req.call()
+		};
 
-        match sent {
-            Ok(resp) => Ok(into_raw(resp)),
-            Err(ureq::Error::Status(_code, resp)) => Ok(into_raw(resp)),
-            Err(ureq::Error::Transport(t)) => Err(ApiError::Network(t.to_string())),
-        }
-    }
+		match sent {
+			Ok(resp) => Ok(into_raw(resp)),
+			Err(ureq::Error::Status(_code, resp)) => Ok(into_raw(resp)),
+			Err(ureq::Error::Transport(t)) => Err(ApiError::Network(t.to_string())),
+		}
+	}
 
-    /// GET expecting JSON.
-    pub fn get_json<T: serde::de::DeserializeOwned>(&mut self, url: &str) -> Result<T, ApiError> {
-        let raw = self.send(url, None)?;
-        if (200..300).contains(&raw.status) {
-            raw.json()
-        } else {
-            Err(raw.error())
-        }
-    }
+	/// GET expecting JSON.
+	pub fn get_json<T: serde::de::DeserializeOwned>(&mut self, url: &str) -> Result<T, ApiError> {
+		let raw = self.send(url, None)?;
+		if (200..300).contains(&raw.status) {
+			raw.json()
+		} else {
+			Err(raw.error())
+		}
+	}
 
-    /// POST JSON expecting JSON.
-    pub fn post_json<T: serde::de::DeserializeOwned>(
-        &mut self,
-        url: &str,
-        body: &serde_json::Value,
-    ) -> Result<T, ApiError> {
-        let raw = self.send(url, Some(body))?;
-        if (200..300).contains(&raw.status) {
-            raw.json()
-        } else {
-            Err(raw.error())
-        }
-    }
+	/// POST JSON expecting JSON.
+	pub fn post_json<T: serde::de::DeserializeOwned>(
+		&mut self,
+		url: &str,
+		body: &serde_json::Value,
+	) -> Result<T, ApiError> {
+		let raw = self.send(url, Some(body))?;
+		if (200..300).contains(&raw.status) {
+			raw.json()
+		} else {
+			Err(raw.error())
+		}
+	}
 
-    /// POST JSON returning the raw response (for cookie extraction).
-    pub fn post_raw(&mut self, url: &str, body: &serde_json::Value) -> Result<RawResponse, ApiError> {
-        self.send(url, Some(body))
-    }
+	/// POST JSON returning the raw response (for cookie extraction).
+	pub fn post_raw(
+		&mut self,
+		url: &str,
+		body: &serde_json::Value,
+	) -> Result<RawResponse, ApiError> {
+		self.send(url, Some(body))
+	}
 
-    /// POST JSON with extra headers (game join needs Referer/Origin).
-    /// Runs the same CSRF-rotation dance as `send`.
-    pub fn post_with_headers(
-        &mut self,
-        url: &str,
-        body: &serde_json::Value,
-        headers: &[(&str, &str)],
-    ) -> Result<RawResponse, ApiError> {
-        let mut attempts = 0usize;
-        loop {
-            attempts += 1;
-            let mut req = self.agent.post(url);
-            req = req.set("Accept", "application/json");
-            req = req.set("Content-Type", "application/json");
-            if let Some(tok) = &self.csrf {
-                req = req.set("X-CSRF-Token", tok);
-            }
-            if let Some(cookie) = self.cookie_header() {
-                req = req.set("Cookie", &cookie);
-            }
-            for (k, v) in headers {
-                req = req.set(k, v);
-            }
-            let sent = req.send_bytes(
-                &serde_json::to_vec(body).map_err(|e| ApiError::Network(e.to_string()))?,
-            );
-            let raw = match sent {
-                Ok(resp) => into_raw(resp),
-                Err(ureq::Error::Status(_code, resp)) => into_raw(resp),
-                Err(ureq::Error::Transport(t)) => return Err(ApiError::Network(t.to_string())),
-            };
-            self.apply_set_cookies(&raw);
-            if let Some(tok) = &raw.csrf {
-                self.csrf = Some(tok.clone());
-            }
-            let token_invalid = raw.status == 403
-                && String::from_utf8_lossy(&raw.body).contains("Token Validation Failed");
-            if token_invalid && attempts < 3 && raw.csrf.is_some() {
-                continue;
-            }
-            return Ok(raw);
-        }
-    }
+	/// POST JSON with extra headers (game join needs Referer/Origin).
+	/// Runs the same CSRF-rotation dance as `send`.
+	pub fn post_with_headers(
+		&mut self,
+		url: &str,
+		body: &serde_json::Value,
+		headers: &[(&str, &str)],
+	) -> Result<RawResponse, ApiError> {
+		let mut attempts = 0usize;
+		loop {
+			attempts += 1;
+			let mut req = self.agent.post(url);
+			req = req.set("Accept", "application/json");
+			req = req.set("Content-Type", "application/json");
+			if let Some(tok) = &self.csrf {
+				req = req.set("X-CSRF-Token", tok);
+			}
+			if let Some(cookie) = self.cookie_header() {
+				req = req.set("Cookie", &cookie);
+			}
+			for (k, v) in headers {
+				req = req.set(k, v);
+			}
+			let sent = req.send_bytes(
+				&serde_json::to_vec(body).map_err(|e| ApiError::Network(e.to_string()))?,
+			);
+			let raw = match sent {
+				Ok(resp) => into_raw(resp),
+				Err(ureq::Error::Status(_code, resp)) => into_raw(resp),
+				Err(ureq::Error::Transport(t)) => return Err(ApiError::Network(t.to_string())),
+			};
+			self.apply_set_cookies(&raw);
+			if let Some(tok) = &raw.csrf {
+				self.csrf = Some(tok.clone());
+			}
+			let token_invalid = raw.status == 403
+				&& String::from_utf8_lossy(&raw.body).contains("Token Validation Failed");
+			if token_invalid && attempts < 3 && raw.csrf.is_some() {
+				continue;
+			}
+			return Ok(raw);
+		}
+	}
 
-    /// Plain GET without auth headers (CDN downloads).
-    pub fn get_cdn_bytes(&self, url: &str) -> Result<Vec<u8>, ApiError> {
-        let sent = self.agent.get(url).set("Accept", "*/*").call();
-        match sent {
-            Ok(resp) => {
-                let mut buf = Vec::new();
-                resp.into_reader()
-                    .take(8 * 1024 * 1024)
-                    .read_to_end(&mut buf)
-                    .map_err(|e| ApiError::Network(e.to_string()))?;
-                Ok(buf)
-            }
-            Err(ureq::Error::Status(code, _)) => Err(ApiError::Status { code, message: String::new() }),
-            Err(ureq::Error::Transport(t)) => Err(ApiError::Network(t.to_string())),
-        }
-    }
+	/// Plain GET without auth headers (CDN downloads).
+	pub fn get_cdn_bytes(&self, url: &str) -> Result<Vec<u8>, ApiError> {
+		let sent = self.agent.get(url).set("Accept", "*/*").call();
+		match sent {
+			Ok(resp) => {
+				let mut buf = Vec::new();
+				resp.into_reader()
+					.take(8 * 1024 * 1024)
+					.read_to_end(&mut buf)
+					.map_err(|e| ApiError::Network(e.to_string()))?;
+				Ok(buf)
+			}
+			Err(ureq::Error::Status(code, _)) => {
+				Err(ApiError::Status { code, message: String::new() })
+			}
+			Err(ureq::Error::Transport(t)) => Err(ApiError::Network(t.to_string())),
+		}
+	}
 }
 
 fn into_raw(resp: ureq::Response) -> RawResponse {
-    let status = resp.status();
-    let csrf = resp.header("x-csrf-token").map(|s| s.to_string());
-    let set_cookies: Vec<String> = resp
-        .all("set-cookie")
-        .into_iter()
-        .map(|s| s.to_string())
-        .collect();
-    // Capture the full header set BEFORE the response is moved into the
-    // body reader.
-    let headers: Vec<(String, String)> = resp
-        .headers_names()
-        .into_iter()
-        .filter_map(|name| resp.header(&name).map(|v| (name, v.to_string())))
-        .collect();
-    let mut body = Vec::new();
-    let _ = resp.into_reader().take(4 * 1024 * 1024).read_to_end(&mut body);
-    RawResponse { status, body, csrf, set_cookies, headers }
+	let status = resp.status();
+	let csrf = resp.header("x-csrf-token").map(|s| s.to_string());
+	let set_cookies: Vec<String> =
+		resp.all("set-cookie").into_iter().map(|s| s.to_string()).collect();
+	// Capture the full header set BEFORE the response is moved into the
+	// body reader.
+	let headers: Vec<(String, String)> = resp
+		.headers_names()
+		.into_iter()
+		.filter_map(|name| resp.header(&name).map(|v| (name, v.to_string())))
+		.collect();
+	let mut body = Vec::new();
+	let _ = resp.into_reader().take(4 * 1024 * 1024).read_to_end(&mut body);
+	RawResponse { status, body, csrf, set_cookies, headers }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+	use super::*;
 
-    #[test]
-    fn raw_header_lookup_is_case_insensitive() {
-        let raw = RawResponse {
-            status: 200,
-            body: b"{}".to_vec(),
-            csrf: None,
-            set_cookies: Vec::new(),
-            headers: vec![
-                ("content-type".to_string(), "application/json".to_string()),
-                ("RBX-Authentication-Ticket".to_string(), "TICKET".to_string()),
-            ],
-        };
-        assert_eq!(raw.header("rbx-authentication-ticket"), Some("TICKET"));
-        assert_eq!(raw.header("RBX-AUTHENTICATION-TICKET"), Some("TICKET"));
-        assert_eq!(raw.header("content-TYPE"), Some("application/json"));
-        assert_eq!(raw.header("missing"), None);
-    }
+	#[test]
+	fn raw_header_lookup_is_case_insensitive() {
+		let raw = RawResponse {
+			status: 200,
+			body: b"{}".to_vec(),
+			csrf: None,
+			set_cookies: Vec::new(),
+			headers: vec![
+				("content-type".to_string(), "application/json".to_string()),
+				("RBX-Authentication-Ticket".to_string(), "TICKET".to_string()),
+			],
+		};
+		assert_eq!(raw.header("rbx-authentication-ticket"), Some("TICKET"));
+		assert_eq!(raw.header("RBX-AUTHENTICATION-TICKET"), Some("TICKET"));
+		assert_eq!(raw.header("content-TYPE"), Some("application/json"));
+		assert_eq!(raw.header("missing"), None);
+	}
 }
 
 /// Normalize a pasted `.ROBLOSECURITY` value: accepts the bare token, a full
 /// `Set-Cookie` line, a `Cookie:` header, or a token with the anti-sharing
 /// warning prefix (both `|_token` and `|token` endings are handled).
 pub fn normalize_cookie_token(input: &str) -> String {
-    let mut t = input.trim().trim_matches('"').trim().to_string();
-    if let Some(pos) = t.find(".ROBLOSECURITY=") {
-        let rest = t[pos + ".ROBLOSECURITY=".len()..].to_string();
-        let cut = rest.find(';').unwrap_or(rest.len());
-        t = rest[..cut].trim().to_string();
-    }
-    if t.starts_with('_') && t.contains("WARNING") {
-        if let Some(pos) = t.rfind('|') {
-            let rest = t[pos + 1..].trim_start_matches('_');
-            if !rest.is_empty() {
-                t = rest.to_string();
-            }
-        }
-    }
-    t.trim().to_string()
+	let mut t = input.trim().trim_matches('"').trim().to_string();
+	if let Some(pos) = t.find(".ROBLOSECURITY=") {
+		let rest = t[pos + ".ROBLOSECURITY=".len()..].to_string();
+		let cut = rest.find(';').unwrap_or(rest.len());
+		t = rest[..cut].trim().to_string();
+	}
+	if t.starts_with('_') && t.contains("WARNING") {
+		if let Some(pos) = t.rfind('|') {
+			let rest = t[pos + 1..].trim_start_matches('_');
+			if !rest.is_empty() {
+				t = rest.to_string();
+			}
+		}
+	}
+	t.trim().to_string()
 }
