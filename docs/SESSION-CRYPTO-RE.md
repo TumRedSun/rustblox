@@ -687,3 +687,41 @@ Next: hook `writev`/`sendmsg` **and** the 12-byte-record consumer in one run,
 then correlate the frames with the transport datagrams in `rkstack.process`
 (`sendto`) to map plaintext app messages onto wire datagrams — that mapping is
 what the Rust client needs for the game-join and the `9b` challenge answer.
+
+## Game join: the client's own payloads, captured in the clear (24 Nov, hooks v55–v58)
+
+**Correction to the section above**: the `5b4e` frames are **not** the game
+channel — they are SPIR-V shader modules (`GLSL.std.450` inside) written to a
+compiler pipe. The live transport runs in-process (logcat:
+`UDMUX Address = 128.116.5.33 | RbxTransport connection closed, falling back
+to RakNet`), on an ordinary connected UDP socket of `com.roblox.client`.
+
+The correct capture point is the steady AEAD wrapper (`0x43099ce` AES,
+`0x430b163` ChaCha): on entry `rdi` holds the plaintext for a seal (and the
+ciphertext for an open). Dumping it (hooks v55/v56/v57) gives every RakNet
+datagram in the clear; walking the frames and reassembling splits yields the
+client's real application messages:
+
+| split id | size | head | meaning |
+|---|---|---|---|
+| 4 | 7363 B | `a7 cc 01 7e …` | join payload 1 |
+| 5 | 13025 B | `90 c2 3d 3c …` | join payload 2 |
+| 6 | 1745 B | `8a 6b 79 eb …` | join payload 3 |
+| — | 9 B | `9b f7 b8 d2 …` | `9b` reply (head + 8 bytes) |
+
+They travel in the same datagram-sequence stream as `0x09` CREQ, the connected
+pings and the `0x54–0x56` clock sync, i.e. they are **client → server**. All
+are high-entropy (7.90–7.99 bit/byte, no zstd magic anywhere): the application
+layer has its own codec/encryption above the transport seal, so they stay
+opaque — but they are exactly the bytes the transport seals, i.e. the payloads
+a client must send.
+
+**Replay plan (next)**: the earlier replay used *wire* blobs (ciphertext under
+the previous session's keys). The captured `split_{4,5,6}.bin` are the
+pre-seal plaintext, so our own RakNet session can seal and send them with its
+own keys: after the system layer, emit a7/90/8a as reliable-ordered split
+frames and watch for the server's `83 xx` / `8d xx` stream.
+
+Files: `session-crypto/analysis/split_{4,5,6}.bin`, parsers
+`analysis/parse_aead.py` + `analysis/splits.py`, hooks
+`scripts/hook_v5{5,6,7,8}.js`.
