@@ -391,7 +391,7 @@ pub struct RakClient {
 	/// Early-encryption state (join hypothesis (c)): key schedule + the
 	/// crypto OCR2/OpenReply2 handshake. `None` = legacy unencrypted fork
 	/// handshake (direct dials without join-script crypto material).
-	early: Option<crate::roblox::early::EarlyCrypto>,
+	early: Option<crate::net::crypto::EarlyCrypto>,
 	/// Connected-phase framing: after ACCEPTED the session switches from
 	/// the tagged handshake boxes (`nonce12+ct+tag16`) to the stream shape
 	/// the pcap proves out (`nonce12+ct`, no tag — the 56-byte keepalives
@@ -452,7 +452,7 @@ impl RakClient {
 		handshake_timeout: Duration,
 		udmux_token: Option<(&str, u64)>,
 		rcc: Option<(std::net::Ipv4Addr, u16)>,
-		early: Option<crate::roblox::early::EarlyCrypto>,
+		early: Option<crate::net::crypto::EarlyCrypto>,
 	) -> Result<RakClient, RakError> {
 		let addr: SocketAddr = (host, port)
 			.to_socket_addrs()
@@ -1028,8 +1028,8 @@ impl RakClient {
 	/// current (guid, mtu) so the crypto path plugs into the legacy
 	/// phase-2 result tuple.
 	fn parse_reply2_crypto(&mut self, payload: &[u8]) -> Option<(u64, u16)> {
-		let (server_pub, box_wire, unique) =
-			crate::roblox::early::EarlyCrypto::parse_reply2(payload)?;
+		let fields = crate::net::crypto::EarlyCrypto::parse_reply2(payload)?;
+		let (server_pub, box_wire, unique) = (fields.server_pub, fields.box_wire, fields.unique);
 		let ec = self.early.as_mut()?;
 		ec.adopt_reply2_key(server_pub);
 		netlog!(
@@ -1049,12 +1049,11 @@ impl RakClient {
 		}
 		let mut opened = false;
 		if let Some(sk) = ec.session_rx {
-			if crate::roblox::early::open(&sk, box_wire, &[&aads[0], &aads[1]]).is_some() {
+			if crate::net::crypto::open(&sk, box_wire, &[&aads[0], &aads[1]]).is_some() {
 				opened = true;
 			}
 		}
-		if !opened && crate::roblox::early::open(&ec.rx, box_wire, &[&aads[0], &aads[1]]).is_some()
-		{
+		if !opened && crate::net::crypto::open(&ec.rx, box_wire, &[&aads[0], &aads[1]]).is_some() {
 			opened = true;
 		}
 		netlog!(

@@ -87,11 +87,11 @@ fn main() {
 	// Early-encryption material from the join script (live-verified
 	// 2026-11-17): the crypto OCR2/OpenReply2 handshake keyed by
 	// EphemeralEarlyPubKey + the join call's own ClientTicket paBlob.
-	let early = rustblox::roblox::early::EarlyCrypto::from_join(
+	let early = rustblox::net::crypto::EarlyCrypto::from_join(
 		&resp.ephemeral_pubkey,
 		resp.client_ticket_pa_blob.clone(),
 		if resp.client_ticket_auth_ver == 0 {
-			rustblox::roblox::early::OCR2_AUTH_VER
+			rustblox::net::crypto::OCR2_AUTH_VER
 		} else {
 			resp.client_ticket_auth_ver
 		},

@@ -225,11 +225,11 @@ fn game_thread(
 	// (part2 — the server verifies it against THIS join call) and part4
 	// authVer ("18" -> 0x12). Built here so a missing or undecodable key
 	// falls back to the legacy handshake with a log line.
-	let early = crate::roblox::early::EarlyCrypto::from_join(
+	let early = crate::net::crypto::EarlyCrypto::from_join(
 		&resp.ephemeral_pubkey,
 		resp.client_ticket_pa_blob.clone(),
 		if resp.client_ticket_auth_ver == 0 {
-			crate::roblox::early::OCR2_AUTH_VER
+			crate::net::crypto::OCR2_AUTH_VER
 		} else {
 			resp.client_ticket_auth_ver
 		},

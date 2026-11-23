@@ -1,7 +1,6 @@
 pub mod auth;
 pub mod client;
 pub mod dns;
-pub mod early;
 pub mod errors;
 pub mod join;
 pub mod replication;

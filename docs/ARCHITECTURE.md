@@ -9,7 +9,8 @@ migrated toward, subsystem by subsystem.
 | Subsystem | State |
 |---|---|
 | Tooling (fmt/clippy/lints/hooks) | Done (this doc, `rustfmt.toml`, `clippy.toml`, `Cargo.toml [lints]`, `.githooks/`) |
-| Network (`raknet`, `early` crypto, `udmux`, `net`) | Not started — next up |
+| Network: `crypto` (was `roblox::early`) | **Done** — `src/net/crypto/{mod,counter,handshake,keyring}.rs`, tests split out, `#![deny(unwrap/expect/panic)]` locally |
+| Network: `raknet`, `udmux`, `net`/socket | Not started — next up |
 | HTTP/Roblox API (`join`, `client`, `auth`, `dns`, `types`, `errors`) | Not started |
 | UI (`app`, `menu_ui`, `ui`, `login_ui`, `draw`, `font`) | Not started |
 | Render (`gfx`, `world`, `game`, `model`) | Not started |
@@ -98,12 +99,17 @@ Two layers:
     `src/net/...` layout (or any other subsystem's new layout), must replace
     its `unwrap`/`expect`/`panic` calls with proper `Result` propagation
     (or a documented, deliberate exception) **and** add
-    `#![forbid(clippy::unwrap_used, clippy::expect_used, clippy::panic)]`
+    `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]`
     at the top of that specific new module, so the module can't regress once
-    cleaned. Test code is exempt per-module via
+    cleaned. **Correction (crypto migration, Nov 23):** the original wording
+    here said `forbid`, but `forbid` cannot be locally overridden even for a
+    reviewed, documented exception (e.g. a `ChaCha20Poly1305::encrypt` call
+    on a fixed-size buffer that is provably infallible) — `deny` is used
+    instead, with `#[allow(clippy::expect_used)]` plus a comment on each
+    specific exception. Test code is exempt per-module via
     `#[allow(clippy::unwrap_used, clippy::expect_used)]` on the `tests` mod
     — a panic in a test is a correct, intended failure signal. Once every
-    subsystem is migrated and forbids these locally, the crate-wide
+    subsystem is migrated and denies these locally, the crate-wide
     `Cargo.toml` level flips from `"warn"` to `"deny"` as the final step.
 
 ## Pre-commit hook
@@ -127,27 +133,39 @@ not automatic, since `.git/hooks` itself isn't tracked by git):
   pulled in through `wgpu`/`arboard`'s own dependency choices — not
   something this project controls or should try to pin around.
 
-## Target layout — network subsystem (next up)
+## Target layout — network subsystem
+
+**Naming collision found during the crypto migration**: `src/net.rs`
+already existed as the UI's background worker thread (login/API/avatar
+commands, nothing to do with RakNet transport). Renamed to `src/worker.rs`
+(2 call sites: `lib.rs`, `app.rs`) to free `src/net/` for the transport tree
+below, per KISS — the worker's old name never described what it did either.
 
 ```
 src/net/
-  mod.rs                 — public API surface, re-exports
-  raknet/
+  mod.rs                 — subsystem doc, re-exports (DONE)
+  crypto/                — DONE
+    mod.rs                — EarlyCrypto struct, seal/open, crypto_kx, consts
+    handshake.rs          — build_ocr2/parse_reply2/open_handshake_box, Reply2Fields
+    counter.rs            — seal_counter/open_counter, nonce framing
+    keyring.rs            — ClientPublicKeyData keyring JSON parser
+  raknet/                 — NOT STARTED (still src/raknet.rs, 2540 lines)
     mod.rs               — RakClient, entry point
     handshake.rs          — OCR1→OCR2→REPLY_1/2→CONNECTION_REQUEST flow
     wire/
       mod.rs              — datagram/frame encode/decode
       reliability.rs      — ACK/NACK, send window, split reassembly
-  crypto/
-    mod.rs                — EarlyCrypto, X25519/BLAKE2b key exchange
-    counter.rs            — seal_counter/open_counter, nonce framing
-  udmux/
+  udmux/                  — NOT STARTED (still src/roblox/udmux.rs, 570 lines)
     mod.rs
     envelope.rs           — RUPP header encode/decode
-  socket.rs               — UDP socket (from the current net.rs)
+  socket.rs               — NOT STARTED — UDP socket, split out of raknet.rs
 ```
 
-Exact per-file line counts are finalized at plan time, not fixed here in
+Exact per-file line counts are finalized at split time, not fixed here in
 advance — if `handshake.rs` alone would exceed 350 lines once extracted, it
 gets its own subfolder (e.g. `handshake/{mod,ocr,connection_request}.rs`)
-rather than a size exception.
+rather than a size exception. The crypto split needed exactly this once:
+`build_ocr2`/`parse_reply2`/`open_handshake_box` moved out of `mod.rs` into
+`handshake.rs` (a second `impl EarlyCrypto` block in a different file —
+legal in Rust, and exactly how `counter.rs` and `handshake.rs` each add
+their own `impl EarlyCrypto`) once `mod.rs` alone passed 350 lines.

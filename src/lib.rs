@@ -20,12 +20,13 @@ pub mod raknet;
 pub mod roblox;
 pub mod theme;
 pub mod ui;
+pub mod worker;
 pub mod world;
 
 pub use netlog::enabled as netlog_enabled;
 
 use crate::config::Session;
-use crate::net::UserEvent;
+use crate::worker::UserEvent;
 
 /// Shared runner: spawns the network worker and hands control to the winit
 /// event loop. Platform harnesses (desktop binary in `src/main.rs`, mobile
@@ -73,7 +74,7 @@ pub fn run_with(event_loop: winit::event_loop::EventLoop<UserEvent>, session: Op
 	std::thread::Builder::new().name("rustblox-memwatch".into()).spawn(mem_watch_loop).ok();
 
 	let proxy = event_loop.create_proxy();
-	let worker = net::spawn(proxy, session.clone());
+	let worker = worker::spawn(proxy, session.clone());
 	let mut app = app::App::new(worker.tx, session.is_some());
 	if let Err(e) = event_loop.run_app(&mut app) {
 		eprintln!("rustblox: event loop error: {e}");
