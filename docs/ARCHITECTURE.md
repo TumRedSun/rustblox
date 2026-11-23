@@ -23,8 +23,20 @@ migrated toward, subsystem by subsystem.
   Chosen over a tighter 250 because every `pub` item now carries a mandatory
   doc comment (see below) — doc comments cost vertical space without adding
   complexity, and a tighter cap would force splitting simple files for no
-  reason other than comment overhead. Enforced by a pre-commit check (no
-  native clippy lint for "lines per file" exists).
+  reason other than comment overhead.
+  **Thresholds enforced by `scripts/arch_check.py`** (no native clippy lint
+  for "lines per file" exists): `<= 350` OK, **`351..450` WARNING**,
+  **`> 450` ERROR**. A folder follows the same shape: `<= 4` `.rs` files OK,
+  **`5` WARNING**, **`>= 6` ERROR** (subfolders and a `tests.rs` sibling are
+  not counted).
+  Existing oversized files/folders are grandfathered in
+  `docs/arch_baseline.txt`; a grandfathered entry is reported as a warning but
+  **must not grow** — growth is an error. Regenerate the baseline only after
+  an intentional split:
+  `python3 scripts/arch_check.py --update-baseline`.
+  Run it directly with `python3 scripts/arch_check.py` (the pre-commit hook
+  runs the same check; CI should use `--strict`), and self-test the checker
+  with `python3 scripts/arch_check.py --selftest`.
 - **4 files per folder max — subfolders do not count against this limit.**
   A folder may hold `mod.rs` + up to 3 siblings, plus as many subfolders as
   needed, each with its own 4-file budget. Split by **responsibility**, not
