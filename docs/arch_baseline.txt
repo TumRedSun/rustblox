@@ -13,7 +13,6 @@ file src/game/mod.rs 529
 file src/gfx/mod.rs 1358
 file src/login_ui.rs 462
 file src/logs.rs 443
-file src/menu_ui.rs 2804
 file src/net/raknet/handshake/connect.rs 608
 file src/net/raknet/handshake/reply.rs 354
 file src/net/raknet/wire/reliability.rs 487
@@ -27,5 +26,5 @@ file src/world/mod.rs 546
 
 # dir <path> <counted .rs files>
 dir mobile/src 5
-dir src 16
+dir src 15
 dir src/roblox 9
