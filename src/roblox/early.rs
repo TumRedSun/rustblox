@@ -43,7 +43,6 @@
 //! (b64) — it differs per join call, so it is threaded in from the join
 //! response, not carried as a constant.
 
-use aes_gcm::Aes256Gcm;
 use blake2::digest::{Update, VariableOutput};
 use blake2::Blake2bVar;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -119,10 +118,14 @@ pub fn seal(key32: &[u8; 32], nonce12: &[u8; 12], aad: &[u8], pt: &[u8]) -> Vec<
 	out
 }
 
-/// The nonce suffix of every post-OpenReply2 datagram (ref/raknet-decryption,
-/// confirmed by the dump + pcap counter hints): `nonce = u64 LE counter ||
-/// "mbeR"` — the ASCII tail comes from the literal `UniqueNumbeR` string.
-const NONCE_SUFFIX: [u8; 4] = *b"mbeR";
+/// The nonce suffix of every post-OpenReply2 datagram: `nonce = u64 LE
+/// counter || "mber"`. Verified byte-exact against the live engine's own
+/// code (Ghidra decompile of the real `FUN_041c2570`/nonce-builder function,
+/// Nov 2026): it writes the 32-bit immediate `0x7265626d`, which as little-
+/// endian bytes is `6d 62 65 72` = ASCII `"mber"` — lowercase `r`, not the
+/// capitalized `"mbeR"` an earlier session assumed from a capture-only
+/// read. See docs/ARCHITECTURE.md history / todo.md for the full trace.
+const NONCE_SUFFIX: [u8; 4] = *b"mber";
 
 fn nonce_bytes(counter: u64) -> [u8; 12] {
 	let mut n = [0u8; 12];
@@ -133,17 +136,17 @@ fn nonce_bytes(counter: u64) -> [u8; 12] {
 
 /// Post-OpenReply2 framing (dump pkt4..7 + the whole pcap, proven by the
 /// sequential counter hints): wire = `ct || counter_hint(u16 LE) || tag(16)`,
-/// nonce = `u64 LE counter || "mbeR"`, AAD EMPTY. The hint is the low 16 bits
+/// nonce = `u64 LE counter || "mber"`, AAD EMPTY. The hint is the low 16 bits
 /// of the counter; the high bits come from the negotiated base (session
 /// setup). The dump's first post-OR2 counter is 0x6e55 on BOTH sides — the
 /// base is not zero and rides inside encrypted session material we cannot
 /// read offline, so it is configurable (`RUSTBLOX_NONCE_BASE`) and the
 /// opener scans a window of high bits.
 pub fn seal_counter(key32: &[u8; 32], counter: u64, pt: &[u8]) -> Vec<u8> {
-	let cipher = Aes256Gcm::new(aes_gcm::Key::<Aes256Gcm>::from_slice(key32));
+	let cipher = ChaCha20Poly1305::new(Key::from_slice(key32));
 	let box_out = cipher
-		.encrypt(aes_gcm::Nonce::from_slice(&nonce_bytes(counter)), Payload { msg: pt, aad: b"" })
-		.expect("aes-256-gcm encrypt");
+		.encrypt(Nonce::from_slice(&nonce_bytes(counter)), Payload { msg: pt, aad: b"" })
+		.expect("chacha20poly1305 encrypt");
 	let (ct, tag) = box_out.split_at(box_out.len() - 16);
 	let mut out = Vec::with_capacity(ct.len() + 18);
 	out.extend_from_slice(ct);
@@ -167,7 +170,7 @@ pub fn open_counter(
 	let (ct, rest) = wire.split_at(wire.len() - 18);
 	let hint = u16::from_le_bytes([rest[0], rest[1]]);
 	let tag = &rest[2..];
-	let cipher = Aes256Gcm::new(aes_gcm::Key::<Aes256Gcm>::from_slice(key32));
+	let cipher = ChaCha20Poly1305::new(Key::from_slice(key32));
 	let base_lo = (base & 0xFFFF) as u16;
 	let diff = hint.wrapping_sub(base_lo) as u64;
 	let mut data = Vec::with_capacity(ct.len() + 16);
@@ -175,10 +178,9 @@ pub fn open_counter(
 	data.extend_from_slice(tag);
 	for k in 0..=window {
 		let val = base.wrapping_add(diff).wrapping_add(k.wrapping_mul(0x10000));
-		if let Ok(pt) = cipher.decrypt(
-			aes_gcm::Nonce::from_slice(&nonce_bytes(val)),
-			Payload { msg: &data, aad: b"" },
-		) {
+		if let Ok(pt) =
+			cipher.decrypt(Nonce::from_slice(&nonce_bytes(val)), Payload { msg: &data, aad: b"" })
+		{
 			return Some((pt, val));
 		}
 	}
@@ -431,7 +433,7 @@ impl EarlyCrypto {
 
 	/// Seal ANY post-OpenReply2 datagram (handshake boxes pkt4..7 AND the
 	/// connected phase — one scheme, proven by the counter hints):
-	/// `ct || hint(u16 LE) || tag(16)`, nonce = `counter u64 LE || "mbeR"`,
+	/// `ct || hint(u16 LE) || tag(16)`, nonce = `counter u64 LE || "mber"`,
 	/// AAD empty. The counter increments per datagram we send.
 	pub fn seal_counter(&mut self, pt: &[u8]) -> Vec<u8> {
 		let key = self.session_tx.unwrap_or(self.tx);
@@ -670,11 +672,13 @@ mod tests {
 
 	#[test]
 	fn counter_nonce_uses_the_mber_suffix() {
-		// nonce = u64 LE counter || "mbeR" — the ref/raknet-decryption scheme
-		// (confirmed by the pcap's sequential counter hints).
+		// nonce = u64 LE counter || "mber" — verified against the live
+		// engine's own nonce-builder code (Ghidra decompile, Nov 2026): the
+		// immediate `0x7265626d` is the ASCII bytes "mber" little-endian,
+		// lowercase r (not "mbeR" as the pcap-only read once assumed).
 		let n = nonce_bytes(1);
 		assert_eq!(&n[..8], &1u64.to_le_bytes());
-		assert_eq!(&n[8..], b"mbeR");
+		assert_eq!(&n[8..], b"mber");
 	}
 
 	#[test]
