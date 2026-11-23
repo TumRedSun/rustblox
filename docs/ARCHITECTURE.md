@@ -11,7 +11,7 @@ migrated toward, subsystem by subsystem.
 | Tooling (fmt/clippy/lints/hooks) | Done (this doc, `rustfmt.toml`, `clippy.toml`, `Cargo.toml [lints]`, `.githooks/`) |
 | Network: `crypto` (was `roblox::early`) | **Done** — `src/net/crypto/{mod,counter,handshake,keyring}.rs`, tests split out, `#![deny(unwrap/expect/panic)]` locally |
 | Network: `udmux` (was `roblox::udmux`) | **Done** — `src/net/udmux/{mod,envelope,token,netstack}.rs`, same lint policy |
-| Network: `raknet`, `net`/socket | Not started — next up (the big one, 2540 lines) |
+| Network: `raknet` (was `src/raknet.rs`) | **Done** — `src/net/raknet/{mod,tests,handshake/{mod,connect,reply,build,tests},wire/{mod,tests,reliability,reliability/tests}}.rs`, same lint policy. `connect.rs` (564 lines), `reply.rs` (354) and `reliability.rs` (487) exceed the 350-line cap — documented exceptions, see below. |
 | HTTP/Roblox API (`join`, `client`, `auth`, `dns`, `types`, `errors`) | Not started |
 | UI (`app`, `menu_ui`, `ui`, `login_ui`, `draw`, `font`) | Not started |
 | Render (`gfx`, `world`, `game`, `model`) | Not started |
@@ -150,19 +150,36 @@ src/net/
     handshake.rs          — build_ocr2/parse_reply2/open_handshake_box, Reply2Fields
     counter.rs            — seal_counter/open_counter, nonce framing
     keyring.rs            — ClientPublicKeyData keyring JSON parser
-  raknet/                 — NOT STARTED (still src/raknet.rs, 2540 lines)
-    mod.rs               — RakClient, entry point
-    handshake.rs          — OCR1→OCR2→REPLY_1/2→CONNECTION_REQUEST flow
+  raknet/                 — DONE
+    mod.rs                — message ids, OFFLINE_MAGIC, RakError, RakState,
+                            ForkGen, RakClient struct, SplitState, idle/close
+    tests.rs              — offline_magic + the two_clients_loopback integration test
+    handshake/
+      mod.rs              — RBX_* consts, send_raw, strip_incoming,
+                            open_handshake_box, parse_reply2_crypto, local_addr_for
+      connect.rs          — RakClient::connect (the whole offline+connected
+                            handshake state machine — 564 lines, see exception below)
+      reply.rs            — offline_roundtrip, probe_reachability, wait_readable,
+                            parse_reply1/2, handle_accepted (354 lines)
+      build.rs            — build_ocr2, netstack_probe, hex_head
+      tests.rs            — rbx_ocr2_layout + the tag-mirroring send_raw tests
     wire/
-      mod.rs              — datagram/frame encode/decode
-      reliability.rs      — ACK/NACK, send window, split reassembly
+      mod.rs              — Reader, Frame, put_u24, frame_encoded_len, address codecs
+      tests.rs            — Frame + address round-trip tests
+      reliability.rs      — ACK/NACK, send window, split reassembly, tick/poll
+                            (487 lines, see exception below)
+      reliability/tests.rs — ack_encoding
   udmux/                  — DONE
     mod.rs                — proxy table, is_private/proxy_for
     envelope.rs           — Envelope, RUPP frame/parse, envelope_candidates
     token.rs              — b64_decode/percent_decode
     netstack.rs           — NetStackConfig blob parser
-  socket.rs               — NOT STARTED — UDP socket, split out of raknet.rs
 ```
+
+No separate `socket.rs` was carved out: the `UdpSocket` is one `RakClient`
+field used only through `send_raw`/`poll`/the recv loops in `handshake`/
+`wire::reliability` — not a reusable abstraction, so a dedicated file would
+only add indirection. Noted as a deliberate non-split, not a gap.
 
 Exact per-file line counts are finalized at split time, not fixed here in
 advance — if `handshake.rs` alone would exceed 350 lines once extracted, it
@@ -174,8 +191,32 @@ legal in Rust, and exactly how `counter.rs` and `handshake.rs` each add
 their own `impl EarlyCrypto`) once `mod.rs` alone passed 350 lines.
 
 **Known leftover from the `udmux` migration**: `envelope::rupp_parse`
-returns a 4-tuple (`(u8, [u8; 16], [u8; 8], usize)`), which trips clippy's
-`type_complexity` style note (not a hard error). Its one real call site is
-in the still-unmigrated `raknet.rs`; fixing it into a named struct is left
-for the `raknet` migration so both sides change together instead of leaving
-a half-updated signature.
+still returns a 4-tuple (`(u8, [u8; 16], [u8; 8], usize)`), which trips
+clippy's `type_complexity` style note (not a hard error). Its call sites
+in `net::raknet::handshake::reply` and `net::raknet::wire::reliability`
+destructure it positionally; turning it into a named struct is still open,
+just no longer blocked on a pending migration — it is pure follow-up
+cleanup now that both sides are in the same subsystem.
+
+**Line-budget exceptions from the `raknet` migration** (all pre-existing
+logic, moved verbatim — not new complexity introduced by the split):
+- `handshake/connect.rs` (564 lines): `RakClient::connect` is one
+  sequential state machine (envelope pinning -> OCR1/REPLY_1 ->
+  OCR2/REPLY_2 -> CONNECTION_REQUEST/ACCEPTED) where each phase's output
+  feeds the next; splitting it into helper methods would scatter the
+  actual control flow across files without reducing real complexity.
+- `handshake/reply.rs` (354 lines) and `wire/reliability.rs` (487 lines):
+  both are a few lines over, holding a tightly-related group of methods
+  (the offline request/reply loop; the full send/resend/ACK/reassembly
+  path) that splitting further would fragment into oddly-small pieces for
+  little clarity gain. Revisit if either grows further.
+
+Two methods also picked up `pub(crate)` or `pub(in crate::net::raknet)`
+visibility (`send_raw`, `strip_incoming`, `RakClient::out_queue`) solely so
+sibling modules (`handshake`, `wire::reliability`) could call/reach them —
+narrower than `pub` but wider than Rust's default private-to-the-defining-
+module rule requires for a single split-impl file (which only needs
+visibility to descendant modules, the technique `net::crypto` uses). This
+is the one place the `raknet` split needed slightly broader visibility than
+`net::crypto` did, because `handshake` and `wire::reliability` are siblings
+calling into each other rather than one file's children.

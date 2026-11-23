@@ -2,8 +2,8 @@
 //! stream into the DataModel and keeps a renderable SceneView up to date.
 
 use crate::gfx::scene::{Camera, SceneView};
+use crate::net::raknet::{RakClient, RakState};
 use crate::netlog;
-use crate::raknet::{RakClient, RakState};
 use crate::roblox::join::JoinResponse;
 use crate::world::{build_r6_rig, DataModel};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -268,7 +268,7 @@ fn game_thread(
                     "netstack probe: join script advertises NetStackPort {} — testing hypothesis (b) (transport on the NetStack channel)",
                     resp.netstack_port
                 );
-				match crate::raknet::netstack_probe(
+				match crate::net::raknet::netstack_probe(
                     &dial_host,
                     resp.netstack_port,
                     &resp.netstack_token,

@@ -47,7 +47,7 @@ impl EarlyCrypto {
 		}
 		let mut aad = Vec::with_capacity(OCR2_AAD as usize);
 		aad.push(OCR2_CRYPTO_ID);
-		aad.extend_from_slice(&crate::raknet::OFFLINE_MAGIC);
+		aad.extend_from_slice(&crate::net::raknet::OFFLINE_MAGIC);
 		aad.extend_from_slice(&[OCR2_VER, OCR2_AAD, 0x00, OCR2_BOX]);
 		aad.extend_from_slice(&OCR2_SV.to_be_bytes());
 		aad.extend_from_slice(&self.client_pk);
@@ -83,7 +83,7 @@ impl EarlyCrypto {
 		if body.len() < 21 + OCR2_PUB + UNIQUE_NAME.len() + UNIQUE_LEN {
 			return None;
 		}
-		if body[0] != OPEN_REPLY2_ID || body[1..17] != crate::raknet::OFFLINE_MAGIC[..] {
+		if body[0] != OPEN_REPLY2_ID || body[1..17] != crate::net::raknet::OFFLINE_MAGIC[..] {
 			return None;
 		}
 		// Header `01 2c 00 3a` — ver 1, aad 44, box 58 (declared). The

@@ -3,4 +3,5 @@
 //! tree is filled in subsystem by subsystem, not all at once.
 
 pub mod crypto;
+pub mod raknet;
 pub mod udmux;

@@ -20,7 +20,7 @@ const LIVE_REPLY2_UNIQUE: [u8; 16] = [
 /// 54-byte box, "UniqueNumber" + 16B tail — 135 bytes total.
 fn live_reply2_body() -> Vec<u8> {
 	let mut b = vec![super::super::OPEN_REPLY2_ID];
-	b.extend_from_slice(&crate::raknet::OFFLINE_MAGIC);
+	b.extend_from_slice(&crate::net::raknet::OFFLINE_MAGIC);
 	b.extend_from_slice(&[0x01, 0x2c, 0x00, 0x3a]);
 	b.extend_from_slice(&LIVE_REPLY2_SERVER_PUB);
 	b.extend_from_slice(&[0u8; 54]); // box — opaque to the parser
@@ -48,7 +48,7 @@ fn ocr2_wire_matches_the_verified_layout() {
 	);
 	// AAD = id + magic + 03 5a 00 5d 00 05 + pub32 + auth_ver + pa_len + pa33.
 	let mut want = vec![OCR2_CRYPTO_ID];
-	want.extend_from_slice(&crate::raknet::OFFLINE_MAGIC);
+	want.extend_from_slice(&crate::net::raknet::OFFLINE_MAGIC);
 	want.extend_from_slice(&[0x03, 0x5a, 0x00, 0x5d, 0x00, 0x05]);
 	want.extend_from_slice(&ec.client_pk);
 	want.push(0x12); // auth_ver — the engine's wire byte (ClientTicket part4 "18")

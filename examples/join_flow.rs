@@ -7,7 +7,7 @@
 //! appearance -> RakNet handshake against the game server -> replication
 //! diagnostics for a few seconds. RUSTBLOX_DEBUG=net|game enables logs.
 
-use rustblox::raknet::{RakClient, RakState};
+use rustblox::net::raknet::{RakClient, RakState};
 use rustblox::roblox::client::RobloxClient;
 use rustblox::roblox::join;
 use std::time::{Duration, Instant};
