@@ -16,7 +16,7 @@ mod users;
 pub use friends::{fetch_friends, fetch_last_online, fetch_presence, fetch_user_details};
 pub use media::{download_image, fetch_avatar_index, fetch_game_icons};
 pub use places::{
-	fetch_game_names, recently_played, recommended_games, search_games, OmniGroupKind,
+	fetch_game_names, pseudo_uuid, recently_played, recommended_games, search_games, OmniGroupKind,
 };
 pub use users::{
 	accept_friend_request, decline_friend_request, fetch_friend_requests, parse_friend_request_ids,

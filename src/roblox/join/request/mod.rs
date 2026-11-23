@@ -24,10 +24,10 @@ pub(super) fn join_request(
 	body: &serde_json::Value,
 	referer: &str,
 ) -> Result<JoinResponse, ApiError> {
-	// RobloxClient.send() does not support custom headers, so do the POST
-	// manually through the same agent/cookie machinery. The join service
-	// only accepts client-shaped traffic: under a browser User-Agent it
-	// refuses with status 12 even when the session is valid.
+	// The join service only accepts client-shaped traffic: under a browser
+	// User-Agent it refuses with status 12 even when the session is valid, so
+	// the POST carries the client UA/Referer/Origin explicitly through the
+	// shared agent/cookie machinery.
 	let url = format!("{}{}", GAMEJOIN_BASE, path);
 	let raw = client.post_with_headers(
 		&url,

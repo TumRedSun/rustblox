@@ -21,6 +21,34 @@ fn raw_header_lookup_is_case_insensitive() {
 }
 
 #[test]
+fn cookie_lookup_skips_empty_values_and_trims_the_name() {
+	// An empty value on the first matching line must not win: the lookup
+	// walks the remaining `Set-Cookie` lines. The cookie name is compared
+	// after `trim()`, so surrounding whitespace (e.g. after the comma a
+	// folded header leaves `" .ROBLOSECURITY"`) still matches.
+	let raw = RawResponse {
+		status: 200,
+		body: Vec::new(),
+		csrf: None,
+		set_cookies: vec![
+			".ROBLOSECURITY=; Path=/; Domain=.roblox.com".to_string(),
+			" .ROBLOSECURITY=REAL; Path=/; Domain=.roblox.com".to_string(),
+		],
+		headers: Vec::new(),
+	};
+	assert_eq!(raw.header_cookies_find(".ROBLOSECURITY").as_deref(), Some("REAL"));
+	// A single empty value with no fallback still yields `None`.
+	let only_empty = RawResponse {
+		status: 200,
+		body: Vec::new(),
+		csrf: None,
+		set_cookies: vec![".ROBLOSECURITY=; Path=/".to_string()],
+		headers: Vec::new(),
+	};
+	assert_eq!(only_empty.header_cookies_find(".ROBLOSECURITY"), None);
+}
+
+#[test]
 fn cookie_lookup_matches_name_case_insensitively() {
 	let raw = RawResponse {
 		status: 200,
