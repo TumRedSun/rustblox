@@ -27,7 +27,7 @@ impl App {
 		}
 	}
 
-	pub(in crate::app) fn paste_clipboard(&mut self) {
+	pub(super) fn paste_clipboard(&mut self) {
 		// Platform backend first (Android/iOS hooks); falls back to arboard
 		// on desktop.
 		let text = crate::platform::clipboard_get();
@@ -64,7 +64,7 @@ impl App {
 	}
 
 	#[cfg(not(any(target_os = "android", target_os = "ios")))]
-	pub(in crate::app) fn ensure_clipboard(&mut self) {
+	fn ensure_clipboard(&mut self) {
 		if self.clipboard.is_none() {
 			self.clipboard = arboard::Clipboard::new().ok();
 		}

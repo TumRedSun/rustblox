@@ -2,7 +2,6 @@
 
 use crate::app::state::{GameView, Screen, ARROW_REPEAT_DELAY_MS};
 use crate::app::App;
-use crate::menu_ui::{FriendPane, MenuTab, SettingsTab};
 use crate::ui::Hit;
 use std::time::{Duration, Instant};
 use winit::dpi::PhysicalPosition;
@@ -26,47 +25,7 @@ impl App {
 			let prev_hit = self.hits.at(self.cursor.0, self.cursor.1);
 			self.cursor = new_pos;
 			// Scrollbar drag (whichever list is active).
-			if let (Some((start_y, start_scroll)), true) = (
-				self.drag_scroll,
-				self.mouse_down.as_ref().map(|h| matches!(h, Hit::Scrollbar)).unwrap_or(false),
-			) {
-				if let Screen::Menu(v) = &mut self.screen {
-					let (scroll, k) = match (v.tab, v.friend_pane, v.settings.tab) {
-						(MenuTab::Home, _, _) => (
-							&mut v.places_scroll,
-							v.places_metrics
-								.as_ref()
-								.map(|m| (m.content_h / m.h.max(1.0)).max(1.0))
-								.unwrap_or(1.0),
-						),
-						(MenuTab::Friends, FriendPane::Requests, _) => (
-							&mut v.requests_scroll,
-							v.requests_metrics
-								.as_ref()
-								.map(|m| (m.content_h / m.h.max(1.0)).max(1.0))
-								.unwrap_or(1.0),
-						),
-						(MenuTab::Friends, FriendPane::Search, _) => (
-							&mut v.add_scroll,
-							v.add_metrics
-								.as_ref()
-								.map(|m| (m.content_h / m.h.max(1.0)).max(1.0))
-								.unwrap_or(1.0),
-						),
-						(MenuTab::Settings, _, SettingsTab::General)
-						| (MenuTab::Settings, _, SettingsTab::Appearance)
-						| (MenuTab::Settings, _, SettingsTab::Logs) => (
-							&mut v.settings_scroll,
-							v.settings_metrics
-								.as_ref()
-								.map(|m| (m.content_h / m.h.max(1.0)).max(1.0))
-								.unwrap_or(1.0),
-						),
-					};
-					*scroll = (start_scroll + (position.y as f32 - start_y) * k).max(0.0);
-					v.settings_sync_logs_follow();
-				}
-			}
+			self.drag_scrollbar(position.y as f32);
 			let dragging = self.drag_scroll.is_some()
 				|| self.content_drag.is_some()
 				|| self.strip_drag.is_some();
@@ -99,17 +58,7 @@ impl App {
 				if let Hit::Field(id) = hit {
 					self.focus = Some(id);
 				}
-				if let Hit::Scrollbar = hit {
-					if let Screen::Menu(v) = &mut self.screen {
-						let start = match (v.tab, v.friend_pane, v.settings.tab) {
-							(MenuTab::Home, _, _) => v.places_scroll,
-							(MenuTab::Friends, FriendPane::Requests, _) => v.requests_scroll,
-							(MenuTab::Friends, FriendPane::Search, _) => v.add_scroll,
-							(MenuTab::Settings, _, _) => v.settings_scroll,
-						};
-						self.drag_scroll = Some((self.cursor.1, start));
-					}
-				}
+				self.begin_scrollbar_drag(&hit);
 				if matches!(hit, Hit::ScrollUp | Hit::ScrollDown) {
 					// First step immediately, then auto-repeat while held.
 					self.scroll_step(&hit);
@@ -133,50 +82,7 @@ impl App {
 				if let Some(pressed_hit) = pressed {
 					let released_hit = self.hits.at(self.cursor.0, self.cursor.1);
 					if pressed_hit == released_hit {
-						match released_hit {
-							Hit::TabPassword
-							| Hit::TabCookie
-							| Hit::SignIn
-							| Hit::Verify
-							| Hit::Resend
-							| Hit::Back
-							| Hit::Logout
-							| Hit::NavFriends
-							| Hit::NavSettings
-							| Hit::AddSearchBtn
-							| Hit::AddUser(_)
-							| Hit::SearchPlacesBtn
-							| Hit::SidebarToggle
-							| Hit::Logo
-							| Hit::TabRequests
-							| Hit::TabSearch
-							| Hit::RequestAccept(_)
-							| Hit::RequestDecline(_)
-							| Hit::SwitchAccount(_)
-							| Hit::AddAccount
-							| Hit::ThemePreset(_)
-							| Hit::ToggleRecommendations
-							| Hit::SettingsTab(_)
-							| Hit::RadiusUp
-							| Hit::RadiusDown
-							| Hit::ColorPrev(_)
-							| Hit::ColorNext(_)
-							| Hit::ResetAppearance
-							| Hit::CancelAdd
-							| Hit::ClearField(_)
-							| Hit::CopyLogs
-							| Hit::SaveLogs
-							| Hit::ClearLogs
-							| Hit::StripLeft
-							| Hit::StripRight
-							| Hit::JoinPlace(_) => {
-								self.handle_button(released_hit);
-							}
-							Hit::Field(id) => {
-								self.focus = Some(id);
-							}
-							_ => {}
-						}
+						self.activate_hit(released_hit);
 					}
 				}
 				self.request_redraw();

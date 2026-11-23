@@ -38,6 +38,8 @@ use winit::window::Window;
 #[path = "tests.rs"]
 mod tests;
 
+/// Shared application state: the window, the screen being driven and the
+/// input/worker plumbing around them.
 pub struct App {
 	pub window: Option<Arc<Window>>,
 	pub gfx: Option<crate::gfx::Gfx>,
@@ -82,7 +84,7 @@ pub struct App {
 	/// Pending headless auto-join (`RUSTBLOX_AUTOJOIN`): the session restore
 	/// arrives asynchronously and would otherwise replace the game screen
 	/// with the menu right after startup.
-	pub(crate) pending_autojoin: Option<(u64, u64)>,
+	pending_autojoin: Option<(u64, u64)>,
 	/// True while the login screen is open for "add another account" (the
 	/// running menu is parked in `suspended_menu`).
 	pub adding_account: bool,
@@ -90,6 +92,7 @@ pub struct App {
 }
 
 impl App {
+	/// Build the app on the login screen, applying the persisted theme.
 	pub fn new(tx: Sender<Command>, has_saved_session: bool) -> App {
 		// Apply the persisted theme before the first frame.
 		let settings = config::load_settings();
@@ -130,10 +133,12 @@ impl App {
 		}
 	}
 
+	/// Forward a command to the worker thread (dropped if it is gone).
 	pub fn send_command(&mut self, cmd: Command) {
 		let _ = self.tx.send(cmd);
 	}
 
+	/// Mark the window for a redraw on the next frame.
 	pub fn request_redraw(&mut self) {
 		self.needs_redraw = true;
 	}

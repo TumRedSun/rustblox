@@ -19,6 +19,7 @@ pub const ARROW_REPEAT_DELAY_MS: u64 = 250;
 /// Auto-repeat interval of a held scroll arrow.
 pub const ARROW_REPEAT_MS: u64 = 110;
 
+/// The screen currently driven by the event loop.
 pub enum Screen {
 	Login(LoginView),
 	Menu(MenuView),
@@ -41,6 +42,7 @@ pub enum GameView {
 	},
 }
 
+/// Severity of a status line shown on the login/settings screens.
 #[derive(Clone, Copy, PartialEq)]
 pub enum StatusKind {
 	Info,

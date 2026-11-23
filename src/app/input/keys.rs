@@ -8,7 +8,7 @@ use winit::event::KeyEvent;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
 impl App {
-	pub(in crate::app) fn focus_cycle(&mut self) {
+	fn focus_cycle(&mut self) {
 		let order: &[FieldId] = match &self.screen {
 			Screen::Login(v) => {
 				if v.two_step.is_some() {

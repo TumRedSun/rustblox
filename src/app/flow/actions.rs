@@ -2,7 +2,7 @@
 
 use crate::app::state::{Screen, StatusKind};
 use crate::app::App;
-use crate::menu_ui::{FriendPane, MenuTab};
+use crate::menu_ui::{FriendPane, MenuTab, SettingsTab};
 use crate::theme;
 use crate::ui::Hit;
 use crate::worker::Command;
@@ -169,5 +169,119 @@ impl App {
 			}
 		}
 		self.needs_redraw = true;
+	}
+
+	/// Dispatch a completed press/release pair on a clickable hit.
+	///
+	/// The hit must be the one recorded on press and still under the pointer
+	/// at release; text fields only take focus here (their editing runs
+	/// through the keyboard path).
+	pub(in crate::app) fn activate_hit(&mut self, hit: Hit) {
+		match hit {
+			Hit::TabPassword
+			| Hit::TabCookie
+			| Hit::SignIn
+			| Hit::Verify
+			| Hit::Resend
+			| Hit::Back
+			| Hit::Logout
+			| Hit::NavFriends
+			| Hit::NavSettings
+			| Hit::AddSearchBtn
+			| Hit::AddUser(_)
+			| Hit::SearchPlacesBtn
+			| Hit::SidebarToggle
+			| Hit::Logo
+			| Hit::TabRequests
+			| Hit::TabSearch
+			| Hit::RequestAccept(_)
+			| Hit::RequestDecline(_)
+			| Hit::SwitchAccount(_)
+			| Hit::AddAccount
+			| Hit::ThemePreset(_)
+			| Hit::ToggleRecommendations
+			| Hit::SettingsTab(_)
+			| Hit::RadiusUp
+			| Hit::RadiusDown
+			| Hit::ColorPrev(_)
+			| Hit::ColorNext(_)
+			| Hit::ResetAppearance
+			| Hit::CancelAdd
+			| Hit::ClearField(_)
+			| Hit::CopyLogs
+			| Hit::SaveLogs
+			| Hit::ClearLogs
+			| Hit::StripLeft
+			| Hit::StripRight
+			| Hit::JoinPlace(_) => {
+				self.handle_button(hit);
+			}
+			Hit::Field(id) => {
+				self.focus = Some(id);
+			}
+			_ => {}
+		}
+	}
+
+	/// Arm a scrollbar drag at the current cursor position (the list scrolls
+	/// in `drag_scrollbar` as the pointer moves).
+	pub(in crate::app) fn begin_scrollbar_drag(&mut self, hit: &Hit) {
+		if matches!(hit, Hit::Scrollbar) {
+			if let Screen::Menu(v) = &mut self.screen {
+				let start = match (v.tab, v.friend_pane, v.settings.tab) {
+					(MenuTab::Home, _, _) => v.places_scroll,
+					(MenuTab::Friends, FriendPane::Requests, _) => v.requests_scroll,
+					(MenuTab::Friends, FriendPane::Search, _) => v.add_scroll,
+					(MenuTab::Settings, _, _) => v.settings_scroll,
+				};
+				self.drag_scroll = Some((self.cursor.1, start));
+			}
+		}
+	}
+
+	/// Follow the pointer while the scrollbar of the active menu list is held:
+	/// scroll by the cursor delta, scaled to the content height.
+	pub(in crate::app) fn drag_scrollbar(&mut self, y: f32) {
+		if let (Some((start_y, start_scroll)), true) = (
+			self.drag_scroll,
+			self.mouse_down.as_ref().map(|h| matches!(h, Hit::Scrollbar)).unwrap_or(false),
+		) {
+			if let Screen::Menu(v) = &mut self.screen {
+				let (scroll, k) = match (v.tab, v.friend_pane, v.settings.tab) {
+					(MenuTab::Home, _, _) => (
+						&mut v.places_scroll,
+						v.places_metrics
+							.as_ref()
+							.map(|m| (m.content_h / m.h.max(1.0)).max(1.0))
+							.unwrap_or(1.0),
+					),
+					(MenuTab::Friends, FriendPane::Requests, _) => (
+						&mut v.requests_scroll,
+						v.requests_metrics
+							.as_ref()
+							.map(|m| (m.content_h / m.h.max(1.0)).max(1.0))
+							.unwrap_or(1.0),
+					),
+					(MenuTab::Friends, FriendPane::Search, _) => (
+						&mut v.add_scroll,
+						v.add_metrics
+							.as_ref()
+							.map(|m| (m.content_h / m.h.max(1.0)).max(1.0))
+							.unwrap_or(1.0),
+					),
+					(MenuTab::Settings, _, SettingsTab::General)
+					| (MenuTab::Settings, _, SettingsTab::Appearance)
+					| (MenuTab::Settings, _, SettingsTab::Logs) => (
+						&mut v.settings_scroll,
+						v.settings_metrics
+							.as_ref()
+							.map(|m| (m.content_h / m.h.max(1.0)).max(1.0))
+							.unwrap_or(1.0),
+					),
+				};
+				*scroll = (start_scroll + (y - start_y) * k).max(0.0);
+				v.settings_sync_logs_follow();
+			}
+		}
 	}
 }
