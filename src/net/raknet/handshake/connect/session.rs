@@ -103,6 +103,10 @@ fn mark_request_sent(c: &mut RakClient) {
 /// Open the connect-phase counter box when the session is encrypted;
 /// plaintext datagrams pass through unchanged.
 fn open_connect_box(c: &mut RakClient, payload: Vec<u8>) -> Vec<u8> {
+	// Early crypto: post-OpenReply2 datagrams ride the counter
+	// framing (`ct || hint u16 LE || tag 16`, nonce = counter ||
+	// "mbeR", AAD empty — dump pkt4..7). Plaintext sessions pass
+	// through unchanged.
 	let opened = match c.early.as_ref() {
 		Some(ec) => ec.open_counter(&payload),
 		None => return payload,

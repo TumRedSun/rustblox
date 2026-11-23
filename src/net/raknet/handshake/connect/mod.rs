@@ -3,9 +3,9 @@
 //! One sequential state machine (envelope pinning -> OCR1/REPLY_1 ->
 //! OCR2/REPLY_2 -> CONNECTION_REQUEST/ACCEPTED) where every phase's output
 //! feeds the next. The phases are split across this folder so no file has to
-//! carry the whole flow: [`setup`] resolves the server, binds the socket and
-//! pins the datagram envelope, [`offline`] runs the OCR1/OCR2 matrices, and
-//! [`session`] runs the connected CONNECTION_REQUEST/ACCEPTED exchange.
+//! carry the whole flow: `setup` resolves the server, binds the socket and
+//! pins the datagram envelope, `offline` runs the OCR1/OCR2 matrices, and
+//! `session` runs the connected CONNECTION_REQUEST/ACCEPTED exchange.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -41,15 +41,15 @@ impl RakClient {
 		let mut c = setup::new_client(host, port, early)?;
 
 		// Phase 0 (udmux sessions): pin the datagram envelope.
-		let (pinned, probe_pong) = setup::pin_envelope(&mut c, udmux_token, rcc);
+		let pinned = setup::pin_envelope(&mut c, udmux_token, rcc);
 
 		// Phases 1-2: OPEN_CONNECTION_REQUEST/REPLY 1-2.
 		let (server_guid, mtu, use_security) = offline::phase1(
 			&mut c,
-			&pinned,
-			probe_pong,
+			&pinned.envelope,
+			pinned.probe_pong,
 			protocol_versions,
-			udmux_token,
+			&pinned.candidates,
 			handshake_timeout,
 		)?;
 		netlog!(net, "REPLY_1: guid={} mtu={} security={}", server_guid, mtu, use_security);

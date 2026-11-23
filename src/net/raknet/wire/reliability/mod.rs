@@ -4,9 +4,9 @@
 //! [`RakClient`]; the offline + connected handshake lives in
 //! [`super::super::handshake`].
 //!
-//! Split by responsibility: [`send`] owns the outgoing frame/datagram path,
-//! [`recv`] the receive path (ACK parsing, frame dispatch, ordered delivery)
-//! and [`ack`] the timers, control messages, ACK emission and split
+//! Split by responsibility: `send` owns the outgoing frame/datagram path,
+//! `recv` the receive path (ACK parsing, frame dispatch, ordered delivery)
+//! and `ack` the timers, control messages, ACK emission and split
 //! reassembly.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

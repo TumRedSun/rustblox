@@ -1,6 +1,6 @@
 //! The request/reply plumbing `connect` drives: the generic offline
-//! round-trip loop (this file), the reachability probe ([`probe`]) and the
-//! REPLY_1 / REPLY_2 / ACCEPTED parsers ([`accepted`]).
+//! round-trip loop (this file), the reachability probe (`probe`) and the
+//! REPLY_1 / REPLY_2 / ACCEPTED parsers (`accepted`).
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

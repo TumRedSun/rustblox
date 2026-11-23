@@ -33,10 +33,10 @@ pub(super) fn phase1(
 	pinned: &Option<Envelope>,
 	probe_pong: bool,
 	protocol_versions: &[u8],
-	udmux_token: Option<(&str, u64)>,
+	candidates: &[Envelope],
 	timeout: Duration,
 ) -> Result<(u64, u16, bool), RakError> {
-	let variants = phase1_variants(pinned, c.client_tag, protocol_versions, udmux_token);
+	let variants = phase1_variants(pinned, c.client_tag, protocol_versions, candidates);
 	let reply = c.offline_roundtrip(
 		&variants,
 		timeout,
@@ -121,11 +121,11 @@ fn phase1_variants(
 	pinned: &Option<Envelope>,
 	client_tag: [u8; 16],
 	protocol_versions: &[u8],
-	udmux_token: Option<(&str, u64)>,
+	candidates: &[Envelope],
 ) -> Vec<P1Variant> {
 	match pinned {
 		Some(env) => pinned_variants(*env, client_tag, protocol_versions),
-		None => bare_variants(protocol_versions, udmux_token),
+		None => bare_variants(protocol_versions, candidates),
 	}
 }
 
@@ -161,17 +161,16 @@ fn pinned_variants(
 }
 
 /// OCR1 steps without a confirmed envelope: bare fork shape, bare vanilla,
-/// the protocol variants, then the remaining envelope candidates.
-fn bare_variants(protocol_versions: &[u8], udmux_token: Option<(&str, u64)>) -> Vec<P1Variant> {
+/// the protocol variants, then the remaining envelope candidates (the list
+/// the phase-0 probe already built — `BARE` is step one, the rest follow).
+fn bare_variants(protocol_versions: &[u8], candidates: &[Envelope]) -> Vec<P1Variant> {
 	let mut out = vec![
 		(udmux::BARE, RBX_ID_OPEN_CONNECTION_REQUEST_1, RBX_PROTOCOL_VERSION),
 		(udmux::BARE, ID_OPEN_CONNECTION_REQUEST_1, RBX_PROTOCOL_VERSION),
 	];
 	push_extra_protocols(&mut out, udmux::BARE, protocol_versions);
-	if let Some((tok, pepper)) = udmux_token {
-		for env in udmux::envelope_candidates(tok, pepper).into_iter().skip(1) {
-			out.push((env, RBX_ID_OPEN_CONNECTION_REQUEST_1, RBX_PROTOCOL_VERSION));
-		}
+	for &env in candidates.iter().skip(1) {
+		out.push((env, RBX_ID_OPEN_CONNECTION_REQUEST_1, RBX_PROTOCOL_VERSION));
 	}
 	out
 }

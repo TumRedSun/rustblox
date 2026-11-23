@@ -96,6 +96,16 @@ fn seed_tag(guid: u64) -> [u8; 16] {
 	tag
 }
 
+/// Phase-0 result: the envelope to pin (if any), whether the reachability
+/// probe drew a pong, and the token-derived shape list handed to the OCR1
+/// matrix (empty when the capture shape was pinned without a probe), so the
+/// token is decoded once per connect instead of twice.
+pub(super) struct Pinned {
+	pub(super) envelope: Option<Envelope>,
+	pub(super) probe_pong: bool,
+	pub(super) candidates: Vec<Envelope>,
+}
+
 /// Phase 0 (udmux sessions): pin the datagram ENVELOPE.
 ///
 /// The 34k-datagram live capture (`sober_ro.pcap`, Nov 2026) shows the
@@ -110,13 +120,13 @@ fn seed_tag(guid: u64) -> [u8; 16] {
 /// client tag stays as a matrix fallback, and the OCR1 matrix walks
 /// {token,random} x {02,01}.
 ///
-/// Returns the envelope to pin (if any) and whether a reachability probe
-/// drew a pong.
+/// Returns the envelope to pin (if any), whether a reachability probe drew a
+/// pong, and the candidate shapes for the matrix fallback.
 pub(super) fn pin_envelope(
 	c: &mut RakClient,
 	udmux_token: Option<(&str, u64)>,
 	rcc: Option<(Ipv4Addr, u16)>,
-) -> (Option<Envelope>, bool) {
+) -> Pinned {
 	let token_tag = udmux_token.and_then(|(tok, _)| udmux::decode_token16(tok));
 	let known_shape = match (rcc, token_tag) {
 		(Some((ip, port)), Some(tag)) => {
@@ -145,16 +155,16 @@ pub(super) fn pin_envelope(
 		}
 		_ => None,
 	};
-	if known_shape.is_some() {
-		return (known_shape, false);
+	if let Some(env) = known_shape {
+		return Pinned { envelope: Some(env), probe_pong: false, candidates: Vec::new() };
 	}
 
-	let envelopes: Vec<Envelope> = match udmux_token {
+	let candidates: Vec<Envelope> = match udmux_token {
 		None => vec![udmux::BARE],
 		Some((tok, pepper)) => udmux::envelope_candidates(tok, pepper),
 	};
-	if envelopes.len() > 1 {
-		let p = c.probe_reachability(&envelopes, Duration::from_millis(700));
+	if candidates.len() > 1 {
+		let p = c.probe_reachability(&candidates, Duration::from_millis(700));
 		match &p {
 			Some(env) => netlog!(
 				net,
@@ -166,7 +176,8 @@ pub(super) fn pin_envelope(
 				"envelope probe: no pong in any RUPP shape — trying the OCR1 matrix anyway"
 			),
 		}
-		return (p, p.is_some());
+		let probe_pong = p.is_some();
+		return Pinned { envelope: p, probe_pong, candidates };
 	}
-	(None, false)
+	Pinned { envelope: None, probe_pong: false, candidates }
 }
