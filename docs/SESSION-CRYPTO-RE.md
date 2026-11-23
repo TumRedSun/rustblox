@@ -658,3 +658,32 @@ clear, then reproduce them in `src/net/raknet`.
 
 Tooling: `session-crypto/scripts/hook_v50.js` (large-write dumper, iovec-aware) and
 `hook_v51.js` (parses the 5b4e header, logs seq/len/payload head in order).
+
+## Game layer: the channel is bidirectional (24 Nov, hook v53)
+
+`hook_v53.js` detects the app↔`rkstack.process` channel by the first `5b4e`
+write and logs both directions on that fd. On a fresh launch the channel is
+already active ~2.8 s after spawn (the app resumes the last place), and it
+interleaves:
+
+```
+OUT fd=181 len=3180  seq=99   (5b4e frame, header + payload)
+IN  fd=181 len=12             (small ack/notification record)
+OUT fd=181 len=692   seq=100
+IN  fd=181 len=12
+...
+```
+
+- The 12-byte IN records start with a plausible `u32` message size
+  (4839, 156, 5430, 5274, …) followed by `u16` ids (`0x017e`, `0x0016`, …);
+  they are **not** the payload itself — the incoming body must arrive via a
+  second read/shared-memory path (buffer content past the 12 bytes is stale
+  memory from earlier reads, e.g. the GPU name string).
+- Sequences jump (99…103 → 124 → 125): the missing frames are written with
+  `writev`/`sendmsg`, which v53 does not hook (v50/v51 are iovec-aware and do).
+  The complete capture hook is therefore v51 (outbound) + v53 (bidirectional).
+
+Next: hook `writev`/`sendmsg` **and** the 12-byte-record consumer in one run,
+then correlate the frames with the transport datagrams in `rkstack.process`
+(`sendto`) to map plaintext app messages onto wire datagrams — that mapping is
+what the Rust client needs for the game-join and the `9b` challenge answer.
