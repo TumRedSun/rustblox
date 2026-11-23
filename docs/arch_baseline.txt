@@ -6,25 +6,8 @@
 file examples/render_preview.rs 412
 file examples/scene_repro.rs 610
 file mobile/src/android_ui.rs 352
-file src/app.rs 2506
-file src/draw.rs 647
-file src/font.rs 546
-file src/game/mod.rs 529
-file src/gfx/mod.rs 1358
-file src/login_ui.rs 462
-file src/logs.rs 443
-file src/net/raknet/handshake/connect.rs 608
-file src/net/raknet/handshake/reply.rs 354
-file src/net/raknet/wire/reliability.rs 487
-file src/roblox/client.rs 365
-file src/roblox/join.rs 1237
-file src/roblox/replication.rs 510
-file src/roblox/social.rs 584
-file src/ui.rs 564
-file src/worker.rs 526
-file src/world/mod.rs 546
 
 # dir <path> <counted .rs files>
 dir mobile/src 5
-dir src 15
-dir src/roblox 9
+dir src 8
+dir src/roblox 5

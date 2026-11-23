@@ -10,6 +10,8 @@
 //! unknown structures, the decode rules here get upgraded — the design
 //! goal is "never crash, always log".
 
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use crate::world::{Prop, RefId};
 
 mod body;
@@ -72,6 +74,7 @@ pub struct ReplicationParser {
 }
 
 impl ReplicationParser {
+	/// A parser with zeroed counters and an empty head histogram.
 	pub fn new() -> ReplicationParser {
 		ReplicationParser {
 			packets: 0,

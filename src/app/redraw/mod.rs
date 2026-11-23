@@ -68,7 +68,7 @@ impl App {
 				}
 			}
 			let prims = fb.take_prims();
-			let mut atlas = self.fonts.atlas.lock().unwrap();
+			let mut atlas = self.fonts.atlas.lock().unwrap_or_else(|p| p.into_inner());
 			// The 3D scene comes from the live session (if connected).
 			let scene = match &self.screen {
 				Screen::Game(GameView::Active { session, .. }) => {

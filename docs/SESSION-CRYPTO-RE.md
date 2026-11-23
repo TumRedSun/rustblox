@@ -567,7 +567,7 @@ Header shape (`97 0d` is the clean byte-aligned example):
 `id | subtype | u32 LE compressed-len | u32 LE inflated-len | zstd frame`.
 The other subtypes insert 0–5 extra bytes before the lengths, so the parser
 locates the `28 b5 2f fd` magic in the first 24 bytes instead of hard-coding
-one layout (`src/roblox/replication.rs`, `ruzstd`). Strings inside the bodies
+one layout (`src/roblox/replication/`, `ruzstd`). Strings inside the bodies
 use two conventions — `u8 len + ASCII` (schema/cluster) and `u16 LE len +
 ASCII` (the policy message) — both harvested into `DataModel::strings`.
 
@@ -631,3 +631,30 @@ current Hyprland build the special-workspace toggle did not report
 `WASD` walk (camera-relative, 16 studs/s), `Space` jump, mouse look with the
 cursor captured on LMB, `Esc` releases the mouse and a second `Esc` leaves,
 `F` toggles the debug free-fly, `R` respawn. The HUD hint line reflects this.
+
+## Game layer: the app→rkstack channel is PLAINTEXT (24 Nov, emulator + Frida)
+
+The engine sends UDP from a separate `rkstack.process`; the application layer
+travels from the app to it over an IPC channel. Hooking `write`/`send`/
+`sendmsg`/`writev` in `com.roblox.client` (Frida 17: `Module.getGlobalExportByName`)
+shows that channel in the clear:
+
+```
+5b 4e 00 00 | total_len:u32 LE | seq:u32 LE | 02 00 00 00 |
+08 00 03 00 | 10 00 00 00 | 28 bytes of zeros | inner_len:u32 LE |
+payload…
+```
+
+- `total_len` equals the write size (frame = 56-byte header + payload);
+- `seq` increments per message (captured 99…139 on one session);
+- payload starts with the same protocol prefix (`03 02 23 07 00 00 01 00 …`),
+  different per message only in its length and body.
+
+So the client's outbound game messages are **not** app-encrypted: the transport
+steady seal (AES-256-GCM, already solved) is the only encryption on the wire.
+This is the channel to capture the game-join (the `a7/90/92/…` payloads the Rust
+client is missing) and the client's answer to the server's `9b` challenge in the
+clear, then reproduce them in `src/net/raknet`.
+
+Tooling: `session-crypto/scripts/hook_v50.js` (large-write dumper, iovec-aware) and
+`hook_v51.js` (parses the 5b4e header, logs seq/len/payload head in order).

@@ -1,6 +1,8 @@
 //! Unit tests for the replication parser: legacy clusters, zstd fork
 //! bodies and the str16/u8/u16 name-table conventions.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use super::body::extract_names;
 use super::*;
 use crate::world::{DataModel, Prop};

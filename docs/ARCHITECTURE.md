@@ -11,10 +11,11 @@ migrated toward, subsystem by subsystem.
 | Tooling (fmt/clippy/lints/hooks) | Done (this doc, `rustfmt.toml`, `clippy.toml`, `Cargo.toml [lints]`, `.githooks/`) |
 | Network: `crypto` (was `roblox::early`) | **Done** — `src/net/crypto/{mod,counter,handshake,keyring}.rs`, tests split out, `#![deny(unwrap/expect/panic)]` locally |
 | Network: `udmux` (was `roblox::udmux`) | **Done** — `src/net/udmux/{mod,envelope,token,netstack}.rs`, same lint policy |
-| Network: `raknet` (was `src/raknet.rs`) | **Done** — `src/net/raknet/{mod,tests,handshake/{mod,connect,reply,build,tests},wire/{mod,tests,reliability,reliability/tests}}.rs`, same lint policy. `connect.rs` (564 lines), `reply.rs` (354) and `reliability.rs` (487) exceed the 350-line cap — documented exceptions, see below. |
-| HTTP/Roblox API (`join`, `client`, `auth`, `dns`, `types`, `errors`) | Not started |
-| UI (`app`, `menu_ui`, `ui`, `login_ui`, `draw`, `font`) | Not started |
-| Render (`gfx`, `world`, `game`, `model`) | Not started |
+| Network: `raknet` (was `src/raknet.rs`) | **Done** — `src/net/raknet/{mod,tests}`, `handshake/{mod,build,tests,connect/{mod,setup,offline,session},reply/{mod,probe,accepted}}`, `wire/{mod,tests,reliability/{mod,send,recv,ack,tests}}`; every file ≤350 lines, no exceptions left |
+| HTTP/Roblox API (`join`, `client`, `auth`, `dns`, `types`, `errors`) | **Done** — `roblox/join/{mod,avatar,response,ticket,request/{mod,script,fields,diag}}`, `client/{mod,request,raw,cookie}`, `social/{mod,users,friends,places,media}`, `worker/{mod,command,event,tasks/{mod,login,social,refresh}}` |
+| UI (`app`, `menu_ui`, `ui`, `login_ui`, `draw`, `font`) | **Done** — `app/{mod,state,handler,flow/*,input/*,redraw/*,window/*,worker/*}`, `menu_ui/`, `ui/{mod,hit,field,widgets}`, `draw/{mod,pixel,shapes,image}`, `font/{mod,atlas,text}`, `login_ui/{mod,components}`, `logs/{mod,file,crash}` |
+| Render (`gfx`, `world`, `game`, `model`) | **Done** — `gfx/{mod,render,math,scene,core/{mod,texture},ui/{mod,pipeline},scene3d/{mod,pipeline}}`, `world/{mod,model,scene_view}`, `game/{mod,state,session,controller,thread/{mod,world}}` |
+| Roblox replication (`roblox::replication`) | **Done** — `replication/{mod,envelope,body,inflate,tests}`; the parser's 7 live-capture tests moved verbatim |
 | Mobile (`mobile/`) | Not started |
 
 ## Module layout rules
@@ -43,8 +44,12 @@ migrated toward, subsystem by subsystem.
   by raw size: wire-framing is separate from reliability bookkeeping,
   handshake flow is separate from the connected session, crypto primitives
   are separate from the key-schedule that uses them.
-- **Function length: 60 lines max**, enforced by
-  `clippy::too_many_lines` (`clippy.toml` → `too-many-lines-threshold = 60`).
+- **Function length: advisory 60 lines** — `clippy.toml` sets
+  `too-many-lines-threshold = 60`, but the pedantic `clippy::too_many_lines`
+  lint is not enabled crate-wide yet: the pre-existing code has many longer
+  functions, so enabling it now would only add noise. The **enforced** limits
+  are the file and folder ones in this section; function length is a review
+  guideline until the migration is complete.
 - **KISS/DRY/SOLID**: when a module is migrated, actively remove
   now-dead fallback paths and duplicated logic rather than carrying them
   into the new layout unchanged. Example done during tooling setup: a dead
@@ -169,18 +174,26 @@ src/net/
     handshake/
       mod.rs              — RBX_* consts, send_raw, strip_incoming,
                             open_handshake_box, parse_reply2_crypto, local_addr_for
-      connect.rs          — RakClient::connect (the whole offline+connected
-                            handshake state machine — 564 lines, see exception below)
-      reply.rs            — offline_roundtrip, probe_reachability, wait_readable,
-                            parse_reply1/2, handle_accepted (354 lines)
       build.rs            — build_ocr2, netstack_probe, hex_head
       tests.rs            — rbx_ocr2_layout + the tag-mirroring send_raw tests
+      connect/
+        mod.rs            — RakClient::connect, phase orchestration
+        setup.rs          — resolve+bind, GUID/tag, phase-0 envelope pinning
+        offline.rs        — OCR1/OCR2 matrices, crypto-OCR2, sala fallback
+        session.rs        — CONNECTION_REQUEST/ACCEPTED, classification, hand-off
+      reply/
+        mod.rs            — offline_roundtrip (handshake-visible)
+        probe.rs          — probe_reachability, wait_readable
+        accepted.rs       — parse_reply1/2, handle_accepted
     wire/
       mod.rs              — Reader, Frame, put_u24, frame_encoded_len, address codecs
       tests.rs            — Frame + address round-trip tests
-      reliability.rs      — ACK/NACK, send window, split reassembly, tick/poll
-                            (487 lines, see exception below)
-      reliability/tests.rs — ack_encoding
+      reliability/
+        mod.rs            — docs, consts, is_reliable/is_ordered, send_reliable*
+        send.rs           — send_frame (split/single), flush, send_datagram/sealed
+        recv.rs           — poll, ingest, handle_packet/frames, deliver, route
+        ack.rs            — tick, handle_control/ack, send_acks, reassemble
+        tests.rs          — ack_encoding
   udmux/                  — DONE
     mod.rs                — proxy table, is_private/proxy_for
     envelope.rs           — Envelope, RUPP frame/parse, envelope_candidates
@@ -210,18 +223,12 @@ destructure it positionally; turning it into a named struct is still open,
 just no longer blocked on a pending migration — it is pure follow-up
 cleanup now that both sides are in the same subsystem.
 
-**Line-budget exceptions from the `raknet` migration** (all pre-existing
-logic, moved verbatim — not new complexity introduced by the split):
-- `handshake/connect.rs` (564 lines): `RakClient::connect` is one
-  sequential state machine (envelope pinning -> OCR1/REPLY_1 ->
-  OCR2/REPLY_2 -> CONNECTION_REQUEST/ACCEPTED) where each phase's output
-  feeds the next; splitting it into helper methods would scatter the
-  actual control flow across files without reducing real complexity.
-- `handshake/reply.rs` (354 lines) and `wire/reliability.rs` (487 lines):
-  both are a few lines over, holding a tightly-related group of methods
-  (the offline request/reply loop; the full send/resend/ACK/reassembly
-  path) that splitting further would fragment into oddly-small pieces for
-  little clarity gain. Revisit if either grows further.
+**Line-budget exceptions from the `raknet` migration**: resolved. The
+previous `handshake/connect.rs` (564), `handshake/reply.rs` (354) and
+`wire/reliability.rs` (487) are now `connect/{mod,setup,offline,session}`,
+`reply/{mod,probe,accepted}` and `reliability/{mod,send,recv,ack}` — the
+control flow stayed sequential per phase, so the phases became files rather
+than helper methods scattered across them. No exception remains in `net/`.
 
 Two methods also picked up `pub(crate)` or `pub(in crate::net::raknet)`
 visibility (`send_raw`, `strip_incoming`, `RakClient::out_queue`) solely so

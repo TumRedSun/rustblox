@@ -54,8 +54,8 @@ impl ReplicationParser {
 					}
 				}
 				3 => {
-					if chunk.len() >= 8 {
-						let r = i64::from_le_bytes(chunk[0..8].try_into().unwrap());
+					if let Some(bytes) = chunk.get(0..8).and_then(|b| <[u8; 8]>::try_from(b).ok()) {
+						let r = i64::from_le_bytes(bytes);
 						dm.remove(r);
 						events.push(RepEvent::InstanceRemoved { r });
 						self.decoded += 1;
