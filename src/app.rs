@@ -169,6 +169,10 @@ pub struct App {
 	pub start_instant: Instant,
 	/// True while validating a saved session at startup.
 	pub restoring: bool,
+	/// Pending headless auto-join (`RUSTBLOX_AUTOJOIN`): the session restore
+	/// arrives asynchronously and would otherwise replace the game screen
+	/// with the menu right after startup.
+	pending_autojoin: Option<(u64, u64)>,
 	/// True while the login screen is open for "add another account" (the
 	/// running menu is parked in `suspended_menu`).
 	pub adding_account: bool,
@@ -210,6 +214,7 @@ impl App {
 			clipboard: None,
 			start_instant: Instant::now(),
 			restoring: has_saved_session,
+			pending_autojoin: None,
 			adding_account: false,
 			suspended_menu: None,
 		}
@@ -386,6 +391,14 @@ impl App {
 							"server: {}  job: {}…",
 							st.server,
 							st.job_id.chars().take(8).collect::<String>()
+						),
+						13.0 * s,
+					),
+					(
+						format!(
+							"replication: {} packets  ({})",
+							st.replication,
+							if st.repl_heads.is_empty() { "waiting…" } else { &st.repl_heads }
 						),
 						13.0 * s,
 					),
@@ -1152,6 +1165,11 @@ impl App {
 		self.send_command(Command::StartRefresh);
 		self.send_command(Command::SearchPlaces { query: String::new() });
 		self.request_redraw();
+		// Headless capture: start the join the caller asked for at startup,
+		// now that the restored session owns the screen.
+		if let Some((place, user_id)) = self.pending_autojoin.take() {
+			self.enter_game_joining(place, user_id);
+		}
 	}
 
 	fn enter_login(&mut self, status: Option<(StatusKind, String)>) {
@@ -1178,6 +1196,14 @@ impl App {
 		self.focus = None;
 		self.send_command(Command::JoinPlace { place_id });
 		self.request_redraw();
+	}
+
+	/// Start a join without any UI input — used by the headless capture
+	/// (`RUSTBLOX_AUTOJOIN=<placeId>`) so a live in-game frame can be
+	/// screenshotted in CI or by a reviewer.
+	pub fn auto_join(&mut self, place_id: u64, user_id: u64) {
+		self.pending_autojoin = Some((place_id, user_id));
+		self.enter_game_joining(place_id, user_id);
 	}
 
 	/// Attach a successfully joined session (from GameEvent::Joined).

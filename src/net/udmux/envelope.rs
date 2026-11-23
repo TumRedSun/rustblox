@@ -54,7 +54,12 @@ use super::token::b64_decode;
 use std::net::Ipv4Addr;
 
 pub const RUPP_FLAG: u8 = 0x01;
-pub const RUPP_SUBFLAGS: [u8; 3] = [0x01, 0x11, 0x02];
+/// TLV-1 header: type 0x01, length 0x11, then the TOKEN TYPE byte. Live
+/// byte check (Nov 2026, `raknet27/29/35/37` + the Android client): every
+/// client datagram carries `01 11 01`, and the standalone client only draws
+/// REPLY_1/REPLY_2 with this exact shape. An earlier reading of 0x02 came
+/// from a stale 8-datagram dump; 0x02 stays as an OCR1 probe variant only.
+pub const RUPP_SUBFLAGS: [u8; 3] = [0x01, 0x11, 0x01];
 
 /// A datagram wrapper candidate: either the raw legacy shape
 /// (`direction == 0`, nothing prepended) or a RUPP envelope header.
@@ -63,9 +68,9 @@ pub struct Envelope {
 	pub label: &'static str,
 	/// 0 = send raw (no envelope); otherwise the header length 0x17 or 0x1f.
 	pub direction: u8,
-	/// TokenTlv token-type byte (byte[6]): 0x02 on every datagram the live
-	/// client sent (34k-datagram pcap, both game flows, both directions).
-	/// 0x01 is kept as an OCR1-matrix variant.
+	/// TokenTlv token-type byte (byte[6]): 0x01 on every datagram the live
+	/// Android client and the working standalone client sent (both game
+	/// flows, both directions). 0x02 is kept only as an OCR1-matrix variant.
 	pub cls: u8,
 	pub epoch: [u8; 16],
 	pub mux: [u8; 8],
@@ -75,20 +80,19 @@ pub struct Envelope {
 pub const BARE: Envelope =
 	Envelope { label: "bare", direction: 0, cls: 0x02, epoch: [0u8; 16], mux: [0u8; 8] };
 
-/// The client envelope: header length 0x1f, token type 0x02, and the private
+/// The client envelope: header length 0x1f, token type 0x01, and the private
 /// RCC `ip:port` from the join script riding in the mux field as
 /// `02 06 <ip4> <port BE16>`. The proxy routes on that embedded address and
-/// gates on the TokenTlv — the type-0x01 + random-tag shape the old builds
-/// pinned is what the RCC silently dropped (total OCR1 silence, not even an
-/// incompatible-protocol error, while the leaked server handler proves it
-/// would have answered a datagram that reached it).
+/// gates on the TokenTlv. Verified live Nov 2026: the Android client and the
+/// standalone client send exactly this shape, and the gateway answers only
+/// for a valid token AND the correct private RCC address.
 pub fn client_envelope(label_tag: &[u8; 16], rcc: (Ipv4Addr, u16)) -> Envelope {
 	let mut mux = [0u8; 8];
 	mux[0] = 0x02;
 	mux[1] = 0x06;
 	mux[2..6].copy_from_slice(&rcc.0.octets());
 	mux[6..8].copy_from_slice(&rcc.1.to_be_bytes());
-	Envelope { label: "client-2026", direction: 0x1f, cls: 0x02, epoch: *label_tag, mux }
+	Envelope { label: "client-2026", direction: 0x1f, cls: 0x01, epoch: *label_tag, mux }
 }
 
 /// The session token as a 16-byte tag: `TokenValue` is base64 and its first
@@ -164,7 +168,7 @@ pub fn envelope_candidates(token: &str, pepper: u64) -> Vec<Envelope> {
 	let dec = b64_decode(token);
 	let pe = (pepper as u32).to_le_bytes();
 	let mut push = |label: &'static str, direction: u8, epoch: [u8; 16], mux: [u8; 8]| {
-		out.push(Envelope { label, direction, cls: 0x02, epoch, mux });
+		out.push(Envelope { label, direction, cls: 0x01, epoch, mux });
 	};
 
 	if dec.len() >= 16 {

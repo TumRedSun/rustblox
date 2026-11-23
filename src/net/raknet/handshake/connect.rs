@@ -366,9 +366,12 @@ impl RakClient {
 		// or wrong one draws total silence. The sala matrix stays as the
 		// fallback for sessions without (or failing) early material.
 		let mut crypto_reply2 = false;
+		let rcc_port = rcc.map(|(_, p)| p).unwrap_or(port);
 		if c.early.is_some() {
-			let early_body =
-				c.early.as_mut().and_then(|ec| ec.build_ocr2(c.mtu).map(|(_, body)| body));
+			let early_body = c
+				.early
+				.as_mut()
+				.and_then(|ec| ec.build_ocr2(c.mtu, rcc_port).map(|(_, body)| body));
 			if let Some(mut body) = early_body {
 				let hlen = env_for_pad.map(|e| e.direction as usize).unwrap_or(0);
 				body.resize(RBX_OFFLINE_PROBE.saturating_sub(hlen), 0x00);
@@ -457,25 +460,48 @@ impl RakClient {
 			if Instant::now() >= deadline {
 				return Err(RakError::TimedOut("connection request"));
 			}
-			let mut out = Vec::with_capacity(64);
-			out.push(ID_CONNECTION_REQUEST);
-			out.extend_from_slice(&c.guid.to_be_bytes());
-			let t = std::time::SystemTime::now()
-				.duration_since(std::time::UNIX_EPOCH)
-				.unwrap_or_default()
-				.as_millis() as u64;
-			out.extend_from_slice(&t.to_be_bytes());
-			out.push(0); // useSecurity = false
-						 // The fork checks this 6-byte password (Sala Packet09:
-						 // DefaultPasswordBytes) — without it the RCC refuses silently.
-			out.extend_from_slice(&RBX_PASSWORD);
 			let wire: Vec<u8> = match c.early.as_mut() {
 				Some(ec) => {
+					// The fork's first steady frame is the 34-byte
+					// CONNECTION_REQUEST the capture carries (raknet27 rec
+					// 257 / raknet29 rec 256, decrypted and confirmed live):
+					//   81 00 00 00 40 00 c0 00 00 00 09
+					//   | session id(8) | 00*6 | fd fc | 00 | password(6)
+					// The session id is the one announced in pt93[8:16].
+					let mut out = Vec::with_capacity(34);
+					out.extend_from_slice(&[
+						0x81, 0x00, 0x00, 0x00, 0x40, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x09,
+					]);
+					out.extend_from_slice(&ec.session_id);
+					out.extend_from_slice(&[0u8; 6]);
+					out.extend_from_slice(&[0xfd, 0xfc]);
+					out.push(0);
+					out.extend_from_slice(&RBX_PASSWORD);
 					let boxed = ec.seal_counter(&out);
-					netlog!(net, "CONNECTION_REQUEST boxed (pt {} + 18 overhead = {} bytes, counter hint {})", out.len(), boxed.len(), boxed[boxed.len()-18..boxed.len()-16].iter().map(|b| format!("{:02x}", b)).collect::<String>());
+					netlog!(
+						net,
+						"CONNECTION_REQUEST (steady) boxed: pt {} + 18 = {} bytes, hint {}",
+						out.len(),
+						boxed.len(),
+						hex_head(&boxed[boxed.len() - 18..boxed.len() - 16], 2)
+					);
 					boxed
 				}
-				None => out,
+				None => {
+					let mut out = Vec::with_capacity(64);
+					out.push(ID_CONNECTION_REQUEST);
+					out.extend_from_slice(&c.guid.to_be_bytes());
+					let t = std::time::SystemTime::now()
+						.duration_since(std::time::UNIX_EPOCH)
+						.unwrap_or_default()
+						.as_millis() as u64;
+					out.extend_from_slice(&t.to_be_bytes());
+					out.push(0); // useSecurity = false
+								 // The fork checks this 6-byte password (Sala Packet09:
+								 // DefaultPasswordBytes) — without it the RCC refuses silently.
+					out.extend_from_slice(&RBX_PASSWORD);
+					out
+				}
 			};
 			if let Err(e) = c.send_raw(&wire) {
 				netlog!(net, "CONNECTION_REQUEST send failed: {}", e);
@@ -525,6 +551,24 @@ impl RakClient {
 					}
 					Some((&ID_CONNECTION_BANNED, _)) => return Err(RakError::Banned),
 					Some((&ID_ALREADY_CONNECTED, _)) => return Err(RakError::AlreadyConnected),
+					// The fork's steady plaintext is a RakNet *datagram*
+					// (`0x80 | count`, then frames) — the ACCEPTED message
+					// rides inside one of them, not at byte 0. Once the
+					// server sends any steady datagram beyond bare ACKs
+					// (0xC0/0xA0/0xD0), it has accepted the boxed request;
+					// this is the same evidence the standalone reference
+					// client uses (live-verified 24 Nov).
+					Some((&first, _))
+						if first & 0x80 != 0 && !matches!(first, 0xc0 | 0xa0 | 0xd0) =>
+					{
+						netlog!(
+							net,
+							"steady datagram 0x{:02x} ({} bytes) received — session accepted",
+							first,
+							payload.len()
+						);
+						break;
+					}
 					Some((&other, _)) => netlog!(net, "got id 0x{:02x} while connecting", other),
 					None => netlog!(net, "ignoring empty datagram during handshake"),
 				}

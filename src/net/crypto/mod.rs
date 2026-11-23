@@ -16,20 +16,20 @@
 //!   auth_ver comes from ClientTicket part4 ("18" -> 0x12); the declared
 //!   `00 5d` (93) is the PT length.
 //!
-//!   pt93 = const(8) + urandom(8) + mtu BE16 (from REPLY_1) + 0x02 +
-//!   urandom(74) — the tail is session entropy the server does not
-//!   verify (a random 74-byte tail was accepted live).
+//!   pt93 = const(8) + session id(8) + mtu BE16 + `02 04 7f 8b` +
+//!   random(2) + RCC port BE16 + `42 06` + random(65); the server does
+//!   not verify the caps tail (accepted live).
 //!
-//! OpenReply2 (server -> client, body 135):
-//!   7d | MAGIC16 | 01 2c 00 3a | server_pub(32) @21 | box(54) @53..107
-//!   | "UniqueNumber" @107 | 16B tail. The header is 4 bytes — verified
-//!   on 2 fresh live replies + the engine's (no trailing 0x03).
+//! OpenReply2 (server -> client, body 135, LIVE-VERIFIED 24 Nov):
+//!   7d | MAGIC16 | 01 2c 00 3a | clear23 @21 | ct(63) |
+//!   "UniqueNumber" | tag(16).  The clear23 is the first 23 bytes of the
+//!   SESSDER#2 peer; the remaining 9 ride as the leading plaintext of the
+//!   box, opened with SESSDER#1 out1 over AAD = body[0..44].
 //!
-//! post-reply2 datagram (client -> server, 52 total):
-//!   envelope(31) | nonce(12) | ct(24) | tag(16)   <- plaintext = the
-//!   vanilla 24-byte CONNECTION_REQUEST, so the AEAD overhead is exactly
-//!   nonce(12)+tag(16) = 28 (the libroblox preauth-window code computes the
-//!   same `payload + 0x1c` expected size).
+//! steady datagram (client -> server, 83 total):
+//!   envelope(31) | ct(34) | hint(2) | tag(16)   <- AES-256-GCM over the
+//!   fork's 34-byte CONNECTION_REQUEST; nonce `LE64(0x754e657571696e55 +
+//!   counter) || "mbeR"`.
 //! ```
 //!
 //! Key schedule (libsodium `crypto_kx` semantics):
@@ -93,12 +93,15 @@ pub const REPLY2_BOX: u8 = 0x3a; // 58 (declared)
 pub const OCR2_PUB: usize = 32;
 pub const OCR2_PA_LEN: usize = 33; // the wire carries 0x21 = 33
 pub const OCR2_CT_LEN: usize = 93; // ct rides first: aad(90) + ct(93)
-/// pt93 layout (decrypted from 2 engine sessions, 2026-11-16/17):
-/// `[0:8]=PT93_CONST  [8:16]=urandom(8)  [16:18]=mtu BE16  [18]=0x02
-/// [19:93]=urandom(74)`.
+/// pt93 layout (decrypted from 3 live engine sessions + re-verified 24 Nov):
+/// `[0:8]=PT93_CONST  [8:16]=session id (8 random)  [16:18]=mtu BE16
+///  [18:20]=02 04  [20:22]=7f 8b  [22:24]=random  [24:26]=RCC port BE16
+///  [26:93]=caps payload (starts `42 06`, 67B; the server does not verify it)`.
 pub const OCR2_PT_LEN: usize = 93;
-/// pt93 [0:8] — constant across engine sessions (2026-11-16).
-pub const PT93_CONST: [u8; 8] = [0x00, 0x0d, 0xdb, 0xc7, 0x50, 0xb3, 0x08, 0x92];
+/// pt93 [0:8] — constant across every engine session (Nov 2026), and the
+/// value the accepted standalone client sends. (`120ddbc750b31896`, seen in
+/// `NetStackConfig.caps`, is the negotiated server mask.)
+pub const PT93_CONST: [u8; 8] = [0x10, 0x0d, 0xdb, 0xc7, 0x50, 0xb3, 0x08, 0x96];
 pub const UNIQUE_NAME: &[u8; 12] = b"UniqueNumber";
 pub const UNIQUE_LEN: usize = 16;
 pub const CONNECTION_REQUEST_PT: usize = 24; // id+guid8+time8+useSec1+password6
@@ -205,6 +208,9 @@ pub struct EarlyCrypto {
 	pub auth_ver: u8,
 	/// The client's 16-byte UniqueNumber value.
 	pub unique: [u8; 16],
+	/// The per-connection id announced in pt93[8:16] and echoed in the
+	/// first steady CONNECTION_REQUEST (11..19).
+	pub session_id: [u8; 8],
 	/// Post-OpenReply2 nonce counter base (`RUSTBLOX_NONCE_BASE`). The dump's
 	/// session starts at 0x6e55 on both sides — the base rides inside
 	/// encrypted setup material; default 0 until it is decoded.
@@ -255,7 +261,9 @@ impl EarlyCrypto {
 		let nonce_base = std::env::var("RUSTBLOX_NONCE_BASE")
 			.ok()
 			.and_then(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
-			.unwrap_or(0);
+			.unwrap_or(counter::STEADY_BASE);
+		let mut session_id = [0u8; 8];
+		session_id.copy_from_slice(&random_bytes(8));
 		EarlyCrypto {
 			server_ephemeral,
 			client_sk,
@@ -267,6 +275,7 @@ impl EarlyCrypto {
 			pa_blob,
 			auth_ver,
 			unique,
+			session_id,
 			nonce_base,
 			send_counter: 0,
 		}

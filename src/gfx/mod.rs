@@ -214,6 +214,11 @@ impl Gfx {
 
 		let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
 			label: Some("rustblox-device"),
+			// Request what the adapter advertises: the GL fallback (software
+			// llvmpipe on CI/Xvfb) validates internal normalised texture views
+			// against TEXTURE_FORMAT_16BIT_NORM, and a missing feature turns
+			// every frame into "TextureView is invalid".
+			required_features: adapter.features(),
 			..Default::default()
 		}))
 		.expect("request wgpu device");

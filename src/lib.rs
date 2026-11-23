@@ -75,6 +75,15 @@ pub fn run_with(event_loop: winit::event_loop::EventLoop<UserEvent>, session: Op
 	let proxy = event_loop.create_proxy();
 	let worker = worker::spawn(proxy, session.clone());
 	let mut app = app::App::new(worker.tx, session.is_some());
+	// Headless capture / CI: RUSTBLOX_AUTOJOIN=<placeId> starts the join as
+	// soon as the app is up, so a reviewer can screenshot the live game view
+	// without touching the UI.
+	if let Ok(pid) = std::env::var("RUSTBLOX_AUTOJOIN") {
+		if let Ok(place) = pid.trim().parse::<u64>() {
+			let user_id = session.as_ref().map(|s| s.user_id).unwrap_or(0);
+			app.auto_join(place, user_id);
+		}
+	}
 	if let Err(e) = event_loop.run_app(&mut app) {
 		eprintln!("rustblox: event loop error: {e}");
 		std::process::exit(1);

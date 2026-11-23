@@ -101,7 +101,7 @@ fn connected_send_mirrors_the_rotating_server_tag() {
 fn connecting_send_keeps_the_client_tag() {
 	// Until ACCEPTED the client still frames its datagrams with ITS OWN
 	// tag — mirroring starts only in the connected phase. The token-type
-	// byte is 0x02 (34k pcap: 100% of the captured client datagrams).
+	// byte is 0x01 (live Android client + the working standalone client).
 	let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
 	peer.set_nonblocking(true).unwrap();
 	let mut c = test_client(RakState::Connecting, Some([9u8; 16]));
@@ -112,7 +112,7 @@ fn connecting_send_keeps_the_client_tag() {
 	assert_eq!(
 		&b[..31],
 		&[
-			0x01, 0x00, 0x00, 0x1f, 0x01, 0x11, 0x02, // token type 0x02
+			0x01, 0x00, 0x00, 0x1f, 0x01, 0x11, 0x01, // token type 0x01
 			7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, // client tag
 			0x02, 0x06, 10, 206, 18, 67, 0xc0, 0x63,
 		][..]

@@ -128,45 +128,18 @@ impl crate::net::raknet::RakClient {
 		self.early.as_ref()?.open_counter(body).map(|(pt, _)| pt)
 	}
 
-	/// Parse the crypto OpenReply2 (`7d | magic | 01 2c 00 3a 03 |
-	/// server_pub(32) | box | "UniqueNumber" | unique(16)`), adopt the
-	/// session keys, and report the wire facts in the log. Returns the
-	/// current (guid, mtu) so the crypto path plugs into the legacy
-	/// phase-2 result tuple.
+	/// Parse the crypto OpenReply2, open its box with the early server->client
+	/// key, adopt the recovered SESSDER#2 peer and report the wire facts.
+	/// Returns the current (guid, mtu) so the crypto path plugs into the
+	/// legacy phase-2 result tuple.
 	fn parse_reply2_crypto(&mut self, payload: &[u8]) -> Option<(u64, u16)> {
-		let fields = crate::net::crypto::EarlyCrypto::parse_reply2(payload)?;
-		let (server_pub, box_wire, unique) = (fields.server_pub, fields.box_wire, fields.unique);
-		let ec = self.early.as_mut()?;
-		ec.adopt_reply2_key(server_pub);
+		let seed2 = self.early.as_ref()?.reply2_seed2(payload)?;
 		netlog!(
 			net,
-			"crypto OpenReply2: server_pub {} box {} bytes unique {} (hdr 01 2c 00 3a)",
-			hex_head(&server_pub, 32),
-			box_wire.len(),
-			hex_head(&unique, 16)
+			"crypto OpenReply2: seed2 {} (23 clear bytes + 9 from the opened box)",
+			hex_head(&seed2, 32)
 		);
-		// Diagnostic: the reply2 box is nonce-on-the-wire (the dump's first
-		// 12 bytes look random, unlike the sequential counter hints after it).
-		// Try the nonce-on-wire open with an empty AAD and the reply's own
-		// RakNet prefix as the AAD.
-		let mut aads: Vec<Vec<u8>> = vec![Vec::new()];
-		if payload.len() > 54 {
-			aads.push(payload[..54].to_vec());
-		}
-		let mut opened = false;
-		if let Some(sk) = ec.session_rx {
-			if crate::net::crypto::open(&sk, box_wire, &[&aads[0], &aads[1]]).is_some() {
-				opened = true;
-			}
-		}
-		if !opened && crate::net::crypto::open(&ec.rx, box_wire, &[&aads[0], &aads[1]]).is_some() {
-			opened = true;
-		}
-		netlog!(
-            net,
-            "crypto OpenReply2 box {} (no key matched — content stays opaque until a live session validates the schedule)",
-            if opened { "OPENED" } else { "not opened" }
-        );
+		self.early.as_mut()?.adopt_reply2_key(seed2);
 		Some((self.server_guid, self.mtu))
 	}
 

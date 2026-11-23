@@ -38,6 +38,12 @@ pub struct GameState {
 	pub packets: u64,
 	pub decoded: u64,
 	pub skipped: u64,
+	/// Real fork replication packets (`0x83..`/`0x8d..`) delivered by the
+	/// server (the transport decodes the RakNet framing; the payload layer is
+	/// still being reverse-engineered).
+	pub replication: u64,
+	/// "83/07×12 8d/01×3" — the head histogram, top entries first.
+	pub repl_heads: String,
 	pub instances: usize,
 	pub players: usize,
 	pub world: DataModel,
@@ -62,6 +68,8 @@ impl GameSession {
 			packets: 0,
 			decoded: 0,
 			skipped: 0,
+			replication: 0,
+			repl_heads: String::new(),
 			instances: 0,
 			players: 0,
 			world: DataModel::new(),
@@ -333,6 +341,18 @@ fn game_thread(
 			let mut st = lock_state(&state);
 			st.ping_ms = ping;
 			st.skipped = parser().skipped;
+			st.replication = parser().replication;
+			if st.replication > 0 && st.repl_heads.is_empty() {
+				let mut heads: Vec<(u16, u64)> =
+					parser().heads.iter().map(|(k, v)| (*k, *v)).collect();
+				heads.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+				st.repl_heads = heads
+					.iter()
+					.take(4)
+					.map(|(h, n)| format!("{:02x}/{:02x}x{}", h >> 8, h & 0xff, n))
+					.collect::<Vec<_>>()
+					.join(" ");
+			}
 		}
 		if client.state == RakState::Disconnected {
 			let mut st = lock_state(&state);

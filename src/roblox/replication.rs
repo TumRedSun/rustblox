@@ -44,13 +44,26 @@ pub struct ReplicationParser {
 	pub decoded: u64,
 	/// Chunks we had to skip.
 	pub skipped: u64,
+	/// Real fork replication packets (`0x83..`/`0x8d..` heads) delivered by
+	/// the transport but not yet decoded: the payload layer below the head
+	/// is still being reverse-engineered.
+	pub replication: u64,
+	/// Per-head counts of those packets, keyed by the two-byte head.
+	pub heads: std::collections::BTreeMap<u16, u64>,
 	/// How many hexdumps we already logged (limit the flood).
 	pub hexdumps: u32,
 }
 
 impl ReplicationParser {
 	pub fn new() -> ReplicationParser {
-		ReplicationParser { packets: 0, decoded: 0, skipped: 0, hexdumps: 0 }
+		ReplicationParser {
+			packets: 0,
+			decoded: 0,
+			skipped: 0,
+			replication: 0,
+			heads: std::collections::BTreeMap::new(),
+			hexdumps: 0,
+		}
 	}
 
 	/// Feed one application payload (after RakNet deframing). Returns events.
@@ -71,6 +84,26 @@ impl ReplicationParser {
 			return;
 		}
 		self.packets += 1;
+		// The fork's post-handshake stream is NOT the legacy u32-header form:
+		// real messages start with a two-byte head (`83 xx` = data clusters,
+		// `8d xx` = compressed/stream variant). Treating those four bytes as
+		// `u32 LE` set the "compressed" bit from the head and sent the parser
+		// down a zlib path that cannot work. Count and surface them instead
+		// until the payload layer is decoded.
+		if matches!(payload[0], 0x83 | 0x8d) {
+			self.replication += 1;
+			let head = u16::from_be_bytes([payload[0], payload[1]]);
+			*self.heads.entry(head).or_insert(0) += 1;
+			if self.hexdumps < 24 {
+				self.hexdumps += 1;
+				self.log_hex(
+					&format!("replication head {:02x}{:02x} (undecoded)", payload[0], payload[1]),
+					payload,
+				);
+			}
+			events.push(RepEvent::Unknown { packet_type: u32::from(head), len: payload.len() });
+			return;
+		}
 		let header = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
 		let ptype = header & 0x0f;
 		let compressed = header & 0x8000_0000 != 0;

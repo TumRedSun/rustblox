@@ -130,15 +130,30 @@ fn main() {
 		std::thread::sleep(Duration::from_millis(5));
 	}
 	println!(
-        "      12s diagnostics: raknet state={:?} ping={:?} packets={} decoded={} skipped={} events={} instances={}",
+        "      12s diagnostics: raknet state={:?} ping={:?} packets={} decoded={} skipped={} replication={} events={} instances={}",
         rak.state,
         rak.ping_ms.map(|p| format!("{:.0}ms", p)),
         parser.packets,
         parser.decoded,
         parser.skipped,
+        parser.replication,
         events_total,
         dm.len()
     );
+	// Which replication heads the server actually sends (top 6).
+	let mut heads: Vec<(u16, u64)> = parser.heads.iter().map(|(k, v)| (*k, *v)).collect();
+	heads.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+	if !heads.is_empty() {
+		println!(
+			"      replication heads: {}",
+			heads
+				.iter()
+				.take(6)
+				.map(|(h, n)| format!("{:02x}{:02x}×{}", h >> 8, h & 0xff, n))
+				.collect::<Vec<_>>()
+				.join(" ")
+		);
+	}
 	if rak.state == RakState::Connected {
 		rak.close();
 	}
