@@ -86,6 +86,9 @@ pub struct DataModel {
 	pub version: u64,
 	/// Camera CFrame last reported by the server.
 	pub camera_cframe: Option<([f32; 3], [f32; 9])>,
+	/// Readable strings harvested from the replication stream (class and
+	/// property names from the schema dictionary, part names, usernames).
+	pub strings: std::collections::BTreeSet<String>,
 }
 
 impl DataModel {
@@ -469,6 +472,55 @@ pub fn build_r6_rig(
 /// Parse a quaternion (x,y,z,w) into a column-major 3x3.
 pub fn quat_rot(x: f32, y: f32, z: f32, w: f32) -> [f32; 9] {
 	quat_to_mat3([x, y, z, w])
+}
+
+/// Fallback ground so the view is always a recognizable place: a
+/// Roblox-style green baseplate with a 32-stud grid, a spawn pad and a few
+/// landmark blocks. The replicated world draws on top of it.
+pub fn build_ground(scene: &mut SceneView) {
+	const ID: [f32; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+	let mut push = |pos: Vec3, size: Vec3, color: [f32; 3]| {
+		scene.parts.push(ScenePart {
+			pos,
+			size,
+			rot: ID,
+			color: [color[0], color[1], color[2], 1.0],
+			roughness: 0.95,
+			emissive: 0.0,
+			cast_shadow: false,
+		});
+	};
+	let grass = [0.40, 0.56, 0.32];
+	let line = [0.32, 0.46, 0.26];
+	// Baseplate.
+	push([0.0, -0.5, 0.0], [2048.0, 1.0, 2048.0], grass);
+	// Grid every 32 studs, just above the surface.
+	let step = 32.0f32;
+	let half = 512.0f32;
+	let mut x = -half;
+	while x <= half {
+		push([x, 0.02, 0.0], [0.40, 0.06, half * 2.0], line);
+		x += step;
+	}
+	let mut z = -half;
+	while z <= half {
+		push([0.0, 0.02, z], [half * 2.0, 0.06, 0.40], line);
+		z += step;
+	}
+	// Spawn pad.
+	push([0.0, 0.08, 0.0], [24.0, 0.2, 24.0], [0.56, 0.66, 0.44]);
+	// Landmarks: coloured blocks + a tower, so walking/gravity is visible.
+	let marks: [(f32, f32, f32, [f32; 3]); 6] = [
+		(-64.0, 0.0, 6.0, [0.75, 0.28, 0.24]),
+		(64.0, 0.0, 8.0, [0.24, 0.42, 0.78]),
+		(0.0, -64.0, 5.0, [0.80, 0.66, 0.24]),
+		(0.0, 64.0, 5.0, [0.42, 0.68, 0.30]),
+		(-96.0, 96.0, 26.0, [0.55, 0.55, 0.60]),
+		(96.0, -96.0, 3.0, [0.85, 0.45, 0.15]),
+	];
+	for (mx, mz, h, col) in marks {
+		push([mx, h * 0.5, mz], [12.0, h, 12.0], col);
+	}
 }
 
 #[cfg(test)]

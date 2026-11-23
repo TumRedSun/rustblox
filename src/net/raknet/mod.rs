@@ -20,6 +20,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 pub mod handshake;
+pub mod system;
 pub mod wire;
 
 pub use handshake::netstack_probe;
@@ -27,7 +28,7 @@ pub use handshake::netstack_probe;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
 use std::time::Instant;
-use wire::{Frame, OutFrame};
+use wire::OutFrame;
 
 // ---------------------------------------------------------------------------
 // Message IDs (RakNet MessageIdentifiers.h)
@@ -143,19 +144,37 @@ pub struct RakClient {
 	/// Offline-id generation that answered phase 1.
 	pub(super) fork: ForkGen,
 
+	// Connected-phase system bookkeeping (see [`system`]): the fork's
+	// steady stream interleaves RakNet-level messages with application data
+	// and the server wants them answered before it starts replicating.
+	/// When this client started — the base of the 8-byte microsecond clock
+	/// every system message carries.
+	pub(super) started: Instant,
+	/// Milliseconds announced in the steady CONNECTION_REQUEST (the ACK
+	/// echoes it back).
+	pub(super) request_ms: u64,
+	/// Newest server millisecond timestamp seen on the wire.
+	pub(super) server_ms: u64,
+	/// Parsed `ID_CONNECTION_REQUEST_ACCEPTED` of the steady stream.
+	pub(super) accepted: Option<system::Accepted>,
+	/// Whether `ID_NEW_INCOMING_CONNECTION` was already answered.
+	pub(super) announced: bool,
+
 	// Send side
 	pub(super) reliability_index: u32,
 	pub(super) order_index: u32,
 	pub(super) datagram_seq: u32,
 	pub(super) split_id: u16,
 	pub(in crate::net::raknet) out_queue: HashMap<u32, OutFrame>,
+	/// Datagram seq -> reliable message numbers it carried (ACK routing).
+	pub(in crate::net::raknet) sent_msgs: HashMap<u32, Vec<u32>>,
 	pub(super) frame_buf: Vec<u8>, // frames awaiting a datagram flush
 
 	// Receive side
 	pub(super) received_datagrams: HashSet<u32>,
 	pub(super) ack_buffer: Vec<u32>,
 	pub(super) delivered_ordered: u32,
-	pub(super) ordered_hold: HashMap<u32, Frame>,
+	pub(super) ordered_hold: HashMap<u32, Vec<u8>>,
 	pub(super) splits: HashMap<u16, SplitState>,
 
 	// Assembled application payloads waiting to be returned by poll().

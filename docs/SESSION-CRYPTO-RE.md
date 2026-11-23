@@ -505,89 +505,129 @@ Invariants that must not regress:
 Artifacts (not in the repo): hooks, pcaps, analysis and the capture logs live
 under `/storage/rblx_debug/session-crypto/`.
 
-## Post-connect replication layer — framing solved, payload layer open
+## Connected-phase RakNet system messages — solved (the "silent server" bug)
 
-Decrypting all 14 732 steady datagrams of the v29 capture gave the complete
-transport framing (verified: **12 407 / 12 432** data datagrams parse
-exactly, 17 432 frames):
+After the steady `CONNECTION_REQUEST` the server does **not** start
+replicating: it walks the client through the connected RakNet handshake, and
+every message of it rides as an ordinary frame payload inside the steady
+datagram stream (byte-mapped from `raknet29.pcap`; `analysis/gamejoin_frames.py`
+prints the exact offsets):
 
 ```text
-datagram = 0x80 | (0x10 << split?) | count   (1 byte; count is only a hint)
-           u24 sequence
-           frame*
-frame    = flags(u8)            bits 7..5 = reliability (0 none … 7 ordered)
-           u16 BE               bit 15 = reliable, bits 14..0 = length in BITS
-           [u24 reliable seq]   reliability 2/3/4/6/7
-           [u24 seq index]      reliability 1/4
-           [u24 order + u8 ch]  reliability 1/3/4/7
-           [10 split bytes]     flags & 0x10
-           payload              ceil(bits/8) bytes
+id  layout                                                         size
+0x10 ACCEPTED      peer addr | sysIndex u16 | 10 addr slots |
+                   request_ms u64 | server_ms u64 | server_us u64     104
+0x13 NEW_INCOMING  peer addr | 10 addr slots | server_ms u64 |
+                   client_ms u64 | client_us u64                      102
+0x00 ping          client_ms u64                                 9 / 1160
+0x03 pong          peer_ms u64 | own_ms u64 | own_us u64          25 / ping
+0x51..0x53 sync    own_ms u64                                          9
+0x54..0x56 ack     peer_ms u64 | own_ms u64 | own_us u64              25
+0x15/0x16          disconnect / connection-lost (framed, not bare)     5
 ```
 
-The frames are self-describing, so a parser should walk to the end of the
-datagram rather than trust the count. Acknowledgement datagrams carry bit 6
-(`0xC0` ACK, `0xA0` NAK, `0xD0` ack-container) and no frames.
+Addresses are the fork's XOR block (`family 4 | ip^0xFF | port BE`); the
+trailing 8-byte value is a **microsecond** monotonic clock, while the echoed
+fields are milliseconds (big-endian). Ids below `0x80` are system, everything
+with bit 7 set is application data — a clean discriminator.
 
-Application messages (after deframing) start with a two-byte head; measured
-distribution over the capture:
+Four client-side bugs kept the session mute, all fixed:
 
-| head | count | what it looks like |
+1. **The framed ACCEPTED was discarded** (`connect` broke on the first
+   steady datagram). It is now ingested, which queues
+   `ID_NEW_INCOMING_CONNECTION` (message 1, order 0), an unpadded ping, an
+   MTU-sized padded ping (split, as in the capture) and the three clock-sync
+   announcements.
+2. **ACKs were sent in the clear** while the steady layer is encrypted. The
+   server ignored them and retransmitted ACCEPTED forever; every control /
+   ACK / pong datagram now goes through the counter box.
+3. **ACK ranges were matched against reliable *message* numbers** instead of
+   *datagram* sequence numbers, so the resend queue never drained (it only
+   "worked" while both counters happened to coincide at session start). The
+   flush now records `datagram seq -> [message numbers]`.
+4. The steady `CONNECTION_REQUEST` is datagram 0 / message 0; the next frame
+   must continue at 1 or the server drops it as a duplicate.
+
+With these, the server stops retransmitting and sends its first application
+messages (the policy/flag table `93 00`, then the join challenge `9b`).
+
+## Replication payload layer — zstd over bit-packed plaintext
+
+The earlier note ("inflates to high-entropy bytes, a further encoding layer")
+is **wrong**. `zstd -d` on the frames of the v29 capture gives plaintext:
+
+| head | inflated size | content |
 |---|---|---|
-| `8d 01` | 6 284 | body contains a **zstd** frame (`28 b5 2f fd`); inflated data is high-entropy |
-| `83 03` | 935 | cluster blob (instance data) |
-| `83 07` | 637 | plaintext property sets, e.g. `…0a "8340698359" … 19 "isInExperienceNameEnabled"` |
-| `83 16` | 399 | zstd blob |
-| `83 0d` | 232 | zstd blob |
-| `83 06` | 136 | small numeric clusters |
-| `83 13` | 74 | zstd blob |
-| `83 05` | 72 | CFrame-ish numerics |
+| `97 0d` | 330 985 | the **schema dictionary**: every class and property name (`AccessModifierType`, `AccessoryType`, `ActionType`…) |
+| `83 0d` | 52 326 | world clusters: `rbxassetid://…`, part names (`SewerPart`, `ShippingContainer4`) |
+| `83 16` | ~20 K | cluster chunks (bit-packed numbers/refs) |
+| `8d 01` | 2 650 | streaming update frames (bit-packed) |
 
-So the framing is no longer the blocker: what remains is the replication
-payload layer itself. `83 07` proves the stream is partly plaintext (property
-and user strings are readable), while the `83 16`/`83 0d`/`83 13`/`8d 01`
-bodies inflate to high-entropy bytes, i.e. a further encoding/encryption
-layer sits on top of zstd. Cracking that is a research task of its own; the
-client's transport now delivers the exact message payloads to the game layer,
-which is the correct boundary.
+Header shape (`97 0d` is the clean byte-aligned example):
+`id | subtype | u32 LE compressed-len | u32 LE inflated-len | zstd frame`.
+The other subtypes insert 0–5 extra bytes before the lengths, so the parser
+locates the `28 b5 2f fd` magic in the first 24 bytes instead of hard-coding
+one layout (`src/roblox/replication.rs`, `ruzstd`). Strings inside the bodies
+use two conventions — `u8 len + ASCII` (schema/cluster) and `u16 LE len +
+ASCII` (the policy message) — both harvested into `DataModel::strings`.
+
+Decoding the bit-packed cluster schema (class descriptors + property ids from
+`97 0d`) into real parts is the next step; the container format is no longer
+in the way.
+
+## The remaining blocker: the client-side game join
+
+Replaying the capture's client-side join payloads (`a7`, `90`, `92`, `8a`,
+`8f`) from a live session makes the server answer with its `9b` challenge
+(2053 bytes, header `9b | A4 | B4 | u32 len | data`), and the real client
+answers `9b | B4 | 4 unknown bytes` — but our replay then draws the framed
+`0x15` disconnect. Those payloads are **opaque**:
+
+* entropy 7.97–7.99, no zstd / zlib / lz4 / brotli frame at any offset,
+* not openable with the transport keys (SESSDER#1/#2, ChaCha `UniqueNumber`,
+  AES-GCM `UniqueNumbeR` + counter) under any header/AAD offset tried
+  (`analysis/applayer_try.py`),
+* the 4-byte tail `23 d5 5c 38` of the capture's `9b` reply matches no hash
+  (CRC32/Adler/FNV/DJB2/murmur, md5/sha1/sha256/blake2 prefixes) of the
+  challenge, its data, the headers or the session id.
+
+So the client→server application layer carries its own cipher/key that is not
+derived from the transport handshake material we hold. Everything else on the
+path is proven: the server's `93` policy table arrives live and is decoded
+(57 names from the flag list), and the transport handshake is answered.
+
+### What this costs in the app
+
+The desktop client joins, shows `state: InGame`, receives the policy message
+and then only keepalives — the server waits for the (encrypted) game-join
+upload. The renderer therefore draws the fallback place (sky, baseplate grid,
+spawn pad, local R6 avatar) and the local character walks/jumps against the
+decoded world's colliders as soon as replication fills them.
 
 ## Visible proof (24 Nov) — the client renders a real, live session
 
-`docs/rustblox-live-ingame.png` is a capture of the **running client** joined to
-a real server:
-
-- place: «Побег из тюрьмы» (606849621), `state: InGame`,
-- `server: 10.206.10.145:58303`, real `jobId`, 75 fps,
-- the HUD also reports the live replication counters.
-
-How it was produced (repeatable, no UI clicks):
+`docs/rustblox-live-ingame.png` is a capture of the **running client** joined
+to a real server (place «Побег из тюрьмы», 606849621: `state: InGame`, real
+server/job, 75 fps, live ping). Reproduction:
 
 ```bash
 cargo build
 RUSTBLOX_AUTOJOIN=606849621 ./target/debug/rustblox
 ```
 
-Two fixes made this path work:
-
-1. **Deferred auto-join.** The saved-session restore arrives asynchronously
-   right after startup and used to replace the game screen with the menu.
-   `App::auto_join` now remembers the request and `enter_menu` fires it once
-   the restored session owns the screen.
-2. **wgpu feature request.** The GL fallback (software llvmpipe) validates
-   internal normalised texture views against `TEXTURE_FORMAT_16BIT_NORM`;
-   without the feature every frame failed with "TextureView is invalid".
-   The device is now created with `required_features: adapter.features()`.
+Two fixes made that path work: deferred auto-join (the restored session used
+to replace the game screen with the menu) and the wgpu `adapter.features()`
+request (the GL/llvmpipe fallback otherwise failed every frame with
+"TextureView is invalid").
 
 Screenshot tooling: `session-crypto/scripts/live_shot_real.sh` isolates the
-client window in a Hyprland special workspace and **refuses to capture unless
-the active workspace and the front window are both the client** — a plain
-region capture on a tiling desktop otherwise grabs whatever window is stacked
-there.
+client window in a Hyprland special workspace and refuses to capture unless
+the active workspace and the front window are both the client. Note: on the
+current Hyprland build the special-workspace toggle did not report
+`special:rblx`, so the gate refused — verify by logs instead.
 
-### What the live session shows
+### Controls (desktop)
 
-The transport is fully connected (see the HUD: real server, job id, packets),
-and the server answers. It does not yet stream the world: the client gets only
-keepalive-class packets (`pkts: 11`, `replication: 0`), because the real client
-sends a game-level join sequence after the transport handshake (`0x13`/`0x51`/
-`0x52`/`0x53` messages in the capture) that we do not send yet. That is the
-next research task; it is separate from the transport crypto, which is done.
+`WASD` walk (camera-relative, 16 studs/s), `Space` jump, mouse look with the
+cursor captured on LMB, `Esc` releases the mouse and a second `Esc` leaves,
+`F` toggles the debug free-fly, `R` respawn. The HUD hint line reflects this.

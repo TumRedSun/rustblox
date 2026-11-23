@@ -28,6 +28,14 @@ impl RakClient {
 		self.send_frame(Frame::reliable_ordered(payload.to_vec()), true);
 	}
 
+	/// Queue a reliable (but NOT ordered) datagram frame — the shape the
+	/// fork uses for its padded ping/pong probes.
+	pub fn send_reliable_unordered(&mut self, payload: &[u8]) {
+		let mut f = Frame::unreliable(payload.to_vec());
+		f.reliability = 2;
+		self.send_frame(f, true);
+	}
+
 	/// Queue an unreliable datagram frame.
 	pub fn send_unreliable(&mut self, payload: &[u8]) {
 		self.send_frame(Frame::unreliable(payload.to_vec()), false);
@@ -37,50 +45,62 @@ impl RakClient {
 		if self.state != RakState::Connected {
 			return;
 		}
-		let seq = self.reliability_index;
-		self.reliability_index = self.reliability_index.wrapping_add(1);
-		frame.seq = seq;
-		if matches!(frame.reliability, 1 | 3 | 4 | 7) {
-			frame.order_index = self.order_index;
+		let order = if matches!(frame.reliability, 1 | 3 | 4 | 7) {
+			let o = self.order_index;
 			self.order_index = self.order_index.wrapping_add(1);
-		}
+			o
+		} else {
+			0
+		};
+		frame.order_index = order;
 
 		// Split if it does not fit a datagram (leave room for datagram hdr).
 		let max_payload = (self.mtu as usize).saturating_sub(4 + 16 + 64);
 		if frame.payload.len() > max_payload {
-			let chunks = frame.payload.chunks(max_payload).count() as u32;
+			// Every split part is its own reliable message: the capture
+			// numbers the two halves of the 1160-byte padded ping 2 and 3
+			// (not 2 and 2), and the server ACKs them individually.
+			let chunks: Vec<Vec<u8>> =
+				frame.payload.chunks(max_payload).map(|c| c.to_vec()).collect();
+			let count = chunks.len() as u32;
 			let split_id = self.split_id;
 			self.split_id = self.split_id.wrapping_add(1);
-			for (i, chunk) in frame.payload.chunks(max_payload).enumerate() {
+			for (i, chunk) in chunks.into_iter().enumerate() {
+				let seq = self.reliability_index;
+				self.reliability_index = self.reliability_index.wrapping_add(1);
 				let f = Frame {
 					reliability: frame.reliability,
 					has_split: true,
 					seq,
-					order_index: frame.order_index,
-					order_channel: frame.order_channel,
+					order_index: order,
+					order_channel: 0,
 					split_id,
-					split_count: chunks,
+					split_count: count,
 					split_index: i as u32,
-					payload: chunk.to_vec(),
+					payload: chunk,
 				};
 				let mut bytes = Vec::new();
 				f.encode(&mut bytes);
-				self.out_queue.insert(
-					seq,
-					OutFrame {
-						reliability_index: seq,
-						bytes: bytes.clone(),
-						sent: Instant::now(),
-						tries: 0,
-					},
-				);
+				if resend && matches!(frame.reliability, 2 | 3 | 4 | 6 | 7) {
+					self.out_queue.insert(
+						seq,
+						OutFrame {
+							reliability_index: seq,
+							bytes: bytes.clone(),
+							sent: Instant::now(),
+							tries: 0,
+						},
+					);
+				}
 				self.frame_buf.extend_from_slice(&bytes);
 			}
-			let _ = resend;
 		} else {
+			let seq = self.reliability_index;
+			self.reliability_index = self.reliability_index.wrapping_add(1);
+			frame.seq = seq;
 			let mut bytes = Vec::with_capacity(frame.payload.len() + 8);
 			frame.encode(&mut bytes);
-			if matches!(frame.reliability, 2 | 3 | 4 | 6 | 7) {
+			if resend && matches!(frame.reliability, 2 | 3 | 4 | 6 | 7) {
 				self.out_queue.insert(
 					seq,
 					OutFrame {
@@ -108,43 +128,62 @@ impl RakClient {
 		let buf = std::mem::take(&mut self.frame_buf);
 		let max = (self.mtu as usize).saturating_sub(4);
 		let mut dg: Vec<u8> = Vec::with_capacity(max);
+		let mut dg_msgs: Vec<u32> = Vec::new();
 		let mut pos = 0usize;
 		let mut seq = self.datagram_seq;
 		while pos < buf.len() {
-			let flen = Frame::decode(&buf[pos..])
-				.map(|f| frame_encoded_len(&f))
-				.unwrap_or(buf.len() - pos);
+			let decoded = Frame::decode(&buf[pos..]);
+			let flen = decoded.as_ref().map(frame_encoded_len).unwrap_or(buf.len() - pos);
 			if !dg.is_empty() && dg.len() + 4 + flen > max {
-				self.send_datagram(&dg, &mut seq);
+				self.send_datagram(&dg, &mut seq, &mut dg_msgs);
 				dg.clear();
+			}
+			if let Some(f) = &decoded {
+				if matches!(f.reliability, 2 | 3 | 4 | 6 | 7) {
+					dg_msgs.push(f.seq);
+				}
 			}
 			let end = (pos + flen).min(buf.len());
 			dg.extend_from_slice(&buf[pos..end]);
 			pos = end;
 		}
 		if !dg.is_empty() {
-			self.send_datagram(&dg, &mut seq);
+			self.send_datagram(&dg, &mut seq, &mut dg_msgs);
 		}
 		self.datagram_seq = seq;
 	}
 
-	fn send_datagram(&mut self, dg: &[u8], seq: &mut u32) {
+	fn send_datagram(&mut self, dg: &[u8], seq: &mut u32, msgs: &mut Vec<u32>) {
 		let mut pkt = Vec::with_capacity(dg.len() + 4);
 		pkt.push(DATAGRAM_VALID | 0x04);
 		put_u24(&mut pkt, *seq);
 		pkt.extend_from_slice(dg);
-		let _ = if self.crypto_connected {
-			// Connected phase AND the late handshake: one counter-framed
-			// scheme (`ct || hint || tag`, nonce = counter || "mbeR").
-			let sealed = self.early.as_mut().map(|ec| ec.seal_counter(&pkt));
-			match sealed {
-				Some(s) => self.send_raw(&s),
-				None => self.send_raw(&pkt),
-			}
+		// ACKs name DATAGRAM sequence numbers, and one ACK covers every
+		// reliable message the datagram carried — remember the mapping or
+		// the resend queue never drains (the old code compared ack ranges
+		// against message numbers, which only coincided at session start).
+		if msgs.is_empty() {
+			self.sent_msgs.remove(seq);
 		} else {
-			self.send_raw(&pkt)
-		};
+			self.sent_msgs.insert(*seq, std::mem::take(msgs));
+		}
+		self.send_sealed(&pkt);
 		*seq = seq.wrapping_add(1);
+	}
+
+	/// Send one connected-phase datagram payload, applying the steady
+	/// counter box when the session is encrypted. ACKs and control replies
+	/// MUST go through here: the server drops clear ACK datagrams (it
+	/// kept retransmitting ACCEPTED forever while ours left unsealed).
+	fn send_sealed(&mut self, pkt: &[u8]) {
+		if self.crypto_connected {
+			let sealed = self.early.as_mut().map(|ec| ec.seal_counter(pkt));
+			if let Some(s) = sealed {
+				let _ = self.send_raw(&s);
+				return;
+			}
+		}
+		let _ = self.send_raw(pkt);
 	}
 
 	/// Resend overdue reliable frames; drop dead ones.
@@ -152,17 +191,13 @@ impl RakClient {
 		if self.state != RakState::Connected {
 			return;
 		}
-		// Ping every second.
+		// Ping every second (the fork's millisecond stamp is big-endian).
 		if self.last_ping.elapsed() > Duration::from_secs(1) {
 			self.last_ping = Instant::now();
-			let t = std::time::SystemTime::now()
-				.duration_since(std::time::UNIX_EPOCH)
-				.unwrap_or_default()
-				.as_millis() as u64;
 			let mut out = vec![ID_CONNECTED_PING];
-			out.extend_from_slice(&t.to_le_bytes());
+			out.extend_from_slice(&self.now_ms().to_be_bytes());
 			self.send_frame(Frame::unreliable(out), false);
-			self.ping_time = Some((t, Instant::now()));
+			self.ping_time = Some((0, Instant::now()));
 			netlog!(net, "ping sent");
 		}
 
@@ -206,7 +241,8 @@ impl RakClient {
 	// -----------------------------------------------------------------
 
 	/// Pump the socket: returns the next application payload if available.
-	/// Handles ACKs, pings, splits and ordered delivery internally.
+	/// Handles ACKs, pings, splits, ordered delivery and the fork's
+	/// connected-phase system messages internally.
 	pub fn poll(&mut self) -> Option<Vec<u8>> {
 		if self.state != RakState::Connected {
 			return None;
@@ -223,30 +259,45 @@ impl RakClient {
 				Err(_) => return None,
 			};
 			let pkt: Vec<u8> = self.strip_incoming(self.buf[..n].to_vec(), "poll");
-			// Connected-phase crypto: counter-framed box.
-			let pkt = if self.crypto_connected {
-				match self.early.as_ref().map(|ec| ec.open_counter(&pkt)) {
-					Some(Some((pt, counter))) => {
-						netlog!(
-							net,
-							"poll: box opened (counter {:#x}, pt {} bytes)",
-							counter,
-							pt.len()
-						);
-						pt
-					}
-					Some(None) => {
-						netlog!(net, "poll: datagram ({}) failed counter-box decrypt", pkt.len());
-						pkt
-					}
-					None => pkt,
-				}
-			} else {
-				pkt
-			};
-			self.handle_packet(&pkt);
+			self.ingest(&pkt);
 		}
 		self.pending.pop_front()
+	}
+
+	/// Feed one RUPP-stripped datagram: open the steady box when the
+	/// session is encrypted, then handle ACKs, control messages, frames and
+	/// system messages. Also used by `connect` for the datagram that
+	/// carries the framed ACCEPTED.
+	pub(crate) fn ingest(&mut self, pkt: &[u8]) {
+		let opened: Vec<u8>;
+		let pkt: &[u8] = if self.crypto_connected {
+			match self.early.as_ref().map(|ec| ec.open_counter(pkt)) {
+				Some(Some((pt, counter))) => {
+					netlog!(
+						net,
+						"poll: box opened (counter {:#x}, pt {} bytes)",
+						counter,
+						pt.len()
+					);
+					opened = pt;
+					&opened
+				}
+				Some(None) => {
+					netlog!(net, "poll: datagram ({}) failed counter-box decrypt", pkt.len());
+					pkt
+				}
+				None => pkt,
+			}
+		} else {
+			pkt
+		};
+		self.handle_packet(pkt);
+	}
+
+	/// Plaintext half of [`RakClient::ingest`] (the connect-phase loop has
+	/// already opened the box of the datagram it is looking at).
+	pub(crate) fn ingest_plain(&mut self, pkt: &[u8]) {
+		self.handle_packet(pkt);
 	}
 
 	fn handle_packet(&mut self, pkt: &[u8]) {
@@ -291,16 +342,14 @@ impl RakClient {
 				Some(f) => {
 					let flen = frame_encoded_len(&f);
 					pos += flen;
+					let ordered = matches!(f.reliability, 1 | 3 | 4 | 7);
+					let order = f.order_index;
 					if f.has_split {
 						if let Some(assembled) = self.reassemble(f) {
-							self.push_ordered_payload(assembled);
-						}
-					} else if matches!(f.reliability, 1 | 3 | 4 | 7) {
-						if let Some(p) = self.deliver_ordered(f) {
-							self.push_ordered_payload(p);
+							self.deliver(assembled, ordered, order);
 						}
 					} else {
-						self.pending.push_back(f.payload);
+						self.deliver(f.payload, ordered, order);
 					}
 				}
 				None => {
@@ -311,24 +360,30 @@ impl RakClient {
 		}
 	}
 
-	/// Push an ordered-delivery payload; drain held follow-up frames too.
-	fn push_ordered_payload(&mut self, first: Vec<u8>) {
-		self.pending.push_back(first);
-		loop {
-			let next_seq = {
-				// deliver_ordered tracks delivered count internally; held
-				// frames are drained by sequence below.
-				match self.ordered_hold.keys().min() {
-					Some(k) => *k,
-					None => return,
-				}
-			};
-			if let Some(f) = self.ordered_hold.remove(&next_seq) {
-				self.pending.push_back(f.payload);
-			} else {
-				return;
-			}
+	/// Route one complete message: ordered messages are held until their
+	/// turn on the ordering channel, connected-phase system messages are
+	/// answered here, everything else goes up to the application layer
+	/// (the replication parser).
+	fn deliver(&mut self, body: Vec<u8>, ordered: bool, order: u32) {
+		if !ordered {
+			self.route(body);
+			return;
 		}
+		if (order as i64) < (self.delivered_ordered as i64) {
+			return; // already delivered (duplicate)
+		}
+		self.ordered_hold.insert(order, body);
+		while let Some(next) = self.ordered_hold.remove(&self.delivered_ordered) {
+			self.delivered_ordered = self.delivered_ordered.wrapping_add(1);
+			self.route(next);
+		}
+	}
+
+	fn route(&mut self, payload: Vec<u8>) {
+		if self.crypto_connected && self.system_message(&payload) {
+			return;
+		}
+		self.pending.push_back(payload);
 	}
 
 	fn handle_control(&mut self, pkt: &[u8]) -> Option<Vec<u8>> {
@@ -338,7 +393,7 @@ impl RakClient {
 				if pkt.len() >= 9 {
 					let mut out = vec![ID_CONNECTED_PONG];
 					out.extend_from_slice(&pkt[1..9]);
-					let _ = self.send_raw(&out);
+					self.send_sealed(&out);
 				}
 				None
 			}
@@ -395,7 +450,11 @@ impl RakClient {
 				},
 			};
 			for seq in lo..=hi.min(lo + 8192) {
-				self.out_queue.remove(&seq);
+				if let Some(msgs) = self.sent_msgs.remove(&seq) {
+					for m in msgs {
+						self.out_queue.remove(&m);
+					}
+				}
 			}
 		}
 	}
@@ -426,7 +485,7 @@ impl RakClient {
 				put_u24(&mut out, lo);
 			}
 		}
-		let _ = self.send_raw(&out);
+		self.send_sealed(&out);
 		self.ack_buffer.clear();
 	}
 
@@ -447,33 +506,6 @@ impl RakClient {
 		} else {
 			None
 		}
-	}
-
-	fn deliver_ordered(&mut self, f: Frame) -> Option<Vec<u8>> {
-		// Ordering key: the fork's order_index (u24 LE + channel), not the
-		// message number — reliable-unordered frames skip ordering entirely.
-		if (f.order_index as i64) < (self.delivered_ordered as i64) {
-			// Already delivered (duplicate).
-			return None;
-		}
-		let key = f.order_index;
-		self.ordered_hold.insert(key, f);
-		if let Some(next) = self.ordered_hold.remove(&self.delivered_ordered) {
-			self.delivered_ordered = self.delivered_ordered.wrapping_add(1);
-			let payload = next.payload;
-			// Drain consecutive held frames.
-			loop {
-				match self.ordered_hold.remove(&self.delivered_ordered) {
-					Some(n) => {
-						self.delivered_ordered = self.delivered_ordered.wrapping_add(1);
-						self.pending.push_back(n.payload);
-					}
-					None => break,
-				}
-			}
-			return Some(payload);
-		}
-		None
 	}
 
 	/// Number of payloads buffered behind the ordered delivery head.

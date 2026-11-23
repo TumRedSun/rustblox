@@ -1,6 +1,7 @@
 //! Live game session: joins a real Roblox server, drives the replication
 //! stream into the DataModel and keeps a renderable SceneView up to date.
 
+use crate::gfx::math::Vec3;
 use crate::gfx::scene::{Camera, SceneView};
 use crate::net::raknet::{RakClient, RakState};
 use crate::netlog;
@@ -44,11 +45,41 @@ pub struct GameState {
 	pub replication: u64,
 	/// "83/07×12 8d/01×3" — the head histogram, top entries first.
 	pub repl_heads: String,
+	/// Fork bodies that arrived as zstd frames.
+	pub inflated: u64,
+	/// Readable strings harvested from the replication stream (class and
+	/// property names, part names, usernames).
+	pub names: usize,
 	pub instances: usize,
 	pub players: usize,
 	pub world: DataModel,
 	pub scene: SceneView,
 	pub fps: f32,
+	/// Axis-aligned colliders of the decoded world, rebuilt with the scene.
+	pub colliders: Vec<Aabb>,
+	/// Local character (feet) position + facing, written by the UI thread's
+	/// controller and read by the scene builder.
+	pub local_pos: Vec3,
+	pub local_yaw: f32,
+	/// Set once the spawn point has been resolved from the world.
+	pub pos_init: bool,
+}
+
+/// Axis-aligned box used for the simple character collision (centre ± half
+/// extents, already in world space).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Aabb {
+	pub min: Vec3,
+	pub max: Vec3,
+}
+
+impl Aabb {
+	pub fn centre_half(pos: Vec3, half: Vec3) -> Aabb {
+		Aabb {
+			min: [pos[0] - half[0], pos[1] - half[1], pos[2] - half[2]],
+			max: [pos[0] + half[0], pos[1] + half[1], pos[2] + half[2]],
+		}
+	}
 }
 
 pub struct GameSession {
@@ -70,11 +101,17 @@ impl GameSession {
 			skipped: 0,
 			replication: 0,
 			repl_heads: String::new(),
+			inflated: 0,
+			names: 0,
 			instances: 0,
 			players: 0,
 			world: DataModel::new(),
 			scene: SceneView::default(),
 			fps: 0.0,
+			colliders: Vec::new(),
+			local_pos: [0.0, 0.0, 0.0],
+			local_yaw: 0.0,
+			pos_init: false,
 		}));
 		let stop = Arc::new(AtomicBool::new(false));
 		let st = Arc::clone(&state);
@@ -310,9 +347,8 @@ fn game_thread(
 			.unwrap_or_default();
 
 	let mut last_scene = Instant::now();
-	let mut spawn: Option<crate::gfx::math::Vec3> = None;
-	let spawn_yaw = 0.0f32;
 	let mut last_pkt_time = Instant::now();
+	let mut logged_scene = false;
 
 	while !stop.load(Ordering::Relaxed) {
 		// Pump RakNet: all available payloads.
@@ -342,6 +378,8 @@ fn game_thread(
 			st.ping_ms = ping;
 			st.skipped = parser().skipped;
 			st.replication = parser().replication;
+			st.inflated = parser().inflated;
+			st.names = st.world.strings.len();
 			if st.replication > 0 && st.repl_heads.is_empty() {
 				let mut heads: Vec<(u16, u64)> =
 					parser().heads.iter().map(|(k, v)| (*k, *v)).collect();
@@ -367,23 +405,42 @@ fn game_thread(
 			last_scene = Instant::now();
 			let mut st = lock_state(&state);
 			st.scene.clear();
+			st.scene.env = crate::gfx::scene::Environment::daylight();
 			st.instances = st.world.len();
-			let world = std::mem::take(&mut st.world);
-			let count = world.build_scene(&mut st.scene);
-			let _ = count;
-			st.world = world;
-
-			// Determine a spawn point: first SpawnLocation, else origin.
-			if spawn.is_none() {
-				if let Some(sp) = find_spawn(&st.world) {
-					spawn = Some(sp);
+			{
+				let world = std::mem::take(&mut st.world);
+				let _ = world.build_scene(&mut st.scene);
+				// Colliders + spawn point come from the decoded world; the
+				// UI thread's character controller resolves against them.
+				st.colliders = collect_colliders(&world);
+				if !st.pos_init {
+					if let Some(sp) = find_spawn(&world) {
+						st.local_pos = sp;
+						st.pos_init = true;
+					}
 				}
+				st.world = world;
 			}
-			// Render our own rig at the spawn until the replication stream
-			// provides the real character.
-			if st.scene.parts.len() < 4000 {
-				let origin = spawn.unwrap_or([0.0, 8.0, 0.0]);
-				let _ = build_r6_rig(origin, spawn_yaw, &appearance, &mut st.scene.parts);
+			// Always render a recognizable place: sky (from the environment),
+			// a baseplate with a grid and the local character. Real replicated
+			// parts simply sit on top of it.
+			crate::world::build_ground(&mut st.scene);
+			if st.scene.parts.len() < 6000 {
+				// The rig's origin sits half a stud above the feet (legs are
+				// centred at +0.5), so lift it off the ground plane.
+				let origin = [st.local_pos[0], st.local_pos[1] + 0.5, st.local_pos[2]];
+				let _ = build_r6_rig(origin, st.local_yaw, &appearance, &mut st.scene.parts);
+			}
+			if !logged_scene {
+				logged_scene = true;
+				netlog!(
+					game,
+					"scene: {} parts ({} world colliders), spawn {:?}, appearance parts {}",
+					st.scene.parts.len(),
+					st.colliders.len(),
+					st.local_pos,
+					appearance.body_colors.torso_color_id
+				);
 			}
 		}
 
@@ -432,7 +489,63 @@ fn find_spawn(dm: &DataModel) -> Option<crate::gfx::math::Vec3> {
 	None
 }
 
-/// Camera used by the local view (free-fly).
+/// Colliders for the local character: every solid part of the decoded world
+/// as a world-space AABB (rotation approximated by its extents, which is
+/// exact for the axis-aligned parts that dominate Roblox builds).
+fn collect_colliders(dm: &DataModel) -> Vec<Aabb> {
+	let Some(root) = dm.find_root("DataModel").or(dm.root) else { return Vec::new() };
+	let mut out = Vec::new();
+	for id in dm.walk(root) {
+		let Some(inst) = dm.get(id) else { continue };
+		if !matches!(
+			inst.class.as_str(),
+			"Part"
+				| "WedgePart"
+				| "CornerWedgePart"
+				| "MeshPart"
+				| "TrussPart"
+				| "SpawnLocation"
+				| "UnionOperation"
+		) {
+			continue;
+		}
+		let (pos, size) = match (inst.prop("CFrame"), inst.prop("Size")) {
+			(Some(crate::world::Prop::CFrame { pos, .. }), Some(crate::world::Prop::Vec3(s))) => {
+				(pos, s)
+			}
+			_ => continue,
+		};
+		let rot = match inst.prop("CFrame") {
+			Some(crate::world::Prop::CFrame { rot, .. }) => *rot,
+			_ => [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+		};
+		// Column-major basis: columns are rot[0..3], rot[3..6], rot[6..9].
+		let half = [
+			(rot[0].abs() * size[0] + rot[3].abs() * size[1] + rot[6].abs() * size[2]) * 0.5,
+			(rot[1].abs() * size[0] + rot[4].abs() * size[1] + rot[7].abs() * size[2]) * 0.5,
+			(rot[2].abs() * size[0] + rot[5].abs() * size[1] + rot[8].abs() * size[2]) * 0.5,
+		];
+		if !pos.iter().all(|v| v.is_finite()) || !half.iter().all(|v| v.is_finite()) {
+			continue;
+		}
+		out.push(Aabb::centre_half(*pos, half));
+		if out.len() >= 20_000 {
+			break;
+		}
+	}
+	out
+}
+
+/// Which movement model the local character uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlMode {
+	/// Roblox-like: walk on the ground, jump, gravity, collisions (default).
+	Walk,
+	/// Debug free-fly (F toggles).
+	Fly,
+}
+
+/// Local character + camera controller.
 #[derive(Clone)]
 pub struct GameController {
 	pub camera: Camera,
@@ -443,6 +556,19 @@ pub struct GameController {
 	pub touch_stick: (f32, f32),
 	/// Touch pad (mobile): +1 while the up button is held, -1 down, 0 none.
 	pub touch_lift: f32,
+	/// Character feet position (walk mode).
+	pub pos: crate::gfx::math::Vec3,
+	pub vel: crate::gfx::math::Vec3,
+	pub on_ground: bool,
+	/// Facing yaw of the character.
+	pub yaw: f32,
+	pub mode: ControlMode,
+	/// Pending jump request (consumed by `step`).
+	pub jump: bool,
+	/// Pending respawn request (R key).
+	pub respawn: bool,
+	/// True once the character was placed at the spawn point.
+	pub spawned: bool,
 }
 
 impl Default for GameController {
@@ -454,54 +580,254 @@ impl Default for GameController {
 			keys: std::collections::HashSet::new(),
 			touch_stick: (0.0, 0.0),
 			touch_lift: 0.0,
+			pos: [0.0, 0.0, 0.0],
+			vel: [0.0, 0.0, 0.0],
+			on_ground: false,
+			yaw: 0.0,
+			mode: ControlMode::Walk,
+			jump: false,
+			respawn: false,
+			spawned: false,
 		}
 	}
 }
 
+/// Roblox R6-ish body dimensions (studs).
+const BODY_RADIUS: f32 = 1.1;
+const BODY_HEIGHT: f32 = 5.0;
+const WALK_SPEED: f32 = 16.0;
+const FLY_SPEED: f32 = 30.0;
+const GRAVITY: f32 = 196.2;
+const JUMP_SPEED: f32 = 50.0;
+/// Third-person camera distance behind the character.
+const CAM_BACK: f32 = 12.0;
+
 impl GameController {
-	/// Advance the camera by dt using the currently held keys.
-	pub fn step(&mut self, dt: f32) {
-		use winit::keyboard::PhysicalKey;
-		let speed = 28.0_f32;
+	/// Place the character (and the camera) at a spawn point.
+	pub fn place(&mut self, feet: crate::gfx::math::Vec3) {
+		self.pos = feet;
+		self.vel = [0.0; 3];
+		self.on_ground = false;
+		self.spawned = true;
+		self.update_camera();
+	}
+
+	pub fn toggle_fly(&mut self) {
+		self.mode = match self.mode {
+			ControlMode::Walk => ControlMode::Fly,
+			ControlMode::Fly => ControlMode::Walk,
+		};
+		self.vel = [0.0; 3];
+		if self.mode == ControlMode::Walk {
+			// Drop out of the air onto whatever is below.
+			self.on_ground = false;
+		}
+	}
+
+	fn held(&self, code: winit::keyboard::KeyCode) -> bool {
+		self.keys.contains(&winit::keyboard::PhysicalKey::Code(code))
+	}
+
+	/// Wish direction on the ground plane from WASD + the touch stick,
+	/// relative to where the camera looks.
+	fn wish_dir(&self, axes: (f32, f32)) -> (f32, f32) {
+		let fwd = self.camera.forward();
+		let flat = (fwd[0] * fwd[0] + fwd[2] * fwd[2]).sqrt();
+		let (fx, fz) = if flat > 1e-4 { (fwd[0] / flat, fwd[2] / flat) } else { (0.0, -1.0) };
+		let right = self.camera.right();
+		let (ix, iz) = axes;
+		let x = fx * iz + right[0] * ix;
+		let z = fz * iz + right[2] * ix;
+		let len = (x * x + z * z).sqrt();
+		if len > 1e-4 {
+			(x / len, z / len)
+		} else {
+			(0.0, 0.0)
+		}
+	}
+
+	fn axes(&self) -> (f32, f32) {
+		use winit::keyboard::KeyCode;
+		let mut ix = 0.0;
+		let mut iz = 0.0;
+		if self.held(KeyCode::KeyW) || self.held(KeyCode::ArrowUp) {
+			iz += 1.0;
+		}
+		if self.held(KeyCode::KeyS) || self.held(KeyCode::ArrowDown) {
+			iz -= 1.0;
+		}
+		if self.held(KeyCode::KeyD) || self.held(KeyCode::ArrowRight) {
+			ix += 1.0;
+		}
+		if self.held(KeyCode::KeyA) || self.held(KeyCode::ArrowLeft) {
+			ix -= 1.0;
+		}
+		let (sx, sy) = self.touch_stick;
+		ix += sx;
+		iz += sy;
+		let len = (ix * ix + iz * iz).sqrt();
+		if len > 1.0 {
+			(ix / len, iz / len)
+		} else {
+			(ix, iz)
+		}
+	}
+
+	/// Advance the character / camera by `dt`. `colliders` are the world-space
+	/// boxes of the decoded scene (empty before replication arrives).
+	pub fn step(&mut self, dt: f32, colliders: &[Aabb]) {
+		let axes = self.axes();
+		match self.mode {
+			ControlMode::Fly => self.step_fly(dt, axes),
+			ControlMode::Walk => self.step_walk(dt, axes, colliders),
+		}
+		self.update_camera();
+	}
+
+	fn step_fly(&mut self, dt: f32, axes: (f32, f32)) {
+		use winit::keyboard::KeyCode;
 		let fwd = self.camera.forward();
 		let right = self.camera.right();
-		let mut move_vec = [0.0f32; 3];
-		let held = |k: PhysicalKey, c: &std::collections::HashSet<PhysicalKey>| c.contains(&k);
-		if held(PhysicalKey::Code(winit::keyboard::KeyCode::KeyW), &self.keys) {
-			move_vec = crate::gfx::math::add3(move_vec, fwd);
+		let mut delta = crate::gfx::math::add3(
+			crate::gfx::math::scale3(fwd, axes.1),
+			crate::gfx::math::scale3(right, axes.0),
+		);
+		if self.held(KeyCode::Space) {
+			delta[1] += 1.0;
 		}
-		if held(PhysicalKey::Code(winit::keyboard::KeyCode::KeyS), &self.keys) {
-			move_vec = crate::gfx::math::sub3(move_vec, fwd);
-		}
-		if held(PhysicalKey::Code(winit::keyboard::KeyCode::KeyD), &self.keys) {
-			move_vec = crate::gfx::math::add3(move_vec, right);
-		}
-		if held(PhysicalKey::Code(winit::keyboard::KeyCode::KeyA), &self.keys) {
-			move_vec = crate::gfx::math::sub3(move_vec, right);
-		}
-		if held(PhysicalKey::Code(winit::keyboard::KeyCode::Space), &self.keys) {
-			move_vec[1] += 1.0;
-		}
-		if held(PhysicalKey::Code(winit::keyboard::KeyCode::ShiftLeft), &self.keys) {
-			move_vec[1] -= 1.0;
-		}
-		// Touch pad (mobile): the joystick deflects fly direction, +/− lift.
-		let (sx, sy) = self.touch_stick;
-		if sx.abs() > 1e-3 {
-			move_vec = crate::gfx::math::add3(move_vec, crate::gfx::math::scale3(right, sx));
-		}
-		if sy.abs() > 1e-3 {
-			move_vec = crate::gfx::math::add3(move_vec, crate::gfx::math::scale3(fwd, sy));
+		if self.held(KeyCode::ShiftLeft) || self.held(KeyCode::ShiftRight) {
+			delta[1] -= 1.0;
 		}
 		if self.touch_lift.abs() > 1e-3 {
-			move_vec[1] += self.touch_lift;
+			delta[1] += self.touch_lift;
 		}
-		let len = crate::gfx::math::len3(move_vec);
+		let len = crate::gfx::math::len3(delta);
 		if len > 1e-4 {
-			let dir = crate::gfx::math::scale3(move_vec, 1.0 / len);
-			let d = crate::gfx::math::scale3(dir, speed * dt);
+			let d = crate::gfx::math::scale3(delta, FLY_SPEED * dt / len);
 			self.camera.pos = crate::gfx::math::add3(self.camera.pos, d);
 		}
+	}
+
+	fn step_walk(&mut self, dt: f32, axes: (f32, f32), colliders: &[Aabb]) {
+		let (wx, wz) = self.wish_dir(axes);
+		let want = [wx * WALK_SPEED, 0.0, wz * WALK_SPEED];
+		// Snappy ground control: blend the horizontal velocity toward the wish.
+		let blend = (dt * 14.0).min(1.0);
+		self.vel[0] += (want[0] - self.vel[0]) * blend;
+		self.vel[2] += (want[2] - self.vel[2]) * blend;
+		if (wx * wx + wz * wz).sqrt() > 1e-4 {
+			self.yaw = wx.atan2(wz);
+		}
+
+		if self.on_ground && self.jump {
+			self.vel[1] = JUMP_SPEED;
+			self.on_ground = false;
+		}
+		self.jump = false;
+		self.vel[1] -= GRAVITY * dt;
+		if self.vel[1] < -200.0 {
+			self.vel[1] = -200.0;
+		}
+
+		let prev_y = self.pos[1];
+		self.pos[0] += self.vel[0] * dt;
+		self.resolve_horizontal(colliders, 0);
+		self.pos[2] += self.vel[2] * dt;
+		self.resolve_horizontal(colliders, 2);
+		self.pos[1] += self.vel[1] * dt;
+		self.resolve_vertical(colliders, prev_y);
+
+		// Safety net: never fall through the world (the rendered baseplate
+		// sits at y = 0 until the server's ground is decoded).
+		if self.pos[1] < 0.0 {
+			self.pos[1] = 0.0;
+			if self.vel[1] < 0.0 {
+				self.vel[1] = 0.0;
+				self.on_ground = true;
+			}
+		}
+		if self.respawn {
+			self.respawn = false;
+			if self.pos[1] < 0.0 {
+				self.pos[1] = 8.0;
+			}
+		}
+	}
+
+	fn overlaps(&self, c: &Aabb) -> bool {
+		let p = self.pos;
+		p[0] + BODY_RADIUS > c.min[0]
+			&& p[0] - BODY_RADIUS < c.max[0]
+			&& p[1] + BODY_HEIGHT > c.min[1]
+			&& p[1] < c.max[1]
+			&& p[2] + BODY_RADIUS > c.min[2]
+			&& p[2] - BODY_RADIUS < c.max[2]
+	}
+
+	fn resolve_horizontal(&mut self, colliders: &[Aabb], axis: usize) {
+		for c in colliders {
+			if !self.overlaps(c) {
+				continue;
+			}
+			// Ignore boxes we are standing on top of.
+			if self.pos[1] >= c.max[1] - 0.05 {
+				continue;
+			}
+			if self.vel[axis] > 0.0 {
+				self.pos[axis] = c.min[axis] - BODY_RADIUS - 1e-3;
+			} else if self.vel[axis] < 0.0 {
+				self.pos[axis] = c.max[axis] + BODY_RADIUS + 1e-3;
+			}
+			self.vel[axis] = 0.0;
+		}
+	}
+
+	fn resolve_vertical(&mut self, colliders: &[Aabb], prev_y: f32) {
+		let mut landed = false;
+		for c in colliders {
+			if self.pos[0] + BODY_RADIUS <= c.min[0]
+				|| self.pos[0] - BODY_RADIUS >= c.max[0]
+				|| self.pos[2] + BODY_RADIUS <= c.min[2]
+				|| self.pos[2] - BODY_RADIUS >= c.max[2]
+			{
+				continue;
+			}
+			if self.vel[1] <= 0.0
+				&& prev_y >= c.max[1] - 0.35
+				&& self.pos[1] <= c.max[1]
+				&& self.pos[1] + BODY_HEIGHT > c.min[1]
+			{
+				self.pos[1] = c.max[1];
+				landed = true;
+				continue;
+			}
+			if self.vel[1] > 0.0 && self.overlaps(c) {
+				self.pos[1] = c.min[1] - BODY_HEIGHT - 1e-3;
+				self.vel[1] = 0.0;
+			}
+		}
+		if landed {
+			self.vel[1] = 0.0;
+			self.on_ground = true;
+		} else if self.vel[1].abs() > 0.001 {
+			self.on_ground = false;
+		}
+	}
+
+	/// Chase camera: sit behind the character along the look direction.
+	fn update_camera(&mut self) {
+		if self.mode == ControlMode::Fly {
+			return;
+		}
+		let fwd = self.camera.forward();
+		let eye = [self.pos[0], self.pos[1] + 4.6, self.pos[2]];
+		let mut cam =
+			[eye[0] - fwd[0] * CAM_BACK, eye[1] - fwd[1] * CAM_BACK, eye[2] - fwd[2] * CAM_BACK];
+		// Never dip below the character's feet.
+		if cam[1] < self.pos[1] + 0.8 {
+			cam[1] = self.pos[1] + 0.8;
+		}
+		self.camera.pos = cam;
 	}
 
 	pub fn mouse_delta(&mut self, x: f32, y: f32) {
@@ -517,13 +843,98 @@ impl GameController {
 		let dy = y - self.last_mouse.1;
 		self.last_mouse = (x, y);
 		self.camera.yaw -= dx * 0.0028;
-		self.camera.pitch = (self.camera.pitch - dy * 0.0028).clamp(-1.55, 1.55);
+		self.camera.pitch = (self.camera.pitch - dy * 0.0028).clamp(-1.35, 1.1);
 	}
 
 	/// Camera look from a touch drag (mobile game pad): the finger delta
 	/// rotates the camera with the same sensitivity as the locked mouse.
 	pub fn touch_look(&mut self, dx: f32, dy: f32) {
 		self.camera.yaw -= dx * 0.0028;
-		self.camera.pitch = (self.camera.pitch - dy * 0.0028).clamp(-1.55, 1.55);
+		self.camera.pitch = (self.camera.pitch - dy * 0.0028).clamp(-1.35, 1.1);
+	}
+}
+
+#[cfg(test)]
+mod controller_tests {
+	use super::*;
+	use winit::keyboard::{KeyCode, PhysicalKey};
+
+	fn walker() -> GameController {
+		let mut c = GameController::default();
+		c.place([0.0, 0.0, 0.0]);
+		c
+	}
+
+	#[test]
+	fn character_falls_and_lands() {
+		let mut c = walker();
+		c.pos = [0.0, 10.0, 0.0];
+		for _ in 0..240 {
+			c.step(1.0 / 60.0, &[]);
+		}
+		assert!(c.on_ground, "character should be standing");
+		assert!(c.pos[1].abs() < 0.01, "feet at y=0, got {}", c.pos[1]);
+	}
+
+	#[test]
+	fn wasd_moves_and_faces_the_move_direction() {
+		let mut c = walker();
+		c.keys.insert(PhysicalKey::Code(KeyCode::KeyW));
+		for _ in 0..60 {
+			c.step(1.0 / 60.0, &[]);
+		}
+		// yaw 0 looks along -Z, so W walks toward -Z.
+		assert!(c.pos[2] < -5.0, "walked along -Z, z={}", c.pos[2]);
+		assert!(c.pos[0].abs() < 0.5);
+	}
+
+	#[test]
+	fn space_jumps() {
+		let mut c = walker();
+		for _ in 0..30 {
+			c.step(1.0 / 60.0, &[]);
+		}
+		assert!(c.on_ground);
+		c.jump = true;
+		c.step(1.0 / 60.0, &[]);
+		assert!(c.vel[1] > 10.0, "jump impulse applied, vy={}", c.vel[1]);
+		assert!(!c.on_ground);
+	}
+
+	#[test]
+	fn collider_blocks_walking() {
+		let mut c = walker();
+		// Wall spanning x at z = -10.
+		let wall = Aabb::centre_half([0.0, 5.0, -10.0], [20.0, 5.0, 1.0]);
+		c.keys.insert(PhysicalKey::Code(KeyCode::KeyW));
+		for _ in 0..180 {
+			c.step(1.0 / 60.0, &[wall]);
+		}
+		// Stopped in front of the wall (its face is at z = -9).
+		assert!(c.pos[2] > -9.5, "blocked by the wall, z={}", c.pos[2]);
+	}
+
+	#[test]
+	fn stands_on_a_collider_top() {
+		let mut c = walker();
+		let platform = Aabb::centre_half([0.0, 5.0, 0.0], [10.0, 5.0, 10.0]);
+		c.pos = [0.0, 15.0, 0.0];
+		for _ in 0..240 {
+			c.step(1.0 / 60.0, &[platform]);
+		}
+		assert!(c.on_ground);
+		assert!((c.pos[1] - 10.0).abs() < 0.05, "standing on the box top, y={}", c.pos[1]);
+	}
+
+	#[test]
+	fn fly_mode_ignores_gravity() {
+		let mut c = walker();
+		c.toggle_fly();
+		c.keys.insert(PhysicalKey::Code(KeyCode::Space));
+		let y0 = c.camera.pos[1];
+		for _ in 0..30 {
+			c.step(1.0 / 60.0, &[]);
+		}
+		assert!(c.camera.pos[1] > y0 + 5.0, "flew up: {} -> {}", y0, c.camera.pos[1]);
 	}
 }

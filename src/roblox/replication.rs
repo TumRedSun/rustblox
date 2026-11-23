@@ -30,12 +30,25 @@ pub enum RepEvent {
 		name: String,
 		value: Prop,
 	},
+	/// A fork message whose payload was decoded: `inflated` = the body came
+	/// out of a zstd frame, `body` = its plaintext length.
+	Decoded {
+		head: u16,
+		body: usize,
+		inflated: bool,
+	},
+	/// Readable strings pulled out of the replication stream (class and
+	/// property names from the schema dictionary, part names, usernames).
+	Names(Vec<String>),
 	/// Raw packet we could not decode (id + first bytes), kept for diagnostics.
 	Unknown {
 		packet_type: u32,
 		len: usize,
 	},
 }
+
+/// zstd frame magic (`28 b5 2f fd`).
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
 
 pub struct ReplicationParser {
 	/// Packets processed (any kind).
@@ -45,9 +58,13 @@ pub struct ReplicationParser {
 	/// Chunks we had to skip.
 	pub skipped: u64,
 	/// Real fork replication packets (`0x83..`/`0x8d..` heads) delivered by
-	/// the transport but not yet decoded: the payload layer below the head
-	/// is still being reverse-engineered.
+	/// the transport.
 	pub replication: u64,
+	/// Fork bodies that arrived as zstd frames.
+	pub inflated: u64,
+	/// Compressed / plaintext byte totals of the fork bodies.
+	pub bytes_in: u64,
+	pub bytes_out: u64,
 	/// Per-head counts of those packets, keyed by the two-byte head.
 	pub heads: std::collections::BTreeMap<u16, u64>,
 	/// How many hexdumps we already logged (limit the flood).
@@ -61,6 +78,9 @@ impl ReplicationParser {
 			decoded: 0,
 			skipped: 0,
 			replication: 0,
+			inflated: 0,
+			bytes_in: 0,
+			bytes_out: 0,
 			heads: std::collections::BTreeMap::new(),
 			hexdumps: 0,
 		}
@@ -84,26 +104,97 @@ impl ReplicationParser {
 			return;
 		}
 		self.packets += 1;
-		// The fork's post-handshake stream is NOT the legacy u32-header form:
-		// real messages start with a two-byte head (`83 xx` = data clusters,
-		// `8d xx` = compressed/stream variant). Treating those four bytes as
-		// `u32 LE` set the "compressed" bit from the head and sent the parser
-		// down a zlib path that cannot work. Count and surface them instead
-		// until the payload layer is decoded.
-		if matches!(payload[0], 0x83 | 0x8d) {
-			self.replication += 1;
-			let head = u16::from_be_bytes([payload[0], payload[1]]);
-			*self.heads.entry(head).or_insert(0) += 1;
-			if self.hexdumps < 24 {
-				self.hexdumps += 1;
-				self.log_hex(
-					&format!("replication head {:02x}{:02x} (undecoded)", payload[0], payload[1]),
-					payload,
-				);
-			}
-			events.push(RepEvent::Unknown { packet_type: u32::from(head), len: payload.len() });
+		self.bytes_in += payload.len() as u64;
+		// The fork's application layer always sets bit 7 in its first byte
+		// (`0x81`, `0x83`, `0x8d`, `0x97`, `0xa1`…), while the legacy stream
+		// used a little-endian u32 header whose low nibble is the type.
+		if payload[0] & 0x80 != 0 {
+			self.fork_message(payload, dm, events, depth);
 			return;
 		}
+		self.legacy_message(payload, dm, events, depth);
+	}
+
+	/// One fork application message: `[head u8][sub u8]…`, with big bodies
+	/// carried as zstd frames (the magic sits at different header offsets
+	/// depending on the subtype, so it is located, not assumed).
+	fn fork_message(
+		&mut self,
+		payload: &[u8],
+		dm: &mut DataModel,
+		events: &mut Vec<RepEvent>,
+		_depth: u32,
+	) {
+		self.replication += 1;
+		let head = u16::from_be_bytes([payload[0], payload[1.min(payload.len() - 1)]]);
+		*self.heads.entry(head).or_insert(0) += 1;
+
+		let z = payload.windows(4).take(24).position(|w| w == ZSTD_MAGIC);
+		let body = match z {
+			Some(z) => match inflate_zstd(&payload[z..]) {
+				Some(b) => {
+					self.inflated += 1;
+					self.bytes_out += b.len() as u64;
+					b
+				}
+				None => {
+					self.skipped += 1;
+					if self.hexdumps < 24 {
+						self.log_hex(
+							&format!(
+								"zstd inflate failed for {:02x}{:02x}",
+								payload[0],
+								payload[1.min(payload.len() - 1)]
+							),
+							payload,
+						);
+					}
+					events.push(RepEvent::Unknown {
+						packet_type: u32::from(head),
+						len: payload.len(),
+					});
+					return;
+				}
+			},
+			None => payload[2..].to_vec(),
+		};
+
+		// String table: both the schema dictionary (`97 0d`) and the cluster
+		// bodies use `u8 length + ASCII`. Harvest what is readable; classes,
+		// property names, part names and usernames all show up this way.
+		let names = extract_names(&body);
+		if !names.is_empty() {
+			for n in &names {
+				if dm.strings.len() < 8192 {
+					dm.strings.insert(n.clone());
+				}
+			}
+			events.push(RepEvent::Names(names));
+		}
+		if self.hexdumps < 24 && (payload[0] == 0x97 || payload[1.min(payload.len() - 1)] == 0x0d) {
+			self.log_hex(
+				&format!(
+					"fork {:02x}/{:02x} inflated {} bytes ({} in)",
+					payload[0],
+					payload[1.min(payload.len() - 1)],
+					body.len(),
+					payload.len()
+				),
+				&body,
+			);
+		}
+		events.push(RepEvent::Decoded { head, body: body.len(), inflated: z.is_some() });
+	}
+
+	/// Legacy u32-header stream (Studio/TeamTest servers and the older
+	/// public fork shape).
+	fn legacy_message(
+		&mut self,
+		payload: &[u8],
+		dm: &mut DataModel,
+		events: &mut Vec<RepEvent>,
+		depth: u32,
+	) {
 		let header = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
 		let ptype = header & 0x0f;
 		let compressed = header & 0x8000_0000 != 0;
@@ -394,6 +485,56 @@ fn inflate(data: &[u8]) -> Option<Vec<u8>> {
 	}
 }
 
+/// Inflate one zstd frame (`28 b5 2f fd …`). ruzstd stops at the frame end;
+/// the output is capped so a hostile length cannot exhaust memory.
+fn inflate_zstd(data: &[u8]) -> Option<Vec<u8>> {
+	use std::io::Read;
+	let dec = ruzstd::streaming_decoder::StreamingDecoder::new(data).ok()?;
+	let mut out = Vec::new();
+	dec.take(32 * 1024 * 1024).read_to_end(&mut out).ok()?;
+	if out.is_empty() {
+		None
+	} else {
+		Some(out)
+	}
+}
+
+/// Harvest the fork's length-prefixed ASCII strings from a replication body.
+/// Two conventions appear: `u8 len` (the schema dictionary `97 0d` and the
+/// cluster stream) and `u16 LE len` (the policy/flag message `93 00`). Used
+/// for class and property names, part names and usernames.
+fn extract_names(buf: &[u8]) -> Vec<String> {
+	let mut out = Vec::new();
+	let mut i = 0usize;
+	while i < buf.len() {
+		if let Some((s, used)) = string_at(buf, i) {
+			out.push(s);
+			i += used;
+			continue;
+		}
+		i += 1;
+	}
+	out
+}
+
+/// Try to read one length-prefixed printable ASCII string at `i`.
+fn string_at(buf: &[u8], i: usize) -> Option<(String, usize)> {
+	let candidates: [(usize, usize); 2] =
+		[(buf[i] as usize, 1), (u16::from_le_bytes([buf[i], *buf.get(i + 1)?]) as usize, 2)];
+	for (n, hdr) in candidates {
+		if !(2..=64).contains(&n) || i + hdr + n > buf.len() {
+			continue;
+		}
+		let s = &buf[i + hdr..i + hdr + n];
+		if s.iter().all(|c| (0x20..0x7f).contains(c)) {
+			if let Ok(t) = std::str::from_utf8(s) {
+				return Some((t.to_string(), hdr + n));
+			}
+		}
+	}
+	None
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -492,6 +633,22 @@ mod tests {
 	}
 
 	#[test]
+	fn names_honour_both_length_conventions() {
+		// `u8 len` (schema/cluster) and `u16 LE len` (policy message).
+		let mut buf = Vec::new();
+		buf.push(4);
+		buf.extend_from_slice(b"Part");
+		buf.extend_from_slice(&32u16.to_le_bytes());
+		buf.extend_from_slice(b"UserPlayerScriptsSAuthDirectAPIs");
+		buf.extend_from_slice(&5u16.to_le_bytes());
+		buf.extend_from_slice(b"false");
+		let names = extract_names(&buf);
+		assert!(names.contains(&"Part".to_string()), "{:?}", names);
+		assert!(names.contains(&"UserPlayerScriptsSAuthDirectAPIs".to_string()), "{:?}", names);
+		assert!(names.contains(&"false".to_string()), "{:?}", names);
+	}
+
+	#[test]
 	fn delete_event() {
 		let mut p = ReplicationParser::new();
 		let mut dm = DataModel::new();
@@ -506,5 +663,66 @@ mod tests {
 		let events = p.feed(&packet, &mut dm);
 		assert!(matches!(events[0], RepEvent::InstanceRemoved { r: 55 }));
 		assert!(dm.get_by_ref(55).is_none());
+	}
+
+	/// Hex decode for the captured vectors below.
+	fn unhex(s: &str) -> Vec<u8> {
+		let clean: Vec<u8> = s.bytes().filter(|b| b.is_ascii_hexdigit()).collect();
+		clean
+			.chunks(2)
+			.filter_map(|c| {
+				let hi = (c[0] as char).to_digit(16)?;
+				let lo = (c[1] as char).to_digit(16)?;
+				Some((hi * 16 + lo) as u8)
+			})
+			.collect()
+	}
+
+	// Live v29 capture, `8d 01` #11922: the fork's biggest stream type is a
+	// zstd frame; 105 wire bytes inflate to 215 bytes of bit-packed cluster
+	// data. Proves the payload layer is zstd, not a second cipher.
+	#[test]
+	fn fork_zstd_body_inflates() {
+		let mut p = ReplicationParser::new();
+		let mut dm = DataModel::new();
+		let msg = unhex(
+			"8d01b17e0100045a000000d700000028b52ffd20d78d02004404040100e4008bffcb870e4b7ecb87b14b7fcb76014b7ecb870a4b7b4b604b564b5a4b6d4b80cb87094b674b514b474b4a4b5b4b7a4f4b444b484b594b7ccb87170880ff0003003965d0af5222c12614",
+		);
+		let events = p.feed(&msg, &mut dm);
+		assert_eq!(p.replication, 1);
+		assert_eq!(p.inflated, 1, "the body must come out of a zstd frame");
+		assert_eq!(p.skipped, 0);
+		assert!(events
+			.iter()
+			.any(|e| matches!(e, RepEvent::Decoded { head: 0x8d01, body: 215, inflated: true })));
+		assert_eq!(p.bytes_out, 215);
+	}
+
+	// Live v29 capture, `83 0d` #12867: a world cluster body that inflates to
+	// plaintext asset ids and part names. This is the world data the client
+	// needs — it was never encrypted, only zstd-compressed.
+	#[test]
+	fn fork_cluster_names_decode() {
+		let mut p = ReplicationParser::new();
+		let mut dm = DataModel::new();
+		let msg = unhex(
+			"830d01000000b6000000ad00000028b52ffd20ad69050001746a00005001037a130041f84eb140361b7441050117726278617373657469643a2f2f3638343330353132313207010d010e0a92f990232494612626a4d19a156a4e0fbed693bd5d89433ddb864fbf106cee484537c050457b5fbf4411d2b44841069581428f188a4312c9a5964313011dcf6179447a35f341b6e8eac400647fc93e5140210023bb7657260031a00a340247a7f1233fb6f6e23ef93b9c3f4c06486f6c646572ff017ba400000c08000ffedf09090908000ff8e00908000ffee0090909090908000ff8e10908000ffee1090909090908000ff8e20908000ffee209090908000ffee309090100",
+		);
+		let events = p.feed(&msg, &mut dm);
+		assert_eq!(p.inflated, 1);
+		let names: Vec<String> = events
+			.iter()
+			.flat_map(|e| match e {
+				RepEvent::Names(v) => v.clone(),
+				_ => Vec::new(),
+			})
+			.collect();
+		assert!(
+			dm.strings.contains("rbxassetid://6843051212"),
+			"asset id not harvested: {:?}",
+			names
+		);
+		assert!(dm.strings.contains("Holder"), "part name not harvested");
+		assert_eq!(p.bytes_out, 173, "inflated body length");
 	}
 }

@@ -120,26 +120,80 @@ fn main() {
 	// Replication diagnostics.
 	let mut parser = rustblox::roblox::replication::ReplicationParser::new();
 	let mut dm = rustblox::world::DataModel::new();
+	// Experimental: replay the captured client-side game-join payloads
+	// (`a7 90 92 8a 8f`, see analysis/gamejoin_frames.py) once the server
+	// has sent its policy message. Used to find out what the server needs
+	// before it starts replicating; the blobs are opaque (app-layer
+	// encrypted) so they cannot be synthesized yet.
+	let replay_dir = std::env::var("RUSTBLOX_REPLAY_JOIN").ok();
+	let mut replay: Vec<(String, Vec<u8>)> = Vec::new();
+	if let Some(dir) = &replay_dir {
+		for name in ["a7_321.bin", "90_359.bin", "92_359.bin", "8a_363.bin", "8f_363.bin"] {
+			let path = format!("{}/{}", dir, name);
+			if let Ok(b) = std::fs::read(&path) {
+				println!("      replay blob {} ({} bytes)", name, b.len());
+				replay.push((name.to_string(), b));
+			}
+		}
+	}
+	let mut replayed = false;
 	let start = Instant::now();
 	let mut events_total = 0usize;
+	let mut app_log = 0usize;
 	while start.elapsed() < Duration::from_secs(12) {
 		while let Some(payload) = rak.poll() {
+			if payload.first().map(|b| b & 0x80 != 0).unwrap_or(false) && app_log < 40 {
+				app_log += 1;
+				let head: String =
+					payload[..payload.len().min(20)].iter().map(|b| format!("{:02x}", b)).collect();
+				println!("      app msg len={} head={}", payload.len(), head);
+				if payload[0] == 0x9b
+					&& payload.len() > 9
+					&& std::env::var("RUSTBLOX_ANSWER_9B").is_ok()
+				{
+					// The client's answer echoes server bytes [5..9] and adds
+					// four opaque bytes (capture #377). Try a zero tail.
+					let mut ans = vec![0x9bu8];
+					ans.extend_from_slice(&payload[5..9]);
+					ans.extend_from_slice(&[0u8; 4]);
+					rak.send_reliable(&ans);
+					println!(
+						"      -> answered 9b: {}",
+						ans.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+					);
+				}
+			}
+			if !replayed && !replay.is_empty() && payload.first() == Some(&0x93) {
+				replayed = true;
+				for (name, blob) in &replay {
+					rak.send_reliable(blob);
+					println!("      -> sent replay {}", name);
+				}
+				rak.flush();
+			}
 			events_total += parser.feed(&payload, &mut dm).len();
 		}
 		rak.tick();
 		std::thread::sleep(Duration::from_millis(5));
 	}
 	println!(
-        "      12s diagnostics: raknet state={:?} ping={:?} packets={} decoded={} skipped={} replication={} events={} instances={}",
+        "      12s diagnostics: raknet state={:?} ping={:?} packets={} decoded={} skipped={} replication={} zstd={} inflated-bytes={} events={} instances={} names={}",
         rak.state,
         rak.ping_ms.map(|p| format!("{:.0}ms", p)),
         parser.packets,
         parser.decoded,
         parser.skipped,
         parser.replication,
+        parser.inflated,
+        parser.bytes_out,
         events_total,
-        dm.len()
+        dm.len(),
+        dm.strings.len()
     );
+	if !dm.strings.is_empty() {
+		let sample: Vec<&str> = dm.strings.iter().take(8).map(|s| s.as_str()).collect();
+		println!("      decoded names: {:?}", sample);
+	}
 	// Which replication heads the server actually sends (top 6).
 	let mut heads: Vec<(u16, u64)> = parser.heads.iter().map(|(k, v)| (*k, *v)).collect();
 	heads.sort_by_key(|(_, n)| std::cmp::Reverse(*n));

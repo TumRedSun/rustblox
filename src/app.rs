@@ -22,7 +22,7 @@ use winit::event::{
 	ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, Touch, TouchPhase, WindowEvent,
 };
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowLevel};
 
 pub const WINDOW_W: f32 = 1100.0;
@@ -380,7 +380,7 @@ impl App {
 					0.0,
 				);
 			}
-			GameView::Active { session, place_name, fps, .. } => {
+			GameView::Active { session, ctrl, place_name, fps, .. } => {
 				let st = session.state.lock().unwrap_or_else(|p| p.into_inner());
 				let pad = 14.0 * s;
 				let lines: Vec<(String, f32)> = vec![
@@ -396,8 +396,10 @@ impl App {
 					),
 					(
 						format!(
-							"replication: {} packets  ({})",
+							"replication: {} packets  zstd: {}  names: {}  ({})",
 							st.replication,
+							st.inflated,
+							st.names,
 							if st.repl_heads.is_empty() { "waiting…" } else { &st.repl_heads }
 						),
 						13.0 * s,
@@ -411,6 +413,19 @@ impl App {
 							st.packets,
 							st.decoded,
 							st.skipped
+						),
+						13.0 * s,
+					),
+					(
+						format!(
+							"mode: {}   pos: {:.0}, {:.0}, {:.0}",
+							match ctrl.mode {
+								crate::game::ControlMode::Walk => "walk",
+								crate::game::ControlMode::Fly => "fly (debug)",
+							},
+							ctrl.pos[0],
+							ctrl.pos[1],
+							ctrl.pos[2]
 						),
 						13.0 * s,
 					),
@@ -528,7 +543,7 @@ impl App {
 						fb,
 						pad + 12.0 * s,
 						h as f32 - pad - 8.0 * s,
-						"joystick — fly   drag — look   +/- — up/down   X — leave",
+						"joystick — move   drag — look   + — jump   X — leave",
 						12.0 * s,
 						t.text_dim,
 						false,
@@ -540,7 +555,7 @@ impl App {
 						fb,
 						pad + 12.0 * s,
 						h as f32 - pad - 8.0 * s,
-						"Esc — leave   LMB — capture mouse   WASD — fly   Space/Shift — up/down",
+						"Esc — release / leave   LMB — capture mouse   WASD — walk   Space — jump   F — fly",
 						12.0 * s,
 						t.text_dim,
 						false,
@@ -1785,13 +1800,32 @@ impl ApplicationHandler<UserEvent> for App {
 			WindowEvent::KeyboardInput { event, .. } => {
 				// Game screen consumes keys first (movement + Esc).
 				if let Screen::Game(GameView::Active { ctrl, .. }) = &mut self.screen {
+					let mut action = 0u8; // 1 = release mouse, 2 = leave
 					if event.state == ElementState::Pressed {
 						ctrl.keys.insert(event.physical_key);
 						if matches!(event.logical_key, Key::Named(NamedKey::Escape)) {
-							self.leave_game(None);
+							// Roblox-like: the first Esc releases the captured
+							// mouse, a second one leaves the experience.
+							action = if ctrl.pointer_locked { 1 } else { 2 };
+						}
+						if let PhysicalKey::Code(code) = event.physical_key {
+							match code {
+								KeyCode::Space => ctrl.jump = true,
+								KeyCode::KeyF => ctrl.toggle_fly(),
+								KeyCode::KeyR => ctrl.respawn = true,
+								_ => {}
+							}
 						}
 					} else {
 						ctrl.keys.remove(&event.physical_key);
+					}
+					if action == 1 {
+						ctrl.pointer_locked = false;
+					}
+					match action {
+						1 => self.release_pointer(),
+						2 => self.leave_game(None),
+						_ => {}
 					}
 					return;
 				}
@@ -1852,8 +1886,19 @@ impl ApplicationHandler<UserEvent> for App {
 			let dt = last_frame.elapsed().as_secs_f32().min(0.1);
 			*last_frame = now;
 			*fps = *fps * 0.9 + (1.0 / dt.max(1.0 / 240.0)) * 0.1;
-			ctrl.step(dt);
 			let st = session.state.lock().unwrap_or_else(|p| p.into_inner());
+			// Spawn the character once the world (or the fallback ground)
+			// gives us a place to stand.
+			if !ctrl.spawned && st.pos_init {
+				ctrl.place(st.local_pos);
+			}
+			ctrl.step(dt, &st.colliders);
+			// Publish the character + camera back for the scene builder and
+			// the renderer (the game thread rebuilds parts, not the camera).
+			let mut st = st;
+			st.local_pos = ctrl.pos;
+			st.local_yaw = ctrl.yaw;
+			st.scene.camera = ctrl.camera;
 			let phase = st.phase.clone();
 			drop(st);
 			if matches!(phase, GamePhase::Failed(_) | GamePhase::Left) {

@@ -82,11 +82,17 @@ impl RakClient {
 			crypto_connected: false,
 			// Offline-id generation that answered phase 1.
 			fork: ForkGen::Roblox,
+			started: Instant::now(),
+			request_ms: 0,
+			server_ms: 0,
+			accepted: None,
+			announced: false,
 			reliability_index: 0,
 			order_index: 0,
 			datagram_seq: 0,
 			split_id: 0,
 			out_queue: HashMap::new(),
+			sent_msgs: HashMap::new(),
 			frame_buf: Vec::new(),
 			received_datagrams: HashSet::new(),
 			ack_buffer: Vec::new(),
@@ -507,6 +513,16 @@ impl RakClient {
 				netlog!(net, "CONNECTION_REQUEST send failed: {}", e);
 			} else {
 				netlog!(net, "CONNECTION_REQUEST sent");
+				if c.early.is_some() {
+					// The steady CONNECTION_REQUEST is itself RakNet
+					// datagram 0 / reliable message 0. The next frame must
+					// continue from 1 or the server treats it as a duplicate
+					// and stays silent (the capture's first game datagram is
+					// `81 01 00 00 … 60 03 30 01 00 00` = dgram 1, msg 1).
+					c.datagram_seq = 1;
+					c.reliability_index = 1;
+					c.request_ms = u64::from(u16::from_be_bytes([0xfd, 0xfc]));
+				}
 			}
 
 			if let Some(payload) = c.wait_readable(deadline) {
@@ -567,6 +583,23 @@ impl RakClient {
 							first,
 							payload.len()
 						);
+						if c.early.is_some() {
+							// The first steady datagram carries the framed
+							// ACCEPTED, so switch the crypto framing on and
+							// let the system layer answer it (NEW_INCOMING +
+							// the clock-sync burst) right now — the server
+							// starts replicating only after that.
+							c.crypto_connected = true;
+							c.state = RakState::Connected;
+							c.ingest_plain(&payload);
+							if !c.announced {
+								netlog!(
+									net,
+									"steady datagram did not carry a framed ACCEPTED — \
+									 the connected handshake was not answered"
+								);
+							}
+						}
 						break;
 					}
 					Some((&other, _)) => netlog!(net, "got id 0x{:02x} while connecting", other),
