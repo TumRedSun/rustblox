@@ -147,6 +147,23 @@ fn main() {
 				let head: String =
 					payload[..payload.len().min(20)].iter().map(|b| format!("{:02x}", b)).collect();
 				println!("      app msg len={} head={}", payload.len(), head);
+				if payload[0] == 0x9b && payload.len() > 9 {
+					// Experiment: send the 9-byte reply captured from the real
+					// client (head 0x9b + 8 opaque bytes) and see whether the
+					// server accepts it (account-constant) or not (per-challenge).
+					if let Ok(path) = std::env::var("RUSTBLOX_9B_REPLY") {
+						if let Ok(b) = std::fs::read(&path) {
+							rak.send_reliable(&b);
+							rak.flush();
+							println!(
+								"      -> sent captured 9b reply ({} bytes): {}",
+								b.len(),
+								b.iter().map(|x| format!("{:02x}", x)).collect::<String>()
+							);
+							continue;
+						}
+					}
+				}
 				if payload[0] == 0x9b
 					&& payload.len() > 9
 					&& std::env::var("RUSTBLOX_ANSWER_9B").is_ok()

@@ -725,3 +725,23 @@ frames and watch for the server's `83 xx` / `8d xx` stream.
 Files: `session-crypto/analysis/split_{4,5,6}.bin`, parsers
 `analysis/parse_aead.py` + `analysis/splits.py`, hooks
 `scripts/hook_v5{5,6,7,8}.js`.
+
+### Replay test result (24 Nov): the 9b gate is challenge-derived
+
+`cargo run --example join_flow -- 606849621` with
+`RUSTBLOX_REPLAY_JOIN=<pre-seal blobs>` and `RUSTBLOX_9B_REPLY=<answer file>`:
+
+- **The a7/90/8a plaintext replay is accepted**: right after it the server
+  sends `0x93` (`UserPlayerScript…`, 2087 B) and then the `9b` challenge
+  (2038 B). So those blobs are the right client payloads and the transport
+  path (our own keys) is fine.
+- **Replaying the 9-byte answer from another session does not pass**:
+  `9b f7 b8 d2 87 d9 69 c6 96` → the server disconnects. The challenge's
+  first 8 bytes differ per session (`9b 8c3f511caa1a9f86…` vs
+  `9b 8bd685c3c0559749…`), so the answer is **derived from the challenge**,
+  not an account constant — it has to be computed.
+- Next: capture the *incoming* plaintext in the app (the same `9b` challenge)
+  to get a real (challenge → answer) pair, then reverse the derivation.
+  Hook plan: at the AEAD wrapper dump `rdi`/`rdx`/`rcx` **after** the call
+  to find where the open path writes its plaintext (the current dump only
+  sees the ciphertext for opens).
