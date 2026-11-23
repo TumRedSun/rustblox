@@ -9,7 +9,7 @@ mod render;
 mod scene3d;
 mod ui;
 
-use core::texture::ImageEntry;
+use crate::gfx::core::texture::ImageEntry;
 use std::collections::HashMap;
 
 /// GPU context owned by the app: one surface, one UI pipeline and the

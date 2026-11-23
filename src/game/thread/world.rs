@@ -1,6 +1,7 @@
 //! World queries used by the game thread: spawn point and character
 //! colliders decoded from the DataModel.
 
+use crate::game::Aabb;
 use crate::gfx::math::Vec3;
 use crate::world::{DataModel, Prop};
 
@@ -29,8 +30,7 @@ pub(super) fn find_spawn(dm: &DataModel) -> Option<Vec3> {
 /// Colliders for the local character: every solid part of the decoded world
 /// as a world-space AABB (rotation approximated by its extents, which is
 /// exact for the axis-aligned parts that dominate Roblox builds).
-pub(super) fn collect_colliders(dm: &DataModel) -> Vec<crate::game::Aabb> {
-	use crate::game::Aabb;
+pub(super) fn collect_colliders(dm: &DataModel) -> Vec<Aabb> {
 	let Some(root) = dm.find_root("DataModel").or(dm.root) else { return Vec::new() };
 	let mut out = Vec::new();
 	for id in dm.walk(root) {
