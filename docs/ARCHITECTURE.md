@@ -10,7 +10,8 @@ migrated toward, subsystem by subsystem.
 |---|---|
 | Tooling (fmt/clippy/lints/hooks) | Done (this doc, `rustfmt.toml`, `clippy.toml`, `Cargo.toml [lints]`, `.githooks/`) |
 | Network: `crypto` (was `roblox::early`) | **Done** — `src/net/crypto/{mod,counter,handshake,keyring}.rs`, tests split out, `#![deny(unwrap/expect/panic)]` locally |
-| Network: `raknet`, `udmux`, `net`/socket | Not started — next up |
+| Network: `udmux` (was `roblox::udmux`) | **Done** — `src/net/udmux/{mod,envelope,token,netstack}.rs`, same lint policy |
+| Network: `raknet`, `net`/socket | Not started — next up (the big one, 2540 lines) |
 | HTTP/Roblox API (`join`, `client`, `auth`, `dns`, `types`, `errors`) | Not started |
 | UI (`app`, `menu_ui`, `ui`, `login_ui`, `draw`, `font`) | Not started |
 | Render (`gfx`, `world`, `game`, `model`) | Not started |
@@ -155,9 +156,11 @@ src/net/
     wire/
       mod.rs              — datagram/frame encode/decode
       reliability.rs      — ACK/NACK, send window, split reassembly
-  udmux/                  — NOT STARTED (still src/roblox/udmux.rs, 570 lines)
-    mod.rs
-    envelope.rs           — RUPP header encode/decode
+  udmux/                  — DONE
+    mod.rs                — proxy table, is_private/proxy_for
+    envelope.rs           — Envelope, RUPP frame/parse, envelope_candidates
+    token.rs              — b64_decode/percent_decode
+    netstack.rs           — NetStackConfig blob parser
   socket.rs               — NOT STARTED — UDP socket, split out of raknet.rs
 ```
 
@@ -169,3 +172,10 @@ rather than a size exception. The crypto split needed exactly this once:
 `handshake.rs` (a second `impl EarlyCrypto` block in a different file —
 legal in Rust, and exactly how `counter.rs` and `handshake.rs` each add
 their own `impl EarlyCrypto`) once `mod.rs` alone passed 350 lines.
+
+**Known leftover from the `udmux` migration**: `envelope::rupp_parse`
+returns a 4-tuple (`(u8, [u8; 16], [u8; 8], usize)`), which trips clippy's
+`type_complexity` style note (not a hard error). Its one real call site is
+in the still-unmigrated `raknet.rs`; fixing it into a named struct is left
+for the `raknet` migration so both sides change together instead of leaving
+a half-updated signature.

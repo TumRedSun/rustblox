@@ -225,8 +225,8 @@ impl EarlyCrypto {
 		// The join script ships the key percent-encoded (`%2B`/`%2F`/`%3D`)
 		// — percent-decode FIRST, then base64. Decoding the raw string
 		// yields 0 bytes and silently disabled the whole crypto handshake.
-		let decoded = crate::roblox::udmux::percent_decode(eepk_encoded);
-		let key = crate::roblox::udmux::b64_decode(&decoded);
+		let decoded = crate::net::udmux::percent_decode(eepk_encoded);
+		let key = crate::net::udmux::b64_decode(&decoded);
 		if key.len() != 32 {
 			return None;
 		}

@@ -381,7 +381,7 @@ pub struct RakClient {
 	/// probe candidate, or bare/raw when no envelope is needed). Applied to
 	/// every datagram sent after it was confirmed — the proxy binds the
 	/// client->RCC mapping to the exact clear-header shape.
-	envelope: Option<crate::roblox::udmux::Envelope>,
+	envelope: Option<crate::net::udmux::Envelope>,
 	/// The 16-byte tag we put in our pre-connect RUPP headers (client's own
 	/// choice — the live capture shows it matches no join-script field).
 	client_tag: [u8; 16],
@@ -539,10 +539,10 @@ impl RakClient {
 			}
 		}
 		let token_tag: Option<[u8; 16]> =
-			udmux_token.and_then(|(tok, _)| crate::roblox::udmux::decode_token16(tok));
+			udmux_token.and_then(|(tok, _)| crate::net::udmux::decode_token16(tok));
 		let known_shape = match (rcc, token_tag) {
 			(Some((ip, port)), Some(tag)) => {
-				let env = crate::roblox::udmux::client_envelope(&tag, (ip, port));
+				let env = crate::net::udmux::client_envelope(&tag, (ip, port));
 				netlog!(
 					net,
 					"envelope: pinning the capture shape with the session token as the tag \
@@ -554,7 +554,7 @@ impl RakClient {
 				Some(env)
 			}
 			(Some((ip, port)), None) => {
-				let env = crate::roblox::udmux::client_envelope(&c.client_tag, (ip, port));
+				let env = crate::net::udmux::client_envelope(&c.client_tag, (ip, port));
 				netlog!(
 					net,
 					"envelope: no usable TokenValue — pinning the capture shape with a random \
@@ -567,9 +567,9 @@ impl RakClient {
 			}
 			_ => None,
 		};
-		let envelopes: Vec<crate::roblox::udmux::Envelope> = match udmux_token {
-			None => vec![crate::roblox::udmux::BARE],
-			Some((tok, pepper)) => crate::roblox::udmux::envelope_candidates(tok, pepper),
+		let envelopes: Vec<crate::net::udmux::Envelope> = match udmux_token {
+			None => vec![crate::net::udmux::BARE],
+			Some((tok, pepper)) => crate::net::udmux::envelope_candidates(tok, pepper),
 		};
 		let (pinned, probe_pong) = if known_shape.is_some() {
 			(known_shape, false)
@@ -600,7 +600,7 @@ impl RakClient {
 		// must not inherit a token header), then each envelope candidate ×
 		// the fork shape — enough to notice a shape that answers OCR1 but
 		// not pings.
-		let mut p1_variants: Vec<(crate::roblox::udmux::Envelope, u8, u8)> = Vec::new();
+		let mut p1_variants: Vec<(crate::net::udmux::Envelope, u8, u8)> = Vec::new();
 		match &pinned {
 			Some(env) => {
 				// Token type / tag-value variants FIRST — the proxy gates on
@@ -648,19 +648,19 @@ impl RakClient {
 			}
 			None => {
 				p1_variants.push((
-					crate::roblox::udmux::BARE,
+					crate::net::udmux::BARE,
 					RBX_ID_OPEN_CONNECTION_REQUEST_1,
 					RBX_PROTOCOL_VERSION,
 				));
 				p1_variants.push((
-					crate::roblox::udmux::BARE,
+					crate::net::udmux::BARE,
 					ID_OPEN_CONNECTION_REQUEST_1,
 					RBX_PROTOCOL_VERSION,
 				));
 				for &pr in protocol_versions {
 					if pr != RBX_PROTOCOL_VERSION {
 						p1_variants.push((
-							crate::roblox::udmux::BARE,
+							crate::net::udmux::BARE,
 							RBX_ID_OPEN_CONNECTION_REQUEST_1,
 							pr,
 						));
@@ -787,7 +787,7 @@ impl RakClient {
 						// bytes, the rest is the zero pad to 1160.
 						out.resize(RBX_OFFLINE_PROBE.saturating_sub(hlen), 0x00);
 					},
-					move |_| pinned_env.unwrap_or(crate::roblox::udmux::BARE),
+					move |_| pinned_env.unwrap_or(crate::net::udmux::BARE),
 					|c, payload| c.parse_reply2_crypto(payload),
 				);
 				match res {
@@ -842,7 +842,7 @@ impl RakClient {
 					let hlen = env_for_pad.map(|e| e.direction as usize).unwrap_or(0);
 					out.resize(RBX_OFFLINE_PROBE.saturating_sub(hlen), 0x00);
 				},
-				move |_| pinned_env.unwrap_or(crate::roblox::udmux::BARE),
+				move |_| pinned_env.unwrap_or(crate::net::udmux::BARE),
 				|c, payload| c.parse_reply2(payload),
 			)?
 		};
@@ -1005,7 +1005,7 @@ impl RakClient {
 			None => buf,
 			Some(env) if env.direction == 0 => buf,
 			Some(env) => {
-				owned = crate::roblox::udmux::rupp_frame(env, buf);
+				owned = crate::net::udmux::rupp_frame(env, buf);
 				&owned
 			}
 		};
@@ -1069,7 +1069,7 @@ impl RakClient {
 	/// server answers inside the envelope of its direction (0x1f), so this
 	/// runs on every recv path.
 	fn strip_incoming(&mut self, payload: Vec<u8>, ctx: &str) -> Vec<u8> {
-		if let Some((dir, epoch, mux, hlen)) = crate::roblox::udmux::rupp_parse(&payload) {
+		if let Some((dir, epoch, mux, hlen)) = crate::net::udmux::rupp_parse(&payload) {
 			netlog!(
 				net,
 				"{}: RUPP reply dir 0x{:02x} epoch {} mux {} body {} bytes",
@@ -1110,7 +1110,7 @@ impl RakClient {
 		timeout: Duration,
 		label: &str,
 		mut build: impl FnMut(&P, &mut Vec<u8>, u16),
-		env_of: impl Fn(&P) -> crate::roblox::udmux::Envelope,
+		env_of: impl Fn(&P) -> crate::net::udmux::Envelope,
 		mut parse: F,
 	) -> Result<(R, usize), RakError>
 	where
@@ -1205,9 +1205,9 @@ impl RakClient {
 	/// expects.
 	fn probe_reachability(
 		&mut self,
-		envelopes: &[crate::roblox::udmux::Envelope],
+		envelopes: &[crate::net::udmux::Envelope],
 		per_env: Duration,
-	) -> Option<crate::roblox::udmux::Envelope> {
+	) -> Option<crate::net::udmux::Envelope> {
 		for env in envelopes {
 			self.envelope = if env.direction == 0 { None } else { Some(*env) };
 			for pid in [0x01u8, 0x02u8] {
@@ -2056,14 +2056,14 @@ pub fn netstack_probe(host: &str, port: u16, token: &str, per_shape: Duration) -
 	let _ = socket.set_nonblocking(true);
 
 	let mut shapes: Vec<(String, Vec<u8>)> = Vec::new();
-	for env in crate::roblox::udmux::envelope_candidates(token, 0) {
+	for env in crate::net::udmux::envelope_candidates(token, 0) {
 		let mut body = Vec::with_capacity(1400);
 		body.push(RBX_ID_OPEN_CONNECTION_REQUEST_1);
 		body.extend_from_slice(&OFFLINE_MAGIC);
 		body.push(RBX_PROTOCOL_VERSION);
 		body.resize(1400usize.saturating_sub(env.direction as usize), 0x00);
 		let wire =
-			if env.direction == 0 { body } else { crate::roblox::udmux::rupp_frame(&env, &body) };
+			if env.direction == 0 { body } else { crate::net::udmux::rupp_frame(&env, &body) };
 		shapes.push((format!("{}+0x7b", env.label), wire));
 	}
 	let mut vanilla = Vec::with_capacity(1400);
@@ -2462,7 +2462,7 @@ mod tests {
 			mtu: 1400,
 			state,
 			ping_ms: None,
-			envelope: Some(crate::roblox::udmux::client_envelope(
+			envelope: Some(crate::net::udmux::client_envelope(
 				&[7u8; 16],
 				("10.206.18.67".parse().unwrap(), 49251),
 			)),

@@ -460,7 +460,7 @@ fn join_request(
 			// Shape diagnostics for the routing token: 24 base64 chars are
 			// 18 raw bytes unpadded but 16 with "==" — and 16 is exactly the
 			// RUPP epoch-tag width the proxy routes on.
-			let dec = crate::roblox::udmux::b64_decode(t);
+			let dec = crate::net::udmux::b64_decode(t);
 			crate::netlog!(
 				info,
 				"join: udmux token present ({} chars, b64 -> {} bytes, padded={})",
@@ -488,7 +488,7 @@ fn join_request(
 		{
 			let parts: Vec<&str> = ct.split(';').collect();
 			if parts.len() > 2 {
-				let blob = crate::roblox::udmux::b64_decode(parts[2].trim());
+				let blob = crate::net::udmux::b64_decode(parts[2].trim());
 				crate::netlog!(
 					info,
 					"join: ClientTicket part2 = {} bytes (the OCR2 paBlob)",
@@ -532,7 +532,7 @@ fn join_request(
 			// (pubKey/port/caps/certHashes) never come out. The config itself is
 			// not a credential; token-ish VALUES inside the parsed pairs are
 			// logged as lengths only (see below).
-			let dec = crate::roblox::udmux::percent_decode(c);
+			let dec = crate::net::udmux::percent_decode(c);
 			crate::netlog!(
 				info,
 				"join: NetStackConfig ({} chars raw, {} decoded): {}",
@@ -541,7 +541,7 @@ fn join_request(
 				dec
 			);
 			resp.netstack_config = dec.clone();
-			for (k, val) in crate::roblox::udmux::parse_netstack_config(&dec) {
+			for (k, val) in crate::net::udmux::parse_netstack_config(&dec) {
 				if is_secret_join_field(&k) {
 					crate::netlog!(info, "join: netstack config: {} = <len {}>", k, val.len());
 				} else {
@@ -559,7 +559,7 @@ fn join_request(
 				info,
 				"join: netstack token present ({} chars, b64 -> {} bytes)",
 				t.len(),
-				crate::roblox::udmux::b64_decode(t).len()
+				crate::net::udmux::b64_decode(t).len()
 			);
 			resp.netstack_token = t.to_string();
 		}
@@ -579,8 +579,8 @@ fn join_request(
 				// bailed with 0 bytes, hiding a perfectly good 32-byte
 				// X25519 public key. ClientPublicKeyData is not base64 at
 				// all but a JSON key-rotation config — log it verbatim.
-				let dec = crate::roblox::udmux::percent_decode(p);
-				let n = crate::roblox::udmux::b64_decode(&dec).len();
+				let dec = crate::net::udmux::percent_decode(p);
+				let n = crate::net::udmux::b64_decode(&dec).len();
 				if n > 0 {
 					crate::netlog!(
                         info,
@@ -1204,7 +1204,7 @@ mod tests {
 		assert_eq!(js.get("TokenGenAlgorithm").and_then(|p| p.as_u64()), Some(1));
 		// The raw NetStackConfig parses through the best-effort parser.
 		let cfg = js.get("NetStackConfig").unwrap().as_str().unwrap();
-		let pairs = crate::roblox::udmux::parse_netstack_config(cfg);
+		let pairs = crate::net::udmux::parse_netstack_config(cfg);
 		assert!(pairs.contains(&("port".to_string(), "64469".to_string())));
 		assert!(pairs.contains(&("mtuSize".to_string(), "1200".to_string())));
 	}

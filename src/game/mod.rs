@@ -164,20 +164,19 @@ fn game_thread(
 		}
 	} else {
 		match resp.ip.parse::<std::net::Ipv4Addr>() {
-			Ok(ip) if crate::roblox::udmux::is_private(ip) => {
-				match crate::roblox::udmux::proxy_for(ip) {
-					Some(proxy) => {
-						netlog!(
-							net,
-							"rcc {} is private — dialing udmux proxy {}:{} (same port)",
-							ip,
-							proxy,
-							resp.port
-						);
-						dial_host = proxy.to_string();
-					}
-					None => {
-						netlog!(
+			Ok(ip) if crate::net::udmux::is_private(ip) => match crate::net::udmux::proxy_for(ip) {
+				Some(proxy) => {
+					netlog!(
+						net,
+						"rcc {} is private — dialing udmux proxy {}:{} (same port)",
+						ip,
+						proxy,
+						resp.port
+					);
+					dial_host = proxy.to_string();
+				}
+				None => {
+					netlog!(
                             net,
                             "rcc {} is private and no udmux proxy is known for the 10.{}.x.x prefix \
                              — direct dial will not leave the LAN (set RUSTBLOX_UDMUX=10.{}=<proxy-ip>)",
@@ -185,9 +184,8 @@ fn game_thread(
                             ip.octets()[1],
                             ip.octets()[1]
                         );
-					}
 				}
-			}
+			},
 			Ok(_) => {}
 			Err(_) => netlog!(net, "rcc address {:?} is not an IPv4 literal", resp.ip),
 		}

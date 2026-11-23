@@ -22,7 +22,7 @@ pub fn parse_keyring(cpkd: &str) -> Option<(Vec<KeyringVersion>, Option<u64>)> {
 		for ver in arr {
 			let id = ver.get("id").and_then(|x| x.as_u64()).unwrap_or(0);
 			let b64 = ver.get("value").and_then(|x| x.as_str()).unwrap_or("");
-			let key = crate::roblox::udmux::b64_decode(b64);
+			let key = crate::net::udmux::b64_decode(b64);
 			if key.is_empty() {
 				continue;
 			}
