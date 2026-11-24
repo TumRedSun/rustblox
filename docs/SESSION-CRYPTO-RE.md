@@ -745,3 +745,29 @@ Files: `session-crypto/analysis/split_{4,5,6}.bin`, parsers
   Hook plan: at the AEAD wrapper dump `rdi`/`rdx`/`rcx` **after** the call
   to find where the open path writes its plaintext (the current dump only
   sees the ciphertext for opens).
+
+### Direction proof, and the decrypt gap (24 Nov, hooks v67–v71)
+
+- **`0x43099ce` is the seal, not a shared wrapper.** Every call returns from
+  the same site (`0x4307ca2`), and its output buffer is byte-identical to the
+  payload put on the wire after the udmux envelope (`sendto` 1160 B = 79 B
+  envelope + 1081 B AEAD output). Its *input* is therefore the client's
+  outgoing plaintext datagram — which also settles the direction of the
+  a7/90/8a capture (client → server).
+- **The decrypt is a different function.** In-game socket counters over 30 s:
+  recv ≈ 32 000 datagrams, sent ≈ 3 700, AEAD-wrapper calls with a
+  datagram-sized buffer ≈ 40. One shared wrapper cannot be decrypting the
+  incoming stream; the receive path uses another routine (not yet located).
+- A memory scan for the decrypted `0x93` message (`UserPlayerScript`, known
+  plaintext from our own client) found only an FFlag JSON blob — the decrypted
+  replication buffers are not retained in a scannable form.
+- A `MemoryAccessMonitor` watchpoint on the first large recv buffer is the
+  next step (hook v71). The first attempt never armed because the app did not
+  join that run (no `UDMUX` in logcat), so the launch sequence must be verified
+  with a screenshot before arming it.
+
+Client join sequence observed on a successful app session (`Join snapshot
+timer: 0.945`): `90` (13 025 B, 13 fragments), `8a` (1 745 B, 2 fragments),
+then `83 07…` string-dictionary messages (`CAFETERIA`, `Controls`,
+`Press [CTRL]…`) and a 9-byte `9b`. Another session started with `a7`
+(7 363 B) before `90`/`8a`, so `a7` is the variable (cached dictionary) part.
