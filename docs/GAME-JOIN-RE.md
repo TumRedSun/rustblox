@@ -405,6 +405,54 @@ The 9b challenge layout confirmed against all four pairs:
 `637dda32-…` it is 2012 B with SHA-256 `ad2f0c29…`; other jobs give other
 bodies (`ec5f100f…`, `1a8360fc…`).
 
+## 12a. Follow-up session (24 Nov 2026, later) — operational blockers found live
+
+Live re-run on the same emulator/account, aimed at capturing a fresh `0x9b`
+pair via the safe seal/open hooks (`0x4307bea`/`0x4307cc8`) while avoiding the
+degenerate-call artefact in §3. Two **CONFIRMED** operational findings, both
+reproduced twice:
+
+* **Hooking `0x61072fa` (the `X` lookup) with a Frida `Interceptor.attach`
+  reliably crashes the client.** Both attempts crashed identically:
+  `SIGSEGV` (`SEGV_MAPERR`, fault addr `0x0`) in thread `RBX Worker C`, PC
+  `libroblox.so+0x610745e` (14 bytes past the hooked address — consistent
+  with Frida's inline trampoline corrupting a tight/hot call on a non-main
+  thread). Confirmed as hook-induced, not a pre-existing client bug: the
+  identical join (same place, same account, same emulator) completes
+  normally with **no** crash when Frida is not attached at all. Do not hook
+  `0x61072fa` with a plain `Interceptor.attach`; the safe path to recover `X`
+  is still the seal entry (`0x4307bea`), which captures the outbound 9-byte
+  reply (and therefore `X`) as plaintext without touching the lookup
+  function itself.
+* **The emulator/account used for this RE is now actively kicked by
+  server-side anti-emulator detection**, independent of any join/crypto
+  issue: `Disconnected — "We don't allow emulators for accounts without
+  place edit access… (Error Code: 305)"`, observed twice, each a minute or
+  so after a successful join (HUD and replication already flowing normally
+  beforehand — `0x83` application traffic was seen going out just before the
+  kick in one case). This is a plausible explanation for some of the
+  session drops that were previously attributed only to the `9b`/list
+  binding in §5 — at least some disconnects on this account may be this
+  check, not the crypto. The error text's own wording ("accounts without
+  place edit access") suggests a Studio/builder-access account would not
+  trigger it; worth trying for future live captures instead of a plain
+  player account.
+* A same-job re-capture (fresh app process, fresh RakNet connect) reproduced
+  the exact same challenge body hash (`93dc9e97…`) with a new nonce
+  (`115b778e4b69db4f`), consistent with §4's finding that the body is
+  per-job/static — a fifth independent confirmation, no new information.
+  The corresponding `0x9b` reply was not captured this run (the session was
+  kicked by the anti-emulator check before 500/20000 SEAL calls had
+  elapsed, or the client silently resumed a cached session without a full
+  re-handshake on one attempt — both are plausible and were not
+  disambiguated).
+
+Net effect: `X` is still unknown. The next attempt should (a) use an account
+with place-edit access to avoid the 305 kick, and (b) hook only
+`0x4307bea`/`0x4307cc8` (never `0x61072fa` directly) with a seal-call cap
+high enough to survive past the 9b reply (order index 6, but hundreds of
+transport ACK seals precede it).
+
 ## 12. Sub-analysis provenance (what came from where)
 
 | report | contribution | how I treated it |
