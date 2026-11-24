@@ -23,13 +23,23 @@ impl Gfx {
 		}))
 		.expect("no suitable GPU adapter");
 
+		// Request what the adapter advertises, minus the EXPERIMENTAL_* bits:
+		// newer wgpu refuses request_device outright if any experimental
+		// feature is requested without a separate opt-in, so passing the raw
+		// adapter.features() here makes the device request fail on drivers
+		// that advertise ray query / mesh shader support (observed:
+		// RequestDeviceError::ExperimentalFeaturesNotEnabled). The GL
+		// fallback's TEXTURE_FORMAT_16BIT_NORM need (see below) is not an
+		// experimental bit, so it survives the mask.
+		let experimental = wgpu::Features::EXPERIMENTAL_RAY_QUERY
+			| wgpu::Features::EXPERIMENTAL_MESH_SHADER
+			| wgpu::Features::EXPERIMENTAL_RAY_HIT_VERTEX_RETURN
+			| wgpu::Features::EXPERIMENTAL_MESH_SHADER_MULTIVIEW
+			| wgpu::Features::EXPERIMENTAL_MESH_SHADER_POINTS
+			| wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX;
 		let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
 			label: Some("rustblox-device"),
-			// Request what the adapter advertises: the GL fallback (software
-			// llvmpipe on CI/Xvfb) validates internal normalised texture views
-			// against TEXTURE_FORMAT_16BIT_NORM, and a missing feature turns
-			// every frame into "TextureView is invalid".
-			required_features: adapter.features(),
+			required_features: adapter.features() - experimental,
 			..Default::default()
 		}))
 		.expect("request wgpu device");

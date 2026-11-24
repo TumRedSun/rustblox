@@ -19,7 +19,15 @@ impl App {
 			// theme presets firing from the Home tab, or sidebar items
 			// reacting while the sidebar is collapsed).
 			self.hits.clear();
-			fb.fill(theme::cur().bg);
+			// The game screen while Active renders a live 3D scene underneath
+			// this 2D layer; filling the whole canvas opaquely here would
+			// paint over the entire viewport every frame (the HUD panels
+			// draw their own backgrounds), leaving only a blank theme-bg
+			// screen with text on it no matter what the 3D pass produced.
+			let is_active_game = matches!(&self.screen, Screen::Game(GameView::Active { .. }));
+			if !is_active_game {
+				fb.fill(theme::cur().bg);
+			}
 			let now_ms = self.start_instant.elapsed().as_millis() as u64;
 			match &mut self.screen {
 				Screen::Login(view) => {
