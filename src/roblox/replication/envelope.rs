@@ -51,6 +51,15 @@ impl ReplicationParser {
 		let head = u16::from_be_bytes([payload[0], payload[1.min(payload.len() - 1)]]);
 		*self.heads.entry(head).or_insert(0) += 1;
 
+		// Verified join item lists (`0xa7`/`0x90`/`0x8a`) are counted arrays
+		// of 16-byte items, not zstd bodies — decoding them here also stops
+		// the name harvester from reporting random items as garbage strings.
+		if let Some(list) = super::join_items::parse(payload) {
+			self.decoded += 1;
+			events.push(RepEvent::JoinItemList { message_id: list.message_id, items: list.items });
+			return;
+		}
+
 		let z = payload.windows(4).take(24).position(|w| w == ZSTD_MAGIC);
 		let body = match z {
 			Some(z) => match inflate_zstd(&payload[z..]) {

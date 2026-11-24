@@ -17,6 +17,7 @@ use crate::world::{Prop, RefId};
 mod body;
 mod envelope;
 mod inflate;
+pub mod join_items;
 
 /// A decoded replication event.
 #[derive(Debug, Clone)]
@@ -45,6 +46,14 @@ pub enum RepEvent {
 	/// Readable strings pulled out of the replication stream (class and
 	/// property names from the schema dictionary, part names, usernames).
 	Names(Vec<String>),
+	/// A verified client→server game-join item list (heads `0xa7`, `0x90`,
+	/// `0x8a`): a counted array of 16-byte opaque items. The container is
+	/// proven from four live captures; the item semantics are still open
+	/// (`docs/GAME-JOIN-RE.md`).
+	JoinItemList {
+		message_id: u8,
+		items: Vec<[u8; join_items::JOIN_ITEM_LEN]>,
+	},
 	/// Raw packet we could not decode (id + first bytes), kept for diagnostics.
 	Unknown {
 		packet_type: u32,

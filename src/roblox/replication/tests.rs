@@ -162,6 +162,58 @@ fn fork_zstd_body_inflates() {
 	assert_eq!(p.bytes_out, 215);
 }
 
+// Live `83 16`/`83 0d` messages carry the zstd frame plus 1–2 trailing bytes
+// (the frame ends before the application message does). ruzstd must stop at
+// the frame end, not reject the message. This keeps the existing 8d01 vector
+// and appends the same kind of tail.
+#[test]
+fn zstd_frame_ignores_trailing_bytes() {
+	let mut p = ReplicationParser::new();
+	let mut dm = DataModel::new();
+	let mut msg = unhex(
+		"8d01b17e0100045a000000d700000028b52ffd20d78d02004404040100e4008bffcb870e4b7ecb87b14b7fcb76014b7ecb870a4b7b4b604b564b5a4b6d4b80cb87094b674b514b474b4a4b5b4b7a4f4b444b484b594b7ccb87170880ff0003003965d0af5222c12614",
+	);
+	msg.extend_from_slice(&[0x00, 0x00]);
+	let events = p.feed(&msg, &mut dm);
+	assert_eq!(p.inflated, 1);
+	assert!(events
+		.iter()
+		.any(|e| matches!(e, RepEvent::Decoded { head: 0x8d01, body: 215, inflated: true })));
+}
+
+// Live join uploads (24 Nov): `0xa7`/`0x90`/`0x8a` are counted arrays of
+// 16-byte opaque items, not compressed/ciphered bodies. The vectors below are
+// the first items of `join_plain/{a7,90,8a}` from the real client.
+#[test]
+fn join_item_lists_decode() {
+	let mut p = ReplicationParser::new();
+	let mut dm = DataModel::new();
+
+	let m90 = unhex("90c23d3c2d341d3a5415c5489f397c692dbc33024cad1c975ceaf42b8ead128722");
+	let m8a = unhex("8a6b79eba23a7433200f2700acd97ff730");
+	let a7 = unhex("a701007eaf79ea0fad0f8be223e179aaae641b");
+
+	for msg in [m90, m8a, a7] {
+		let events = p.feed(&msg, &mut dm);
+		let hit = events
+			.iter()
+			.any(|e| matches!(e, RepEvent::JoinItemList { message_id: 0x90 | 0x8a | 0xa7, .. }));
+		assert!(hit, "no JoinItemList event for {:02x}", msg[0]);
+	}
+	assert_eq!(p.decoded, 3);
+	// The items must not be mistaken for a zstd frame.
+	assert_eq!(p.inflated, 0);
+	assert_eq!(p.skipped, 0);
+}
+
+// A head-only list whose length is not a multiple of 16 is not a join list;
+// it stays on the normal (zstd/name) path.
+#[test]
+fn malformed_join_list_is_not_claimed() {
+	assert!(super::join_items::parse(&[0x90, 1, 2, 3]).is_none());
+	assert!(super::join_items::parse(&[0xa7, 2, 0]).is_none());
+}
+
 // Live v29 capture, `83 0d` #12867: a world cluster body that inflates to
 // plaintext asset ids and part names. This is the world data the client
 // needs — it was never encrypted, only zstd-compressed.
