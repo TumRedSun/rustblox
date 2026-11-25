@@ -11,18 +11,18 @@ use rustblox::roblox::client::RobloxClient;
 use rustblox::roblox::errors::ApiError;
 
 fn main() {
-    let mut c = RobloxClient::new();
-    println!("POST auth.roblox.com/v2/login (dummy credentials)...");
-    match auth::login_password(&mut c, "definitelynotarealuser99", "wrongpass123") {
-        Ok(_) => println!("UNEXPECTED SUCCESS (should not happen with dummy creds)"),
-        Err(e @ ApiError::InvalidCredentials) => {
-            println!("PIPELINE OK \u{2713}  server said: {e}")
-        }
-        Err(e @ ApiError::CaptchaRequired) => println!(
-            "PIPELINE OK \u{2713}  captcha gate hit (expected from datacenter IPs): {e}"
-        ),
-        Err(e) => println!("PIPELINE REACHED SERVER, error: {e}"),
-    }
-    println!("csrf token cached: {}", c.csrf.is_some());
-    println!("cookies in jar: {}", c.jar_len());
+	let mut c = RobloxClient::new();
+	println!("POST auth.roblox.com/v2/login (dummy credentials)...");
+	match auth::login_password(&mut c, "definitelynotarealuser99", "wrongpass123") {
+		Ok(_) => println!("UNEXPECTED SUCCESS (should not happen with dummy creds)"),
+		Err(e @ ApiError::InvalidCredentials) => {
+			println!("PIPELINE OK \u{2713}  server said: {e}")
+		}
+		Err(e @ ApiError::CaptchaRequired) => {
+			println!("PIPELINE OK \u{2713}  captcha gate hit (expected from datacenter IPs): {e}")
+		}
+		Err(e) => println!("PIPELINE REACHED SERVER, error: {e}"),
+	}
+	println!("csrf token cached: {}", c.csrf.is_some());
+	println!("cookies in jar: {}", c.jar_len());
 }

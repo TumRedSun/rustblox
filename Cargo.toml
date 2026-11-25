@@ -27,6 +27,10 @@ ureq = { version = "2.10", default-features = false, features = ["tls", "gzip"] 
 image = { version = "0.25", default-features = false, features = ["png"] }
 dirs = "5.0"
 flate2 = "1"
+# Replication payload layer: the fork's big cluster bodies are zstd frames
+# (`83 16`/`83 0d`/`83 13`/`8d 01`/`97 0d`) whose plaintext is the bit-packed
+# replication stream. Pure Rust, no C build.
+ruzstd = { version = "0.7.3", default-features = false, features = ["std"] }
 
 # Early-encryption (handshake crypto, join hypothesis (c)): the fork OCR2
 # carries an X25519 public key + an AEAD box, and the reply announces the
@@ -34,6 +38,9 @@ flate2 = "1"
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
 blake2 = "0.10"
 chacha20poly1305 = "0.10"
+# Post-OpenReply2 steady layer: AES-256-GCM (live-verified; the engine uses
+# AES-GCM with the "UniqueNumbeR" counter nonce, not ChaCha).
+aes-gcm = "0.10"
 
 # Desktop clipboard (arboard has no Android/iOS backend). wayland-data-control
 # adds a native Wayland clipboard backend so Copy works under Wayland too,
@@ -43,6 +50,20 @@ arboard = { version = "3.7", features = ["wayland-data-control"] }
 
 [dev-dependencies]
 naga = { version = "29", features = ["wgsl-in"] }
+
+[lints.rust]
+dead_code = "deny"
+unused = "deny"
+
+[lints.clippy]
+# Deny-by-default: new code must not rely on these. Existing modules are
+# migrated module-by-module (see docs/ARCHITECTURE.md); until a module is
+# migrated it carries a local `#![allow(...)]` to opt back out.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+unimplemented = "warn"
+todo = "warn"
 
 [profile.release]
 opt-level = 3

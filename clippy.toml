@@ -1,0 +1,6 @@
+# Architecture limits — see docs/ARCHITECTURE.md.
+# File-length cap (350 lines) is enforced by a CI/pre-commit line-count
+# check, not by clippy (clippy has no native "lines per file" lint).
+too-many-lines-threshold = 60
+cognitive-complexity-threshold = 15
+type-complexity-threshold = 200

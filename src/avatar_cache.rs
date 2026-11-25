@@ -5,47 +5,47 @@ use std::path::PathBuf;
 use ureq::Agent;
 
 pub fn cdn_agent() -> Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(30))
-        .user_agent(crate::roblox::client::UA)
-        // Pinned CDN IPs first (see roblox::dns) with system DNS as fallback:
-        // thumbnail hosts are DNS-blocked on the same networks as the API.
-        .resolver(crate::roblox::dns::PinnedResolver)
-        .build()
+	ureq::AgentBuilder::new()
+		.timeout_connect(std::time::Duration::from_secs(10))
+		.timeout(std::time::Duration::from_secs(30))
+		.user_agent(crate::roblox::client::UA)
+		// Pinned CDN IPs first (see roblox::dns) with system DNS as fallback:
+		// thumbnail hosts are DNS-blocked on the same networks as the API.
+		.resolver(crate::roblox::dns::PinnedResolver)
+		.build()
 }
 
 pub fn fnv1a64(data: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &b in data {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
+	let mut h: u64 = 0xcbf29ce484222325;
+	for &b in data {
+		h ^= b as u64;
+		h = h.wrapping_mul(0x100000001b3);
+	}
+	h
 }
 
 fn cache_path(url: &str) -> Option<PathBuf> {
-    crate::config::avatar_cache_dir()
-        .map(|d| d.join(format!("{:016x}.rgba", fnv1a64(url.as_bytes()))))
+	crate::config::avatar_cache_dir()
+		.map(|d| d.join(format!("{:016x}.rgba", fnv1a64(url.as_bytes()))))
 }
 
 /// Load a cached decoded square image (`size` x `size` RGBA8).
 pub fn load(url: &str, size: u32) -> Option<Vec<u8>> {
-    let p = cache_path(url)?;
-    let data = std::fs::read(p).ok()?;
-    let expected = (size * size * 4) as usize;
-    if data.len() == expected {
-        Some(data)
-    } else {
-        None
-    }
+	let p = cache_path(url)?;
+	let data = std::fs::read(p).ok()?;
+	let expected = (size * size * 4) as usize;
+	if data.len() == expected {
+		Some(data)
+	} else {
+		None
+	}
 }
 
 pub fn store(url: &str, rgba: &[u8]) {
-    if let Some(p) = cache_path(url) {
-        if let Some(dir) = p.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let _ = std::fs::write(p, rgba);
-    }
+	if let Some(p) = cache_path(url) {
+		if let Some(dir) = p.parent() {
+			let _ = std::fs::create_dir_all(dir);
+		}
+		let _ = std::fs::write(p, rgba);
+	}
 }

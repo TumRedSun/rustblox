@@ -1,0 +1,13 @@
+# Grandfathered architecture-limit offenders (docs/ARCHITECTURE.md).
+# A listed entry may not GROW; regenerate after an intentional split with
+#   python3 scripts/arch_check.py --update-baseline
+
+# file <path> <lines>
+file examples/render_preview.rs 412
+file examples/scene_repro.rs 610
+file mobile/src/android_ui.rs 352
+
+# dir <path> <counted .rs files>
+dir mobile/src 5
+dir src 8
+dir src/roblox 5

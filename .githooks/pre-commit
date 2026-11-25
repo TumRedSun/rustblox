@@ -1,0 +1,24 @@
+#!/bin/sh
+# Enforced by docs/ARCHITECTURE.md. Enable once per clone with:
+#   git config core.hooksPath .githooks
+set -e
+
+echo "pre-commit: cargo fmt --check"
+cargo fmt --check
+
+# No blanket `-D warnings` here: Cargo.toml's [lints] already hard-denies
+# what must be hard today (dead_code, unused); unwrap/expect/panic are
+# deliberately left at "warn" during the staged migration (see
+# docs/ARCHITECTURE.md) and `-D warnings` would promote those pre-existing
+# warnings to commit-blocking errors crate-wide, defeating that staging.
+echo "pre-commit: cargo clippy --all-targets"
+cargo clippy --all-targets
+
+# Architecture limits (docs/ARCHITECTURE.md): a file over 450 lines or a
+# folder over 5 .rs files is an ERROR; 351..450 lines / 5 files only warn.
+# Pre-existing offenders are grandfathered in docs/arch_baseline.txt and may
+# not grow. `--strict` (CI) turns the warnings into errors too.
+echo "pre-commit: architecture limits"
+python3 scripts/arch_check.py
+
+echo "pre-commit: ok"

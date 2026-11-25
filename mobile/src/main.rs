@@ -2,5 +2,5 @@
 //! client (winit's iOS backend handles the UIApplication lifecycle).
 
 fn main() {
-    rustblox_mobile::run_ios();
+	rustblox_mobile::run_ios();
 }

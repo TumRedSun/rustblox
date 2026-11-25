@@ -89,35 +89,54 @@ The token is stored locally in your user config directory (`%APPDATA%/rustblox/s
 ```
 src/
 ├── main.rs            # entry point
-├── app.rs             # winit ApplicationHandler, screen state machine, input routing
-├── login_ui.rs        # login screen (password / cookie tabs, 2FA dialog)
-├── menu_ui.rs         # main menu: collapsible sidebar, horizontal friends strip, places search + card grid, add-friends pane
-├── ui.rs              # widgets: text fields (IME!), buttons, hit-testing
-├── draw.rs            # dual-mode primitives: GPU command recorder + headless soft rasterizer
-├── font.rs            # ab_glyph → shared glyph atlas (GPU quads) / direct raster (soft path)
+├── lib.rs             # run()/app wiring, CLI/env flags
+├── app/               # winit ApplicationHandler, screens, input routing
+│   ├── mod.rs         #   App struct, commands, redraw requests
+│   ├── state.rs       #   Screen/GameView/StatusKind/UiCtx/GamePad
+│   ├── handler.rs     #   ApplicationHandler impl
+│   ├── flow/          #   screen transitions, buttons, settings
+│   ├── input/         #   pointer/keys/touch/text fields (IME-safe)
+│   ├── redraw/        #   frame draw + in-game HUD
+│   ├── window/        #   winit window-event dispatch
+│   └── worker/        #   worker-event routing (auth/menu/game)
+├── menu_ui/           # main menu: sidebar, friends strip, places grid
+├── login_ui/          # login screen (password / cookie tabs, 2FA dialog)
+├── ui/                # widgets: text fields, buttons, hit-testing
+├── draw/              # GPU command recorder + headless soft rasterizer
+├── font/              # ab_glyph → shared glyph atlas / soft raster
+├── logs/              # ring buffer, file mirror, crash hook
 ├── theme.rs           # colors / metrics
 ├── model.rs           # domain models, sorting, humanized "last online"
 ├── config.rs          # session persistence (0600)
 ├── avatar_cache.rs    # disk cache for avatar bitmaps
-├── net.rs             # background worker thread + avatar pool → EventLoopProxy
-├── raknet.rs          # RakNet client: handshake, reliability, ACKs, splits, ping
+├── platform.rs        # OS-specific bits (IME/scale/clipboard)
+├── netlog.rs          # RUSTBLOX_DEBUG=net trace macros
+├── net/               # transport stack
+│   ├── crypto/        #   OCR2/ORP2 + AES-256-GCM steady layer
+│   ├── udmux/         #   udmux table, envelope, NetStack blob
+│   └── raknet/        #   RakNet: handshake (connect/reply), reliability, ACKs
 ├── gfx/               # the wgpu renderer
-│   ├── mod.rs         # device/surface/pipelines, font atlas, image cache, frame loop
-│   ├── ui.wgsl        # instanced SDF UI shader (rects, rounded rects, rings, glyphs, images)
-│   ├── scene.wgsl     # 3D: instanced parts, sun shadow map, fog; sky gradient shader
-│   ├── scene.rs       # SceneView/Camera/Environment data model
-│   └── math.rs        # dependency-free column-major mat4/vec3
-├── world/             # runtime DataModel (instance tree + properties) → SceneView builder
-├── game/              # live session: join state machine, replication thread, camera controller
-└── roblox/
-    ├── client.rs      # ureq agent, cookie jar, CSRF rotation
-    ├── auth.rs        # login / 2FA verify / resend / logout
-    ├── social.rs      # friends, presence, games, thumbnails (batched)
-    ├── join.rs        # LIVE JOIN: authentication-ticket → gamejoin v2/v1 → server addr + avatar
-    ├── replication.rs # tolerant replication stream parser → DataModel events
-    ├── types.rs       # serde models of the API
-    ├── dns.rs         # pinned Roblox/CDN IPs (DNS-blocking-proof resolution)
-    └── errors.rs      # typed errors with readable messages
+│   ├── mod.rs         #   device/surface/pipelines, frame entry
+│   ├── render.rs      #   per-frame passes (shadow → scene → UI)
+│   ├── core/          #   GPU bootstrap, texture upload, image cache
+│   ├── ui/            #   instanced SDF UI pipeline
+│   ├── scene3d/       #   parts, shadow map, sky
+│   ├── scene.wgsl     #   3D: instanced parts, sun shadow, fog; sky
+│   ├── ui.wgsl        #   UI shader (rects, rounded, rings, glyphs, images)
+│   ├── scene.rs       #   SceneView/Camera/Environment
+│   └── math.rs        #   dependency-free mat4/vec3
+├── world/             # runtime DataModel → SceneView builder
+├── game/              # live session: join thread, replication → DataModel, controller
+├── roblox/            # HTTP API
+│   ├── client/        #   ureq agent, cookie jar, CSRF rotation
+│   ├── auth.rs        #   login / 2FA verify / resend / logout
+│   ├── social/        #   friends, presence, games, thumbnails (batched)
+│   ├── join/          #   LIVE JOIN: ticket → gamejoin → server addr + avatar
+│   ├── replication/   #   tolerant replication parser → DataModel events
+│   ├── types.rs       #   serde models of the API
+│   ├── dns.rs         #   pinned Roblox/CDN IPs (DNS-blocking-proof)
+│   └── errors.rs      #   typed errors with readable messages
+└── worker/            # background thread + avatar pool → EventLoopProxy
 ```
 
 ### Joining a place (how it works)
